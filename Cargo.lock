@@ -750,6 +750,7 @@ dependencies = [
  "candle-nn",
  "chrono",
  "engine",
+ "kvcache",
  "minijinja",
  "model",
  "proptest",
@@ -1396,6 +1397,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kvcache"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1554,7 +1563,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "candle-core",
+ "candle-metal-kernels",
  "candle-nn",
+ "half",
+ "objc2-metal",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

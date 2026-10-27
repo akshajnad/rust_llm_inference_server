@@ -205,3 +205,74 @@ fn greedy_tokens_match_reference() {
         failures.join("\n")
     );
 }
+
+/// Batching invariance on the paged path: 32 sequences (the fixture prompts, cycled) prefilled
+/// together in one step and decoded together for 128 steps through the paged KV pool must
+/// each produce their reference greedy tokens, exactly as when run alone.
+#[test]
+#[ignore = "needs models/ (make models) and a GPU"]
+fn paged_batch_of_32_matches_reference() {
+    use model::{AttentionImpl, PagedBatch, PagedKvCache, PagedSeq};
+    const N: usize = 32;
+    const BS: usize = 16;
+    let (model, device, dtype) = setup();
+    let cases = load_cases();
+    let batch: Vec<&Case> = (0..N).map(|i| &cases[i % cases.len()]).collect();
+    let longest = batch.iter().map(|c| c.prompt_ids.len()).max().unwrap() + STEPS;
+    let per_seq = longest.div_ceil(BS);
+    let mut cache = PagedKvCache::new(model.config(), N * per_seq, BS, dtype, &device).unwrap();
+    let attention = match std::env::var("PARITY_ATTENTION").as_deref() {
+        Ok("v1") => AttentionImpl::Gather,
+        _ => AttentionImpl::Kernel,
+    };
+    let attention = cache.set_attention(attention);
+    // Interleave physical blocks across sequences so no table is contiguous.
+    let tables: Vec<Vec<u32>> = (0..N)
+        .map(|i| (0..per_seq).map(|j| (j * N + (N - 1 - i)) as u32).collect())
+        .collect();
+
+    let mut seqs: Vec<Vec<u32>> = batch.iter().map(|c| c.prompt_ids.clone()).collect();
+    let mut computed = vec![0usize; N];
+    let mut diverged: Vec<Option<String>> = vec![None; N];
+    for step in 0..STEPS {
+        let toks: Vec<&[u32]> = (0..N).map(|i| &seqs[i][computed[i]..]).collect();
+        let paged: Vec<PagedSeq> = (0..N)
+            .map(|i| PagedSeq {
+                block_table: &tables[i],
+                start_pos: computed[i],
+                len: seqs[i].len() - computed[i],
+            })
+            .collect();
+        let logits = model
+            .forward_batch(&toks, &mut PagedBatch::new(&cache, &paged).unwrap())
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        for i in 0..N {
+            computed[i] = seqs[i].len();
+            let got = argmax(&logits[i]);
+            let want = batch[i].greedy_ids[step];
+            if got != want && diverged[i].is_none() {
+                let margin = batch[i].topk_values[step][0] - batch[i].topk_values[step][1];
+                diverged[i] = Some(format!(
+                    "seq {i} step {step}: got {got} want {want} (margin {margin:.4})"
+                ));
+                assert!(
+                    margin < tie_margin(dtype),
+                    "seq {i} (prompt {}) step {step}: got {got} want {want}, reference margin {margin:.4}",
+                    i % cases.len()
+                );
+            }
+            seqs[i].push(got);
+        }
+    }
+    let flips: Vec<String> = diverged.into_iter().flatten().collect();
+    eprintln!(
+        "paged batch of {N} ({attention:?}): {}/{N} exact for {STEPS} tokens, {} near-tie flips",
+        N - flips.len(),
+        flips.len()
+    );
+    for f in &flips {
+        eprintln!("  near-tie {f}");
+    }
+}

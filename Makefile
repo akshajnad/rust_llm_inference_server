@@ -9,7 +9,7 @@ HF := https://huggingface.co
 DENSE_REPO := unsloth/Llama-3.2-1B-Instruct
 DENSE_FILES := config.json generation_config.json tokenizer.json tokenizer_config.json model.safetensors
 
-.PHONY: models build test parity-ref chat-ref parity lint fuzz teardown
+.PHONY: models build test test-metal parity-ref chat-ref parity lint fuzz teardown
 
 models:
 	@mkdir -p $(MODEL_DIR)
@@ -26,6 +26,10 @@ build:
 
 test:
 	cargo test --workspace
+
+# GPU-only unit tests (paged-attention kernel vs reference); no model download needed.
+test-metal:
+	cargo test --release -p model --lib --features metal
 
 # Runs the HF transformers reference once in a throwaway venv, then deletes the venv.
 parity-ref: models
@@ -52,6 +56,7 @@ parity: models
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --workspace --all-targets --features model/metal -- -D warnings
 
 # Needs `rustup toolchain install nightly` and `cargo install cargo-fuzz`.
 FUZZ_SECS ?= 60

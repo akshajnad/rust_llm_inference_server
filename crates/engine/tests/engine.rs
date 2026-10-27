@@ -4,19 +4,32 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engine::testing::{byte_tokenizer, tiny_model};
-use engine::{EngineConfig, EngineHandle, Event, FinishReason, Request, SamplingParams};
+use engine::{EngineConfig, EngineHandle, Event, FinishReason, Policy, Request, SamplingParams};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-fn start(max_batch_size: usize) -> (EngineHandle, Arc<engine::Tokenizer>) {
+fn start_with(cfg: EngineConfig) -> (EngineHandle, Arc<engine::Tokenizer>) {
     let tok = Arc::new(byte_tokenizer());
-    let cfg = EngineConfig {
-        max_batch_size,
-        queue_size: 64,
-    };
     (
         engine::spawn(tiny_model(256), tok.clone(), cfg).unwrap(),
         tok,
     )
+}
+
+/// The tiny model's KV is 512 bytes per token, so `kv_tokens` sizes the pool directly.
+fn config(max_num_seqs: usize, kv_tokens: usize) -> EngineConfig {
+    EngineConfig {
+        max_num_seqs,
+        max_batched_tokens: 64,
+        queue_size: 64,
+        kv_cache_bytes: kv_tokens * 512,
+        block_size: 4,
+        policy: Policy::Continuous,
+        attention: engine::AttentionImpl::Kernel,
+    }
+}
+
+fn start(max_num_seqs: usize) -> (EngineHandle, Arc<engine::Tokenizer>) {
+    start_with(config(max_num_seqs, 4096))
 }
 
 fn collect(mut rx: UnboundedReceiver<Event>) -> (String, engine::Finish) {
@@ -127,8 +140,8 @@ fn too_long_requests_get_an_error() {
 #[test]
 fn full_queue_is_refused() {
     let cfg = EngineConfig {
-        max_batch_size: 1,
         queue_size: 1,
+        ..EngineConfig::default()
     };
     let (h, _rx) = EngineHandle::channel(&cfg, 256);
     let req = || Request::new(vec![1], SamplingParams::greedy(1)).0;
@@ -138,4 +151,71 @@ fn full_queue_is_refused() {
         Err(engine::SubmitError::QueueFull)
     ));
     assert_eq!(h.queue_depth(), 1);
+}
+
+/// Under a pool too small for everyone, sequences get preempted and recomputed; greedy output
+/// must be exactly what each prompt produces alone with plenty of memory.
+#[test]
+fn preemption_and_recompute_do_not_change_output() {
+    let prompts: Vec<String> = (0..12).map(|i| format!("prompt number {i} says")).collect();
+    let (roomy, tok) = start(16);
+    let want: Vec<String> = prompts
+        .iter()
+        .map(|p| collect(submit(&roomy, &tok, p, SamplingParams::greedy(40))).0)
+        .collect();
+
+    // 160 slots for 12 sequences of ~19 + 40 tokens each.
+    let (tight, tok) = start_with(config(16, 160));
+    let rxs: Vec<_> = prompts
+        .iter()
+        .map(|p| submit(&tight, &tok, p, SamplingParams::greedy(40)))
+        .collect();
+    let got: Vec<String> = rxs.into_iter().map(|rx| collect(rx).0).collect();
+    assert_eq!(got, want);
+    assert!(
+        tight
+            .stats()
+            .preemptions
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
+        "pool was meant to be too small"
+    );
+    assert_eq!(tight.kv_utilization(), 0.0, "every block returned");
+}
+
+/// A prompt longer than the token budget is prefilled over several steps.
+#[test]
+fn chunked_prefill_matches_single_shot() {
+    let prompt = "a fairly long prompt that will not fit in one step of sixteen tokens";
+    let (one_shot, tok) = start(4);
+    let want = collect(submit(&one_shot, &tok, prompt, SamplingParams::greedy(10))).0;
+    let (chunked, tok) = start_with(EngineConfig {
+        max_batched_tokens: 16,
+        ..config(4, 4096)
+    });
+    assert_eq!(
+        collect(submit(&chunked, &tok, prompt, SamplingParams::greedy(10))).0,
+        want
+    );
+}
+
+#[test]
+fn static_policy_produces_the_same_text() {
+    let (cont, tok) = start(8);
+    let (stat, _) = start_with(EngineConfig {
+        policy: Policy::Static,
+        ..config(8, 4096)
+    });
+    let prompts = ["x", "yy", "zzz"];
+    let a: Vec<_> = prompts
+        .iter()
+        .map(|p| submit(&cont, &tok, p, SamplingParams::greedy(8)))
+        .collect();
+    let b: Vec<_> = prompts
+        .iter()
+        .map(|p| submit(&stat, &tok, p, SamplingParams::greedy(8)))
+        .collect();
+    let a: Vec<String> = a.into_iter().map(|rx| collect(rx).0).collect();
+    let b: Vec<String> = b.into_iter().map(|rx| collect(rx).0).collect();
+    assert_eq!(a, b);
 }

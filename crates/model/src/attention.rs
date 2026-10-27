@@ -2,9 +2,9 @@ use candle_core::{D, DType, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 
 use crate::config::LlamaConfig;
-use crate::kv::KvStore;
+use crate::kv::KvBatch;
 use crate::layers::Linear;
-use crate::rope::Rope;
+use crate::rope::RopeBatch;
 
 #[derive(Debug, Clone)]
 pub struct Attention {
@@ -33,46 +33,28 @@ impl Attention {
     }
 
     /// `x` is `(1, total_tokens, hidden)`: the new tokens of every sequence in the batch,
-    /// concatenated. Projections run once over all of them; RoPE, the KV store and attention
-    /// run per sequence, each against its own cache.
+    /// concatenated. Projections and RoPE run once over all of them; the KV backend stores
+    /// the new keys and values and computes attention per sequence.
     pub fn forward(
         &self,
         x: &Tensor,
         layer: usize,
         segments: &[Segment],
-        rope: &Rope,
-        seqs: &mut [SeqInput],
+        rope: &RopeBatch,
+        kv: &mut dyn KvBatch,
     ) -> Result<Tensor> {
         let (b, total, _) = x.dims3()?;
         let split =
             |t: Tensor, heads: usize| t.reshape((b, total, heads, self.head_dim))?.transpose(1, 2);
-        let q = split(self.q_proj.forward(x)?, self.n_heads)?;
-        let k = split(self.k_proj.forward(x)?, self.n_kv_heads)?;
+        let q = rope.apply(&split(self.q_proj.forward(x)?, self.n_heads)?)?;
+        let k = rope.apply(&split(self.k_proj.forward(x)?, self.n_kv_heads)?)?;
         let v = split(self.v_proj.forward(x)?, self.n_kv_heads)?;
-        let mut outs = Vec::with_capacity(segments.len());
-        for (seg, seq) in segments.iter().zip(seqs.iter_mut()) {
-            let part = |t: &Tensor| t.narrow(2, seg.offset, seg.len);
-            let q = rope.apply(&part(&q)?, seg.start_pos)?;
-            let k = rope.apply(&part(&k)?, seg.start_pos)?;
-            let (k, v) = seq.kv.append(layer, &k, &part(&v)?)?;
-            outs.push(gqa_attention(&q, &k, &v, seg.mask.as_ref(), self.head_dim)?);
-        }
-        let out = match outs.len() {
-            1 => outs.pop().expect("one segment"),
-            _ => Tensor::cat(&outs, 2)?,
-        };
+        let out = kv.attend(layer, &q, &k, &v, segments)?;
         let out = out
             .transpose(1, 2)?
             .reshape((b, total, self.n_heads * self.head_dim))?;
         self.o_proj.forward(&out)
     }
-}
-
-/// One sequence's slice of a batched forward pass: the tokens to run now and the cache that
-/// holds everything before them.
-pub struct SeqInput<'a> {
-    pub tokens: &'a [u32],
-    pub kv: &'a mut dyn KvStore,
 }
 
 /// Where a sequence's tokens sit in the concatenated batch, computed once per forward pass.
@@ -85,24 +67,37 @@ pub struct Segment {
     pub mask: Option<Tensor>,
 }
 
+/// Runs attention for each segment against the full keys/values `kv_for(i)` returns, then
+/// concatenates the outputs along the token axis.
+pub fn attend_segments(
+    q: &Tensor,
+    segments: &[Segment],
+    mut kv_for: impl FnMut(usize, &Segment) -> Result<(Tensor, Tensor)>,
+) -> Result<Tensor> {
+    let mut outs = Vec::with_capacity(segments.len());
+    for (i, seg) in segments.iter().enumerate() {
+        let (k, v) = kv_for(i, seg)?;
+        let q = q.narrow(2, seg.offset, seg.len)?;
+        outs.push(gqa_attention(&q, &k, &v, seg.mask.as_ref())?);
+    }
+    match outs.len() {
+        1 => Ok(outs.pop().expect("one segment")),
+        _ => Tensor::cat(&outs, 2),
+    }
+}
+
 /// Grouped-query attention without materializing repeated K/V.
 ///
 /// Query head `h` uses KV head `h / n_rep`, so `(b, n_heads, seq, d)` reshapes to
 /// `(b, n_kv, n_rep * seq, d)` and each KV head is multiplied once against its whole group.
 /// Softmax runs in f32, as in the reference implementation.
-pub fn gqa_attention(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    mask: Option<&Tensor>,
-    head_dim: usize,
-) -> Result<Tensor> {
+pub fn gqa_attention(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
     let (b, n_heads, seq, d) = q.dims4()?;
     let (_, n_kv, total, _) = k.dims4()?;
     let n_rep = n_heads / n_kv;
     let dtype = q.dtype();
     let q = q.contiguous()?.reshape((b, n_kv, n_rep * seq, d))?;
-    let scores = (q.matmul(&k.t()?)? * (1.0 / (head_dim as f64).sqrt()))?;
+    let scores = (q.matmul(&k.t()?)? * (1.0 / (d as f64).sqrt()))?;
     let scores = scores.to_dtype(DType::F32)?;
     let scores = match mask {
         Some(m) => scores
@@ -166,7 +161,7 @@ mod tests {
         let k = Tensor::randn(0f32, 1.0, (b, nkv, start + seq, d), &dev)?;
         let v = Tensor::randn(0f32, 1.0, (b, nkv, start + seq, d), &dev)?;
         let mask = causal_mask(seq, start, &dev)?;
-        let got = gqa_attention(&q, &k, &v, Some(&mask), d)?;
+        let got = gqa_attention(&q, &k, &v, Some(&mask))?;
         let want = naive(&q, &k, &v, Some(&mask))?;
         let diff = (got - want)?.abs()?.max_all()?.to_scalar::<f32>()?;
         assert!(diff < 1e-5, "max diff {diff}");

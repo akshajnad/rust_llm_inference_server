@@ -5,12 +5,14 @@ pub mod config;
 pub mod kv;
 pub mod layers;
 pub mod llama;
+pub mod paged;
+pub mod paged_attention;
 pub mod rope;
 
-pub use attention::SeqInput;
 pub use config::LlamaConfig;
-pub use kv::{ContiguousKvCache, KvStore};
+pub use kv::{ContiguousKvCache, KvBatch, KvStore, PerSeqKv};
 pub use llama::Llama;
+pub use paged::{AttentionImpl, PagedBatch, PagedKvCache, PagedSeq};
 
 use candle_core::Device;
 

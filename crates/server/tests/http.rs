@@ -33,8 +33,11 @@ fn state() -> AppState {
         tiny_model(MAX_SEQ_LEN),
         tok,
         EngineConfig {
-            max_batch_size: 8,
+            max_num_seqs: 8,
             queue_size: 8,
+            kv_cache_bytes: 4096 * 512,
+            block_size: 4,
+            ..EngineConfig::default()
         },
     )
     .unwrap();
@@ -211,25 +214,32 @@ async fn malformed_json_is_a_400() {
 
 #[tokio::test]
 async fn full_queue_returns_503_with_retry_after() {
-    // A queue with room for one request and no engine draining it.
+    // A queue with room for one request and no engine draining it; fill it directly.
     let (engine, _rx) = EngineHandle::channel(
         &EngineConfig {
-            max_batch_size: 1,
             queue_size: 1,
+            ..EngineConfig::default()
         },
         MAX_SEQ_LEN,
     );
+    let (filler, _events) = engine::Request::new(vec![1], engine::SamplingParams::greedy(1));
+    engine.submit(filler).unwrap();
     let st = state_with(engine);
-    let first = router(st.clone()).oneshot(post(
-        "/v1/completions",
-        json!({"prompt": "a", "stream": true}),
-    ));
-    let first = tokio::spawn(first);
-    tokio::time::sleep(Duration::from_millis(50)).await;
     let (status, headers, body) = send(&st, post("/v1/completions", json!({"prompt": "b"}))).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(headers[header::RETRY_AFTER], "1");
-    first.abort();
+}
+
+#[tokio::test]
+async fn prompt_longer_than_context_names_the_prompt() {
+    let st = state();
+    let long = "x".repeat(MAX_SEQ_LEN);
+    let (status, _, body) = send(&st, post("/v1/completions", json!({"prompt": long}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"]["param"],
+        "prompt"
+    );
 }
 
 #[tokio::test]

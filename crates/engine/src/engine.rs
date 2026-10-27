@@ -2,34 +2,53 @@
 //! locks. Requests arrive over a bounded channel (backpressure); each request streams its
 //! events back over its own channel, and dropping that receiver cancels the request.
 //!
-//! M2 schedules with static batching: take whatever is queued (up to `max_batch_size`), run
-//! that batch until every sequence finishes, then take the next batch. M3 replaces this with
-//! iteration-level scheduling over a paged KV pool.
+//! Each iteration: take new requests off the queue, drop cancelled ones, ask the scheduler
+//! what to run, run one forward pass over the shared paged KV pool, and sample one token for
+//! every sequence whose tokens are all computed.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use model::{ContiguousKvCache, Llama, SeqInput};
+use candle_core::Tensor;
+use kvcache::SeqId;
+use model::{AttentionImpl, Llama, PagedBatch, PagedKvCache, PagedSeq};
 use tokio::sync::mpsc;
 
 use crate::detokenizer::Detokenizer;
 use crate::sampler::{Sampler, SamplingParams};
+use crate::scheduler::{Policy, Schedule, Scheduler, SchedulerConfig};
 use crate::stop::{StopMatcher, StopResult};
 use crate::tokenizer::Tokenizer;
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    pub max_batch_size: usize,
+    /// Sequences in one step.
+    pub max_num_seqs: usize,
+    /// Tokens in one step; longer prompts are prefilled in chunks.
+    pub max_batched_tokens: usize,
     /// Requests that may wait in the queue before submissions are refused.
     pub queue_size: usize,
+    /// Size of the preallocated KV pool. Never derived from free memory: on unified memory the
+    /// GPU shares RAM with everything else.
+    pub kv_cache_bytes: usize,
+    pub block_size: usize,
+    pub policy: Policy,
+    /// Decode attention; `Kernel` falls back to `Gather` off Metal.
+    pub attention: AttentionImpl,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            max_batch_size: 32,
+            max_num_seqs: 64,
+            max_batched_tokens: 2048,
             queue_size: 256,
+            kv_cache_bytes: 1 << 30,
+            block_size: 16,
+            policy: Policy::Continuous,
+            attention: AttentionImpl::Kernel,
         }
     }
 }
@@ -107,6 +126,11 @@ impl Finish {
 #[derive(Debug, Default)]
 pub struct EngineStats {
     pub running: AtomicUsize,
+    /// Admitted-but-not-running: new and preempted sequences inside the engine.
+    pub waiting: AtomicUsize,
+    pub preemptions: AtomicU64,
+    /// KV block utilization in parts per million.
+    pub kv_usage_ppm: AtomicU64,
     pub alive: AtomicBool,
 }
 
@@ -158,6 +182,15 @@ impl EngineHandle {
         self.stats.running.load(Ordering::Relaxed)
     }
 
+    pub fn stats(&self) -> &EngineStats {
+        &self.stats
+    }
+
+    /// Fraction of KV blocks in use, 0.0 to 1.0.
+    pub fn kv_utilization(&self) -> f64 {
+        self.stats.kv_usage_ppm.load(Ordering::Relaxed) as f64 / 1e6
+    }
+
     pub fn is_alive(&self) -> bool {
         self.stats.alive.load(Ordering::Relaxed) && !self.tx.is_closed()
     }
@@ -168,27 +201,74 @@ impl EngineHandle {
     }
 }
 
-/// Starts the engine thread, which owns `model` from here on.
+/// Starts the engine thread, which owns `model` and the KV pool from here on.
 pub fn spawn(
     model: Llama,
     tokenizer: Arc<Tokenizer>,
     cfg: EngineConfig,
-) -> std::io::Result<EngineHandle> {
-    let (handle, rx) = EngineHandle::channel(&cfg, model.max_seq_len());
+) -> anyhow::Result<EngineHandle> {
+    let num_blocks = PagedKvCache::blocks_for_bytes(
+        model.config(),
+        cfg.kv_cache_bytes,
+        cfg.block_size,
+        model.dtype(),
+    );
+    anyhow::ensure!(
+        num_blocks >= 2,
+        "kv cache of {} bytes holds fewer than 2 blocks",
+        cfg.kv_cache_bytes
+    );
+    let sched_cfg = SchedulerConfig {
+        max_num_seqs: cfg.max_num_seqs,
+        max_batched_tokens: cfg.max_batched_tokens.max(cfg.max_num_seqs),
+        num_blocks,
+        block_size: cfg.block_size,
+        watermark_blocks: (num_blocks / 100).max(1),
+        policy: cfg.policy,
+    };
+    let mut cache = PagedKvCache::new(
+        model.config(),
+        num_blocks,
+        cfg.block_size,
+        model.dtype(),
+        model.device(),
+    )?;
+    let attention = cache.set_attention(cfg.attention);
+    let max_seq_len = model.max_seq_len().min(sched_cfg.max_seq_tokens());
+    tracing::info!(
+        num_blocks,
+        block_size = cfg.block_size,
+        tokens = num_blocks * cfg.block_size,
+        mib = cfg.kv_cache_bytes >> 20,
+        max_seq_len,
+        ?attention,
+        "kv cache allocated"
+    );
+    let (handle, rx) = EngineHandle::channel(&cfg, max_seq_len);
     let stats = handle.stats.clone();
     std::thread::Builder::new()
         .name("engine".into())
         .spawn(move || {
-            run(&model, &tokenizer, &cfg, rx, &stats);
+            let mut engine = Engine {
+                model,
+                tokenizer,
+                cache,
+                sched: Scheduler::new(sched_cfg),
+                seqs: HashMap::new(),
+                next_id: 0,
+                max_seq_len,
+                stats: stats.clone(),
+            };
+            engine.run(rx);
             stats.alive.store(false, Ordering::Relaxed);
         })?;
     Ok(handle)
 }
 
 struct Sequence {
-    prompt: Vec<u32>,
-    output: Vec<u32>,
-    kv: ContiguousKvCache,
+    /// Prompt followed by everything generated so far.
+    tokens: Vec<u32>,
+    prompt_len: usize,
     sampler: Sampler,
     detok: Detokenizer,
     stop: StopMatcher,
@@ -200,39 +280,36 @@ struct Sequence {
 }
 
 impl Sequence {
-    fn new(model: &Llama, req: Request) -> Option<Self> {
+    fn new(req: Request, max_seq_len: usize) -> Option<Self> {
         let total = req.prompt.len() + req.params.max_tokens;
-        let fail = |msg: String| {
-            let _ = req.events.send(Event::Error(msg));
-            None
-        };
         if req.prompt.is_empty() || req.params.max_tokens == 0 {
-            return fail("empty prompt or max_tokens of 0".into());
+            let _ = req
+                .events
+                .send(Event::Error("empty prompt or max_tokens of 0".into()));
+            return None;
         }
-        if total > model.max_seq_len() {
-            return fail(format!(
-                "{total} tokens exceeds max_seq_len {}",
-                model.max_seq_len()
-            ));
+        if total > max_seq_len {
+            let _ = req.events.send(Event::Error(format!(
+                "{total} tokens exceeds max_seq_len {max_seq_len}"
+            )));
+            return None;
         }
-        let kv = match ContiguousKvCache::new(model.config(), total, model.dtype(), model.device())
-        {
-            Ok(kv) => kv,
-            Err(e) => return fail(format!("allocating kv cache: {e}")),
-        };
         Some(Self {
             detok: Detokenizer::new(&req.prompt),
             stop: StopMatcher::new(req.params.stop.clone()),
             max_tokens: req.params.max_tokens,
             sampler: Sampler::new(req.params),
-            output: Vec::new(),
-            prompt: req.prompt,
-            kv,
+            prompt_len: req.prompt.len(),
+            tokens: req.prompt,
             events: req.events,
             arrived: req.arrived,
             first_token_at: None,
             finished: false,
         })
+    }
+
+    fn output_len(&self) -> usize {
+        self.tokens.len() - self.prompt_len
     }
 
     fn send_text(&self, text: String) {
@@ -248,7 +325,7 @@ impl Sequence {
         if tokenizer.is_eos(token) {
             return self.finish(FinishReason::Stop, tokenizer);
         }
-        self.output.push(token);
+        self.tokens.push(token);
         let text = self.detok.push(tokenizer, token)?;
         match self.stop.push(&text) {
             StopResult::Continue(t) => self.send_text(t),
@@ -257,7 +334,7 @@ impl Sequence {
                 return self.send_finish(FinishReason::Stop);
             }
         }
-        if self.output.len() >= self.max_tokens {
+        if self.output_len() >= self.max_tokens {
             return self.finish(FinishReason::Length, tokenizer);
         }
         Ok(())
@@ -285,8 +362,8 @@ impl Sequence {
         let first = self.first_token_at.unwrap_or_else(Instant::now);
         let _ = self.events.send(Event::Finished(Finish {
             reason,
-            prompt_tokens: self.prompt.len(),
-            completion_tokens: self.output.len(),
+            prompt_tokens: self.prompt_len,
+            completion_tokens: self.output_len(),
             ttft: first - self.arrived,
             decode_time: first.elapsed(),
         }));
@@ -298,64 +375,180 @@ impl Sequence {
     }
 }
 
-fn run(
-    model: &Llama,
-    tokenizer: &Tokenizer,
-    cfg: &EngineConfig,
-    mut rx: mpsc::Receiver<Request>,
-    stats: &EngineStats,
-) {
-    tracing::info!(max_batch_size = cfg.max_batch_size, "engine started");
-    while let Some(first) = rx.blocking_recv() {
-        let mut batch: Vec<Sequence> = Sequence::new(model, first).into_iter().collect();
-        while batch.len() < cfg.max_batch_size {
-            match rx.try_recv() {
-                Ok(req) => batch.extend(Sequence::new(model, req)),
-                Err(_) => break,
-            }
-        }
-        tracing::debug!(batch = batch.len(), "batch started");
-        while !batch.is_empty() {
-            batch.retain(|s| !s.cancelled());
-            stats.running.store(batch.len(), Ordering::Relaxed);
-            if batch.is_empty() {
-                break;
-            }
-            if let Err(e) = step(model, tokenizer, &mut batch) {
-                tracing::error!("engine step failed: {e:#}");
-                for s in &batch {
-                    let _ = s.events.send(Event::Error(format!("{e:#}")));
-                }
-                batch.clear();
-            }
-            batch.retain(|s| !s.finished);
-        }
-        stats.running.store(0, Ordering::Relaxed);
-    }
-    tracing::info!("engine stopped");
+struct Engine {
+    model: Llama,
+    tokenizer: Arc<Tokenizer>,
+    cache: PagedKvCache,
+    sched: Scheduler,
+    seqs: HashMap<SeqId, Sequence>,
+    next_id: SeqId,
+    max_seq_len: usize,
+    stats: Arc<EngineStats>,
 }
 
-/// One forward pass over the batch (prefill for new sequences, one decode token for the
-/// rest), then one sampled token per sequence.
-fn step(model: &Llama, tokenizer: &Tokenizer, batch: &mut [Sequence]) -> anyhow::Result<()> {
-    let mut inputs: Vec<SeqInput> = batch
-        .iter_mut()
-        .map(|s| {
-            let Sequence {
-                prompt, output, kv, ..
-            } = s;
-            let tokens = match output.last() {
-                Some(last) => std::slice::from_ref(last),
-                None => prompt.as_slice(),
-            };
-            SeqInput { tokens, kv }
-        })
-        .collect();
-    let logits = model.forward_batch(&mut inputs)?.to_vec2::<f32>()?;
-    drop(inputs);
-    for (seq, mut row) in batch.iter_mut().zip(logits) {
-        let token = seq.sampler.sample(&mut row, &[&seq.prompt, &seq.output]);
-        seq.accept(token, tokenizer)?;
+impl Engine {
+    fn run(&mut self, mut rx: mpsc::Receiver<Request>) {
+        tracing::info!(policy = ?self.sched.config().policy, "engine started");
+        loop {
+            if !self.sched.has_work() {
+                self.publish_stats();
+                match rx.blocking_recv() {
+                    Some(req) => self.add(req),
+                    None => break,
+                }
+            }
+            while let Ok(req) = rx.try_recv() {
+                self.add(req);
+            }
+            self.drop_cancelled();
+            if !self.sched.has_work() {
+                continue;
+            }
+            let step = self.sched.schedule();
+            if step.seqs.is_empty() {
+                // Admission guarantees any queued sequence fits an idle pool, so this means a
+                // scheduler bug; fail loudly rather than spin.
+                tracing::error!("scheduler made no progress");
+                self.fail_all("scheduler made no progress");
+                continue;
+            }
+            if let Err(e) = self.step(&step) {
+                tracing::error!("engine step failed: {e:#}");
+                self.fail_all(&format!("{e:#}"));
+            }
+            self.publish_stats();
+        }
+        tracing::info!("engine stopped");
     }
-    Ok(())
+
+    fn add(&mut self, req: Request) {
+        if let Some(seq) = Sequence::new(req, self.max_seq_len) {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.sched.add(id, seq.tokens.len());
+            self.seqs.insert(id, seq);
+        }
+    }
+
+    /// A dropped event receiver means the client went away: free its blocks now.
+    fn drop_cancelled(&mut self) {
+        let gone: Vec<SeqId> = self
+            .seqs
+            .iter()
+            .filter(|(_, s)| s.cancelled())
+            .map(|(&id, _)| id)
+            .collect();
+        for id in gone {
+            self.sched.remove(id);
+            self.seqs.remove(&id);
+        }
+    }
+
+    fn fail_all(&mut self, msg: &str) {
+        for (id, seq) in self.seqs.drain() {
+            let _ = seq.events.send(Event::Error(msg.to_string()));
+            self.sched.remove(id);
+        }
+    }
+
+    fn publish_stats(&self) {
+        let s = &self.stats;
+        s.running.store(self.sched.num_running(), Ordering::Relaxed);
+        s.waiting.store(self.sched.num_waiting(), Ordering::Relaxed);
+        s.preemptions
+            .store(self.sched.num_preemptions(), Ordering::Relaxed);
+        s.kv_usage_ppm.store(
+            (self.sched.kv_utilization() * 1e6) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// One forward pass over everything scheduled, then one sampled token for each sequence
+    /// that is fully computed. Partially prefilled sequences just advance.
+    fn step(&mut self, step: &Schedule) -> anyhow::Result<()> {
+        if !step.copies.is_empty() {
+            let copies: Vec<(u32, u32)> = step.copies.iter().map(|c| (c.src, c.dst)).collect();
+            self.cache.copy_blocks(&copies)?;
+        }
+        let started = Instant::now();
+        let tokens: Vec<&[u32]> = step
+            .seqs
+            .iter()
+            .map(|q| &self.seqs[&q.id].tokens[q.start..q.end])
+            .collect();
+        let paged: Vec<PagedSeq> = step
+            .seqs
+            .iter()
+            .map(|q| PagedSeq {
+                block_table: self.sched.block_table(q.id),
+                start_pos: q.start,
+                len: q.end - q.start,
+            })
+            .collect();
+        let mut batch = PagedBatch::new(&self.cache, &paged)?;
+        let gpu_started = Instant::now();
+        let logits = self.model.forward_batch(&tokens, &mut batch)?;
+        drop((tokens, paged, batch));
+
+        // Rows that produce a token this step (not mid-prefill), and whether each can take the
+        // GPU argmax: greedy without repetition penalty needs nothing else from the logits.
+        let mut sampled = Vec::new();
+        for (row, q) in step.seqs.iter().enumerate() {
+            self.sched.advance(q.id, q.end);
+            if self.sched.is_caught_up(q.id) {
+                let p = self.seqs[&q.id].sampler.params();
+                sampled.push((row, q.id, p.is_greedy() && p.repetition_penalty == 1.0));
+            }
+        }
+        // Reading results back waits for the GPU, so `forward_us` covers the whole pass.
+        let argmax = match sampled.iter().any(|s| s.2) {
+            true => logits.argmax(1)?.to_vec1::<u32>()?,
+            false => Vec::new(),
+        };
+        let full_rows: Vec<usize> = sampled.iter().filter(|s| !s.2).map(|s| s.0).collect();
+        let mut full = match full_rows.is_empty() {
+            true => Vec::new(),
+            false => {
+                let idx = Tensor::new(
+                    full_rows.iter().map(|&r| r as u32).collect::<Vec<_>>(),
+                    logits.device(),
+                )?;
+                logits.index_select(&idx, 0)?.to_vec2::<f32>()?
+            }
+        }
+        .into_iter();
+        let sample_started = Instant::now();
+
+        for (row, id, fast) in sampled {
+            let seq = self.seqs.get_mut(&id).expect("scheduled sequence exists");
+            let token = match fast {
+                true => argmax[row],
+                false => {
+                    let mut logits = full.next().expect("one row per slow sampler");
+                    seq.sampler.sample(&mut logits, &[&seq.tokens])
+                }
+            };
+            seq.accept(token, &self.tokenizer)?;
+            if seq.finished {
+                self.sched.remove(id);
+                self.seqs.remove(&id);
+            } else {
+                self.sched.append_token(id);
+            }
+        }
+        tracing::debug!(
+            seqs = step.seqs.len(),
+            tokens = step.num_tokens(),
+            prep_us = (gpu_started - started).as_micros() as u64,
+            forward_us = (sample_started - gpu_started).as_micros() as u64,
+            sample_us = sample_started.elapsed().as_micros() as u64,
+            "step"
+        );
+        Ok(())
+    }
+}
+
+/// Default KV pool size in bytes for `gb` gigabytes.
+pub fn gib(gb: f64) -> usize {
+    (gb * (1u64 << 30) as f64) as usize
 }

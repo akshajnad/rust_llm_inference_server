@@ -13,6 +13,7 @@ test-util = ["dep:candle-nn"]
 
 [dependencies]
 model.workspace = true
+kvcache.workspace = true
 candle-core.workspace = true
 candle-nn = { workspace = true, optional = true }
 tokenizers.workspace = true

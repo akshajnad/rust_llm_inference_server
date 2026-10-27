@@ -5,7 +5,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use candle_core::DType;
 use clap::{Parser, Subcommand, ValueEnum};
-use engine::{ChatTemplate, EngineConfig, Event, Request, SamplingParams, Tokenizer};
+use engine::{
+    AttentionImpl, ChatTemplate, EngineConfig, Event, Policy, Request, SamplingParams, Tokenizer,
+};
 use model::Llama;
 use server::AppState;
 
@@ -41,6 +43,8 @@ struct ModelArgs {
 struct GenerateArgs {
     #[command(flatten)]
     model: ModelArgs,
+    #[command(flatten)]
+    engine: EngineArgs,
     #[arg(long)]
     prompt: String,
     /// Wrap the prompt as one user message in the model's chat template.
@@ -71,11 +75,67 @@ struct ServeArgs {
     /// Name reported in responses and `/v1/models`.
     #[arg(long, default_value = "llama-3.2-1b-instruct")]
     served_model_name: String,
-    #[arg(long, default_value_t = 32)]
-    max_batch_size: usize,
+    #[command(flatten)]
+    engine: EngineArgs,
     /// Waiting requests allowed before new ones get 503.
     #[arg(long, default_value_t = 256)]
     queue_size: usize,
+}
+
+#[derive(clap::Args)]
+struct EngineArgs {
+    /// KV cache pool size, allocated at startup.
+    #[arg(long, default_value_t = 1.0)]
+    kv_cache_gb: f64,
+    /// Tokens per KV block.
+    #[arg(long, default_value_t = 16)]
+    block_size: usize,
+    /// Most sequences in one step.
+    #[arg(long, default_value_t = 64)]
+    max_num_seqs: usize,
+    /// Most tokens in one step; longer prompts are prefilled in chunks.
+    #[arg(long, default_value_t = 2048)]
+    max_batched_tokens: usize,
+    #[arg(long, value_enum, default_value_t = SchedulerArg::Continuous)]
+    scheduler: SchedulerArg,
+    #[arg(long, value_enum, default_value_t = AttentionArg::V2)]
+    attention: AttentionArg,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum AttentionArg {
+    /// Gather each sequence's KV blocks, then standard attention.
+    V1,
+    /// Paged-attention Metal kernel for decode (falls back to v1 elsewhere).
+    V2,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SchedulerArg {
+    /// Sequences join and leave the batch every step.
+    Continuous,
+    /// A batch runs until all of it finishes before new requests start (baseline).
+    Static,
+}
+
+impl EngineArgs {
+    fn config(&self, queue_size: usize) -> EngineConfig {
+        EngineConfig {
+            max_num_seqs: self.max_num_seqs,
+            max_batched_tokens: self.max_batched_tokens,
+            queue_size,
+            kv_cache_bytes: engine::gib(self.kv_cache_gb),
+            block_size: self.block_size,
+            policy: match self.scheduler {
+                SchedulerArg::Continuous => Policy::Continuous,
+                SchedulerArg::Static => Policy::Static,
+            },
+            attention: match self.attention {
+                AttentionArg::V1 => AttentionImpl::Gather,
+                AttentionArg::V2 => AttentionImpl::Kernel,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -139,14 +199,7 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
     } else {
         tokenizer.encode(&args.prompt)?
     };
-    let engine = engine::spawn(
-        llama,
-        tokenizer,
-        EngineConfig {
-            max_batch_size: 1,
-            queue_size: 1,
-        },
-    )?;
+    let engine = engine::spawn(llama, tokenizer, args.engine.config(1))?;
     let params = SamplingParams {
         temperature: args.temperature,
         top_p: args.top_p,
@@ -190,11 +243,11 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             None
         }
     };
-    let cfg = EngineConfig {
-        max_batch_size: args.max_batch_size,
-        queue_size: args.queue_size,
-    };
-    let engine = engine::spawn(llama, tokenizer.clone(), cfg)?;
+    let engine = engine::spawn(
+        llama,
+        tokenizer.clone(),
+        args.engine.config(args.queue_size),
+    )?;
     let state = AppState {
         engine,
         tokenizer,

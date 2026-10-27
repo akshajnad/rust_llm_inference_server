@@ -4,6 +4,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
@@ -42,7 +43,10 @@ async fn health(State(st): State<AppState>) -> Response {
     let body = json!({
         "status": if st.engine.is_alive() { "ok" } else { "engine_stopped" },
         "running": st.engine.running(),
+        "waiting": st.engine.stats().waiting.load(Ordering::Relaxed),
         "queued": st.engine.queue_depth(),
+        "preemptions": st.engine.stats().preemptions.load(Ordering::Relaxed),
+        "kv_cache_utilization": st.engine.kv_utilization(),
     });
     let status = if st.engine.is_alive() {
         axum::http::StatusCode::OK
@@ -70,10 +74,7 @@ async fn completions(
     body: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(req) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
-    let prompt = st
-        .tokenizer
-        .encode(req.prompt_text()?)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let prompt = tokenize(&st, req.prompt_text()?.to_string(), true).await?;
     let params = req
         .sampling
         .to_params(req.sampling.max_tokens, COMPLETIONS_DEFAULT_MAX_TOKENS)?;
@@ -99,10 +100,7 @@ async fn chat_completions(
     let text = template
         .render(&req.messages()?, true)
         .map_err(|e| ApiError::invalid(format!("chat template: {e:#}"), "messages"))?;
-    let prompt = st
-        .tokenizer
-        .encode_raw(&text)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let prompt = tokenize(&st, text, false).await?;
     let default_max = st.engine.max_seq_len().saturating_sub(prompt.len()).max(1);
     let params = req.sampling.to_params(req.max_tokens(), default_max)?;
     run(
@@ -116,6 +114,21 @@ async fn chat_completions(
     .await
 }
 
+/// Tokenizes off the async workers: a long prompt takes milliseconds of CPU.
+async fn tokenize(st: &AppState, text: String, add_bos: bool) -> Result<Vec<u32>, ApiError> {
+    let tokenizer = st.tokenizer.clone();
+    tokio::task::spawn_blocking(move || {
+        if add_bos {
+            tokenizer.encode(&text)
+        } else {
+            tokenizer.encode_raw(&text)
+        }
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(|e| ApiError::internal(e.to_string()))
+}
+
 async fn run(
     st: AppState,
     kind: Kind,
@@ -125,6 +138,20 @@ async fn run(
     include_usage: bool,
 ) -> Result<Response, ApiError> {
     let limit = st.engine.max_seq_len();
+    if prompt.len() >= limit {
+        let param = if kind == Kind::Chat {
+            "messages"
+        } else {
+            "prompt"
+        };
+        return Err(ApiError::invalid(
+            format!(
+                "the prompt is {} tokens; this model's maximum context length is {limit}",
+                prompt.len()
+            ),
+            param,
+        ));
+    }
     let requested = prompt.len() + params.max_tokens;
     if requested > limit {
         return Err(ApiError::invalid(

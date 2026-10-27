@@ -71,12 +71,26 @@ impl Rope {
         self.cos.dim(0).unwrap_or(0)
     }
 
-    /// Rotates `x` of shape `(b, heads, seq, head_dim)` whose first token sits at `start_pos`.
-    pub fn apply(&self, x: &Tensor, start_pos: usize) -> Result<Tensor> {
-        let seq = x.dim(2)?;
-        let cos = self.cos.narrow(0, start_pos, seq)?.contiguous()?;
-        let sin = self.sin.narrow(0, start_pos, seq)?.contiguous()?;
-        candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
+    /// Gathers the cos/sin rows for each token's position, once per forward pass.
+    pub fn batch(&self, positions: &Tensor) -> Result<RopeBatch> {
+        Ok(RopeBatch {
+            cos: self.cos.index_select(positions, 0)?.contiguous()?,
+            sin: self.sin.index_select(positions, 0)?.contiguous()?,
+        })
+    }
+}
+
+/// cos/sin rows `(total_tokens, head_dim / 2)` for one batch, in token order.
+#[derive(Debug, Clone)]
+pub struct RopeBatch {
+    cos: Tensor,
+    sin: Tensor,
+}
+
+impl RopeBatch {
+    /// Rotates `x` of shape `(1, heads, total_tokens, head_dim)`.
+    pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
+        candle_nn::rotary_emb::rope(&x.contiguous()?, &self.cos, &self.sin)
     }
 }
 

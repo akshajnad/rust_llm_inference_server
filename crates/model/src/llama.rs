@@ -3,9 +3,9 @@ use std::path::Path;
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 
-use crate::attention::{Attention, Segment, SeqInput, causal_mask};
+use crate::attention::{Attention, Segment, causal_mask};
 use crate::config::LlamaConfig;
-use crate::kv::KvStore;
+use crate::kv::{KvBatch, KvStore, PerSeqKv};
 use crate::layers::{Linear, Mlp, RmsNorm};
 use crate::rope::Rope;
 
@@ -26,6 +26,44 @@ impl Block {
             post_attn_norm: RmsNorm::load(vb.pp("post_attention_layernorm"), h, eps)?,
             mlp: Mlp::load(vb.pp("mlp"), h, cfg.intermediate_size)?,
         })
+    }
+}
+
+/// Loads each tensor on the CPU, casts it there, then uploads only the final dtype.
+///
+/// candle's default mmap backend uploads the checkpoint dtype (bf16) and casts on the device;
+/// on Metal the freed bf16 buffers stay in the allocator's cache, so loading peaked about 1.3
+/// GB above the steady footprint.
+struct CastOnCpu(candle_core::safetensors::MmapedSafetensors);
+
+impl candle_nn::var_builder::SimpleBackend for CastOnCpu {
+    fn get(
+        &self,
+        shape: candle_core::Shape,
+        name: &str,
+        _: candle_nn::Init,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Tensor> {
+        let t = self.get_unchecked(name, dtype, dev)?;
+        if t.shape() != &shape {
+            candle_core::bail!(
+                "{name}: expected shape {shape:?}, checkpoint has {:?}",
+                t.shape()
+            );
+        }
+        Ok(t)
+    }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
+        self.0
+            .load(name, &Device::Cpu)?
+            .to_dtype(dtype)?
+            .to_device(dev)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.0.get(name).is_ok()
     }
 }
 
@@ -63,7 +101,8 @@ impl Llama {
             dir.display()
         );
         // SAFETY: the files are opened read-only and not modified while mapped.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? };
+        let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&files)? };
+        let vb = VarBuilder::from_backend(Box::new(CastOnCpu(tensors)), dtype, device.clone());
         Ok(Self::new(cfg, vb, max_seq_len)?)
     }
 
@@ -114,11 +153,19 @@ impl Llama {
 
     /// Runs every sequence's new tokens through the model in one pass and returns the final
     /// hidden states `(1, total_tokens, hidden)` with each sequence's segment.
-    fn hidden(&self, seqs: &mut [SeqInput]) -> Result<(Tensor, Vec<Segment>)> {
-        let mut segments = Vec::with_capacity(seqs.len());
+    fn hidden(&self, tokens: &[&[u32]], kv: &mut dyn KvBatch) -> Result<(Tensor, Vec<Segment>)> {
+        if tokens.len() != kv.num_seqs() {
+            candle_core::bail!(
+                "{} token lists for {} kv sequences",
+                tokens.len(),
+                kv.num_seqs()
+            );
+        }
+        let mut segments = Vec::with_capacity(tokens.len());
+        let mut positions = Vec::new();
         let mut offset = 0;
-        for seq in seqs.iter() {
-            let (start_pos, len) = (seq.kv.seq_len(), seq.tokens.len());
+        for (i, toks) in tokens.iter().enumerate() {
+            let (start_pos, len) = (kv.start_pos(i), toks.len());
             if len == 0 {
                 candle_core::bail!("empty sequence in batch");
             }
@@ -139,14 +186,16 @@ impl Llama {
                 start_pos,
                 mask,
             });
+            positions.extend(start_pos as u32..(start_pos + len) as u32);
             offset += len;
         }
-        let ids: Vec<u32> = seqs.iter().flat_map(|s| s.tokens.iter().copied()).collect();
+        let rope = self.rope.batch(&Tensor::new(positions, &self.device)?)?;
+        let ids: Vec<u32> = tokens.iter().flat_map(|t| t.iter().copied()).collect();
         let ids = Tensor::new(ids, &self.device)?;
         let mut x = self.embed.index_select(&ids, 0)?.unsqueeze(0)?;
         for (i, block) in self.blocks.iter().enumerate() {
             let h = block.input_norm.forward(&x)?;
-            let h = block.attn.forward(&h, i, &segments, &self.rope, seqs)?;
+            let h = block.attn.forward(&h, i, &segments, &rope, kv)?;
             x = (x + h)?;
             let h = block.mlp.forward(&block.post_attn_norm.forward(&x)?)?;
             x = (x + h)?;
@@ -156,8 +205,8 @@ impl Llama {
 
     /// Batched step: logits at each sequence's last new position, shape `(n_seqs, vocab)`, in
     /// f32. Sequences may mix prefill (many tokens) and decode (one token).
-    pub fn forward_batch(&self, seqs: &mut [SeqInput]) -> Result<Tensor> {
-        let (h, segments) = self.hidden(seqs)?;
+    pub fn forward_batch(&self, tokens: &[&[u32]], kv: &mut dyn KvBatch) -> Result<Tensor> {
+        let (h, segments) = self.hidden(tokens, kv)?;
         let last: Vec<u32> = segments
             .iter()
             .map(|s| (s.offset + s.len - 1) as u32)
@@ -169,13 +218,13 @@ impl Llama {
 
     /// Logits for the last position only, shape `(vocab,)`, in f32.
     pub fn forward(&self, tokens: &[u32], kv: &mut dyn KvStore) -> Result<Tensor> {
-        self.forward_batch(&mut [SeqInput { tokens, kv }])?
+        self.forward_batch(&[tokens], &mut PerSeqKv(vec![kv]))?
             .squeeze(0)
     }
 
     /// Logits for every position, shape `(seq, vocab)`, in f32.
     pub fn forward_all_logits(&self, tokens: &[u32], kv: &mut dyn KvStore) -> Result<Tensor> {
-        let (h, _) = self.hidden(&mut [SeqInput { tokens, kv }])?;
+        let (h, _) = self.hidden(&[tokens], &mut PerSeqKv(vec![kv]))?;
         self.lm_head.forward(&h)?.to_dtype(DType::F32)?.squeeze(0)
     }
 }
@@ -185,6 +234,10 @@ mod tests {
     use super::*;
     use crate::kv::ContiguousKvCache;
     use candle_nn::VarMap;
+
+    fn per_seq(kvs: &mut [ContiguousKvCache]) -> PerSeqKv<'_> {
+        PerSeqKv(kvs.iter_mut().map(|k| k as &mut dyn KvStore).collect())
+    }
 
     fn tiny_model() -> Result<Llama> {
         let varmap = VarMap::new();
@@ -238,12 +291,7 @@ mod tests {
         }
 
         let mut kvs = [cache()?, cache()?, cache()?];
-        let mut seqs: Vec<SeqInput> = prompts
-            .iter()
-            .zip(kvs.iter_mut())
-            .map(|(&tokens, kv)| SeqInput { tokens, kv })
-            .collect();
-        let batched = model.forward_batch(&mut seqs)?;
+        let batched = model.forward_batch(&prompts, &mut per_seq(&mut kvs))?;
         let close = |a: &Tensor, b: &Tensor| -> Result<f32> {
             (a - b)?.abs()?.max_all()?.to_scalar::<f32>()
         };
@@ -254,12 +302,7 @@ mod tests {
         // Then one mixed step: two decodes alongside a fresh prefill for sequence 2.
         let next: [&[u32]; 3] = [&[11], &[12], &[3, 4]];
         kvs[2].reset();
-        let mut seqs: Vec<SeqInput> = next
-            .iter()
-            .zip(kvs.iter_mut())
-            .map(|(&tokens, kv)| SeqInput { tokens, kv })
-            .collect();
-        let batched = model.forward_batch(&mut seqs)?;
+        let batched = model.forward_batch(&next, &mut per_seq(&mut kvs))?;
         let mut fresh = cache()?;
         let want = [
             model.forward(next[0], &mut alone_kv[0])?,
