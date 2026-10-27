@@ -28,12 +28,15 @@ pub struct AppState {
     pub tokenizer: Arc<Tokenizer>,
     pub chat_template: Option<Arc<ChatTemplate>>,
     pub model_name: String,
+    /// Renders the Prometheus exposition for `/metrics`; `None` disables the endpoint.
+    pub metrics: Option<metrics_exporter_prometheus::PrometheusHandle>,
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
+        .route("/metrics", get(prometheus))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
@@ -54,6 +57,26 @@ async fn health(State(st): State<AppState>) -> Response {
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     };
     (status, Json(body)).into_response()
+}
+
+/// Queue depth and memory are sampled at scrape time; engine metrics are recorded as they happen.
+async fn prometheus(State(st): State<AppState>) -> Response {
+    let Some(handle) = &st.metrics else {
+        return (axum::http::StatusCode::NOT_FOUND, "metrics disabled").into_response();
+    };
+    metrics::gauge!("rlis_queue_depth").set(st.engine.queue_depth() as f64);
+    if let Some(f) = crate::memory::footprint() {
+        metrics::gauge!("rlis_process_memory_footprint_bytes").set(f.current_bytes as f64);
+        metrics::gauge!("rlis_process_memory_footprint_peak_bytes").set(f.peak_bytes as f64);
+    }
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        handle.render(),
+    )
+        .into_response()
 }
 
 async fn models(State(st): State<AppState>) -> Json<Value> {

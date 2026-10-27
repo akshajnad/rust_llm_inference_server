@@ -17,6 +17,7 @@ use model::{AttentionImpl, Llama, PagedBatch, PagedKvCache, PagedSeq};
 use tokio::sync::mpsc;
 
 use crate::detokenizer::Detokenizer;
+use crate::metrics as m;
 use crate::sampler::{Sampler, SamplingParams};
 use crate::scheduler::{Policy, Schedule, Scheduler, SchedulerConfig};
 use crate::stop::{StopMatcher, StopResult};
@@ -211,7 +212,7 @@ pub fn spawn(
         model.config(),
         cfg.kv_cache_bytes,
         cfg.block_size,
-        model.dtype(),
+        model.kv_dtype(),
     );
     anyhow::ensure!(
         num_blocks >= 2,
@@ -230,7 +231,7 @@ pub fn spawn(
         model.config(),
         num_blocks,
         cfg.block_size,
-        model.dtype(),
+        model.kv_dtype(),
         model.device(),
     )?;
     let attention = cache.set_attention(cfg.attention);
@@ -276,6 +277,7 @@ struct Sequence {
     events: mpsc::UnboundedSender<Event>,
     arrived: Instant,
     first_token_at: Option<Instant>,
+    last_token_at: Option<Instant>,
     finished: bool,
 }
 
@@ -304,6 +306,7 @@ impl Sequence {
             events: req.events,
             arrived: req.arrived,
             first_token_at: None,
+            last_token_at: None,
             finished: false,
         })
     }
@@ -321,11 +324,17 @@ impl Sequence {
     /// Records a sampled token, streams its text, and finishes the sequence when done.
     fn accept(&mut self, token: u32, tokenizer: &Tokenizer) -> anyhow::Result<()> {
         let now = Instant::now();
+        match self.last_token_at {
+            None => metrics::histogram!(m::TTFT).record((now - self.arrived).as_secs_f64()),
+            Some(prev) => metrics::histogram!(m::ITL).record((now - prev).as_secs_f64()),
+        }
         self.first_token_at.get_or_insert(now);
+        self.last_token_at = Some(now);
         if tokenizer.is_eos(token) {
             return self.finish(FinishReason::Stop, tokenizer);
         }
         self.tokens.push(token);
+        metrics::counter!(m::GENERATED_TOKENS).increment(1);
         let text = self.detok.push(tokenizer, token)?;
         match self.stop.push(&text) {
             StopResult::Continue(t) => self.send_text(t),
@@ -360,13 +369,18 @@ impl Sequence {
     fn send_finish(&mut self, reason: FinishReason) -> anyhow::Result<()> {
         self.finished = true;
         let first = self.first_token_at.unwrap_or_else(Instant::now);
-        let _ = self.events.send(Event::Finished(Finish {
+        let finish = Finish {
             reason,
             prompt_tokens: self.prompt_len,
             completion_tokens: self.output_len(),
             ttft: first - self.arrived,
             decode_time: first.elapsed(),
-        }));
+        };
+        metrics::counter!(m::REQUESTS_FINISHED, "reason" => reason.as_openai()).increment(1);
+        if finish.completion_tokens > 1 {
+            metrics::histogram!(m::REQUEST_DECODE_TPS).record(finish.decode_tokens_per_sec());
+        }
+        let _ = self.events.send(Event::Finished(finish));
         Ok(())
     }
 
@@ -413,8 +427,10 @@ impl Engine {
                 continue;
             }
             if let Err(e) = self.step(&step) {
+                // Only this step's sequences may have half-written caches; the rest are intact.
                 tracing::error!("engine step failed: {e:#}");
-                self.fail_all(&format!("{e:#}"));
+                let ids: Vec<SeqId> = step.seqs.iter().map(|q| q.id).collect();
+                self.fail(&ids, &format!("{e:#}"));
             }
             self.publish_stats();
         }
@@ -445,13 +461,24 @@ impl Engine {
     }
 
     fn fail_all(&mut self, msg: &str) {
-        for (id, seq) in self.seqs.drain() {
-            let _ = seq.events.send(Event::Error(msg.to_string()));
-            self.sched.remove(id);
+        let ids: Vec<SeqId> = self.seqs.keys().copied().collect();
+        self.fail(&ids, msg);
+    }
+
+    fn fail(&mut self, ids: &[SeqId], msg: &str) {
+        for id in ids {
+            if let Some(seq) = self.seqs.remove(id) {
+                let _ = seq.events.send(Event::Error(msg.to_string()));
+            }
+            self.sched.remove(*id);
         }
     }
 
     fn publish_stats(&self) {
+        metrics::gauge!(m::RUNNING).set(self.sched.num_running() as f64);
+        metrics::gauge!(m::WAITING).set(self.sched.num_waiting() as f64);
+        metrics::gauge!(m::KV_UTILIZATION).set(self.sched.kv_utilization());
+        metrics::counter!(m::PREEMPTIONS).absolute(self.sched.num_preemptions());
         let s = &self.stats;
         s.running.store(self.sched.num_running(), Ordering::Relaxed);
         s.waiting.store(self.sched.num_waiting(), Ordering::Relaxed);
@@ -471,6 +498,7 @@ impl Engine {
             self.cache.copy_blocks(&copies)?;
         }
         let started = Instant::now();
+        metrics::histogram!(m::STEP_TOKENS).record(step.num_tokens() as f64);
         let tokens: Vec<&[u32]> = step
             .seqs
             .iter()

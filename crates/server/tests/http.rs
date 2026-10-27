@@ -24,7 +24,17 @@ fn state_with(engine: EngineHandle) -> AppState {
             ChatTemplate::new(template, "<s>", "</s>").unwrap(),
         )),
         model_name: "tiny".into(),
+        metrics: Some(prometheus()),
     }
+}
+
+/// The recorder is process-global, so every test shares one.
+fn prometheus() -> metrics_exporter_prometheus::PrometheusHandle {
+    static HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
+        std::sync::OnceLock::new();
+    HANDLE
+        .get_or_init(|| server::install_prometheus().unwrap())
+        .clone()
 }
 
 fn state() -> AppState {
@@ -274,4 +284,39 @@ async fn health_reports_engine_state() {
         serde_json::from_str::<Value>(&body).unwrap()["status"],
         "ok"
     );
+}
+
+#[tokio::test]
+async fn metrics_expose_engine_and_memory_series() {
+    let st = state();
+    let (status, _, _) = send(
+        &st,
+        post(
+            "/v1/completions",
+            json!({"prompt": "metrics", "max_tokens": 4, "temperature": 0}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, headers, body) =
+        send(&st, Request::get("/metrics").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain")
+    );
+    for series in [
+        "rlis_time_to_first_token_seconds_bucket",
+        "rlis_inter_token_latency_seconds_bucket",
+        "rlis_generated_tokens_total",
+        "rlis_requests_finished_total{reason=\"length\"}",
+        "rlis_kv_cache_utilization_ratio",
+        "rlis_queue_depth",
+        "rlis_process_memory_footprint_bytes",
+        "rlis_process_memory_footprint_peak_bytes",
+    ] {
+        assert!(body.contains(series), "missing {series} in:\n{body}");
+    }
 }

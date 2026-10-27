@@ -4,6 +4,8 @@
 pub mod chat;
 pub mod detokenizer;
 pub mod engine;
+pub mod metrics;
+pub mod perplexity;
 pub mod sampler;
 pub mod scheduler;
 pub mod stop;

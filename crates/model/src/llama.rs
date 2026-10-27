@@ -6,7 +6,7 @@ use candle_nn::VarBuilder;
 use crate::attention::{Attention, Segment, causal_mask};
 use crate::config::LlamaConfig;
 use crate::kv::{KvBatch, KvStore, PerSeqKv};
-use crate::layers::{Linear, Mlp, RmsNorm};
+use crate::layers::{Embedding, Linear, Mlp, RmsNorm};
 use crate::rope::Rope;
 
 #[derive(Debug, Clone)]
@@ -71,13 +71,42 @@ impl candle_nn::var_builder::SimpleBackend for CastOnCpu {
 #[derive(Debug, Clone)]
 pub struct Llama {
     cfg: LlamaConfig,
-    embed: Tensor,
+    embed: Embedding,
     blocks: Vec<Block>,
     norm: RmsNorm,
     lm_head: Linear,
     rope: Rope,
+    /// Activation dtype.
     dtype: DType,
+    /// KV cache dtype; f16 under f32 activations for quantized models.
+    kv_dtype: DType,
     device: Device,
+}
+
+/// One decoder layer's weights, for loaders other than HF safetensors.
+pub struct BlockWeights {
+    pub input_norm: RmsNorm,
+    pub q: Linear,
+    pub k: Linear,
+    pub v: Linear,
+    pub o: Linear,
+    pub post_attn_norm: RmsNorm,
+    pub gate: Linear,
+    pub up: Linear,
+    pub down: Linear,
+}
+
+/// A model assembled from already-loaded weights (see `gguf::load`).
+pub struct LlamaParts {
+    pub cfg: LlamaConfig,
+    pub embed: Embedding,
+    pub blocks: Vec<BlockWeights>,
+    pub norm: RmsNorm,
+    pub lm_head: Linear,
+    pub rope: Rope,
+    pub dtype: DType,
+    pub kv_dtype: DType,
+    pub device: Device,
 }
 
 impl Llama {
@@ -125,14 +154,43 @@ impl Llama {
         let rope = Rope::new(&cfg, max_pos, dtype, &device)?;
         Ok(Self {
             cfg,
-            embed,
+            embed: Embedding::Dense(embed),
             blocks,
             norm,
             lm_head,
             rope,
             dtype,
+            kv_dtype: dtype,
             device,
         })
+    }
+
+    pub fn from_parts(p: LlamaParts) -> Self {
+        let blocks = p
+            .blocks
+            .into_iter()
+            .map(|b| Block {
+                input_norm: b.input_norm,
+                attn: Attention::new(b.q, b.k, b.v, b.o, &p.cfg),
+                post_attn_norm: b.post_attn_norm,
+                mlp: Mlp::new(b.gate, b.up, b.down),
+            })
+            .collect();
+        Self {
+            cfg: p.cfg,
+            embed: p.embed,
+            blocks,
+            norm: p.norm,
+            lm_head: p.lm_head,
+            rope: p.rope,
+            dtype: p.dtype,
+            kv_dtype: p.kv_dtype,
+            device: p.device,
+        }
+    }
+
+    pub fn kv_dtype(&self) -> DType {
+        self.kv_dtype
     }
 
     pub fn config(&self) -> &LlamaConfig {
@@ -192,7 +250,11 @@ impl Llama {
         let rope = self.rope.batch(&Tensor::new(positions, &self.device)?)?;
         let ids: Vec<u32> = tokens.iter().flat_map(|t| t.iter().copied()).collect();
         let ids = Tensor::new(ids, &self.device)?;
-        let mut x = self.embed.index_select(&ids, 0)?.unsqueeze(0)?;
+        let mut x = self
+            .embed
+            .lookup(&ids)?
+            .to_dtype(self.dtype)?
+            .unsqueeze(0)?;
         for (i, block) in self.blocks.iter().enumerate() {
             let h = block.input_norm.forward(&x)?;
             let h = block.attn.forward(&h, i, &segments, &rope, kv)?;
@@ -220,6 +282,19 @@ impl Llama {
     pub fn forward(&self, tokens: &[u32], kv: &mut dyn KvStore) -> Result<Tensor> {
         self.forward_batch(&[tokens], &mut PerSeqKv(vec![kv]))?
             .squeeze(0)
+    }
+
+    /// Logits for positions `from..` of one sequence, shape `(seq - from, vocab)`, in f32.
+    /// The LM head runs only on those rows (perplexity scores half of each window).
+    pub fn forward_logits_from(
+        &self,
+        tokens: &[u32],
+        kv: &mut dyn KvStore,
+        from: usize,
+    ) -> Result<Tensor> {
+        let (h, _) = self.hidden(&[tokens], &mut PerSeqKv(vec![kv]))?;
+        let h = h.squeeze(0)?.narrow(0, from, tokens.len() - from)?;
+        self.lm_head.forward(&h)?.to_dtype(DType::F32)
     }
 
     /// Logits for every position, shape `(seq, vocab)`, in f32.

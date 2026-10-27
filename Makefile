@@ -8,8 +8,12 @@ MODEL_DIR := models/llama-3.2-1b-instruct
 HF := https://huggingface.co
 DENSE_REPO := unsloth/Llama-3.2-1B-Instruct
 DENSE_FILES := config.json generation_config.json tokenizer.json tokenizer_config.json model.safetensors
+GGUF_REPO := bartowski/Llama-3.2-1B-Instruct-GGUF
+GGUF_FILES := Llama-3.2-1B-Instruct-Q8_0.gguf Llama-3.2-1B-Instruct-Q4_K_M.gguf
 
-.PHONY: models build test test-metal parity-ref chat-ref parity lint fuzz teardown
+WIKITEXT_URL := $(HF)/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
+
+.PHONY: models wikitext build test test-metal parity-ref chat-ref parity lint fuzz teardown
 
 models:
 	@mkdir -p $(MODEL_DIR)
@@ -20,6 +24,22 @@ models:
 				&& mv $(MODEL_DIR)/$$f.part $(MODEL_DIR)/$$f || exit 1; \
 		fi; \
 	done
+	@for f in $(GGUF_FILES); do \
+		if [ ! -s models/$$f ]; then \
+			echo "downloading $$f"; \
+			curl -L --fail --progress-bar -o models/$$f.part $(HF)/$(GGUF_REPO)/resolve/main/$$f \
+				&& mv models/$$f.part models/$$f || exit 1; \
+		fi; \
+	done
+
+# WikiText-2 raw (the copy llama.cpp's perplexity tool uses), for quantization quality.
+wikitext:
+	@if [ ! -s models/wikitext-2-raw/wiki.test.raw ]; then \
+		curl -L --fail -s -o models/wikitext-2-raw-v1.zip $(WIKITEXT_URL) \
+			&& unzip -q -o models/wikitext-2-raw-v1.zip -d models \
+			&& rm models/wikitext-2-raw-v1.zip; \
+	fi
+	@ls -l models/wikitext-2-raw/wiki.test.raw
 
 build:
 	cargo build --release --features $(FEATURES)
@@ -50,7 +70,7 @@ chat-ref: models
 
 parity: models
 	PARITY_DTYPE=f32 cargo test --release -p model --features $(FEATURES) --test parity -- --ignored --nocapture --test-threads=1
-	PARITY_DTYPE=f16 cargo test --release -p model --features $(FEATURES) --test parity -- --ignored --nocapture --test-threads=1
+	PARITY_DTYPE=f16 cargo test --release -p model --features $(FEATURES) --test parity -- --ignored --nocapture --test-threads=1 --skip gguf_tracks_reference
 	cargo test --release -p engine --test chat_template -- --ignored
 
 lint:

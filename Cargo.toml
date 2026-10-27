@@ -31,6 +31,9 @@ http-body-util = "0.1"
 rand_chacha = "0.10"
 minijinja = { version = "3.0", features = ["json", "serde"] }
 proptest = "1.12"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+libc = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [profile.release]

@@ -1,0 +1,154 @@
+//! Loads llama.cpp GGUF checkpoints (Q8_0, Q4_K_M, ...) into the same `Llama` forward pass.
+//!
+//! Differences from HF safetensors, all handled here:
+//! - Config comes from `llama.*` metadata.
+//! - Matrices stay block-quantized (`QMatMul`, f32 activations); the token embedding stays
+//!   quantized too and doubles as the tied LM head.
+//! - Llama 3 RoPE scaling is stored as `rope_freqs.weight`, per-frequency divisors of the base
+//!   inverse frequencies.
+//! - The converter permutes Q/K rows for interleaved RoPE, so rotation uses adjacent pairs.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use candle_core::quantized::{QMatMul, QTensor, gguf_file};
+use candle_core::{DType, Device};
+
+use crate::config::LlamaConfig;
+use crate::layers::{Embedding, Linear, RmsNorm};
+use crate::llama::{BlockWeights, Llama, LlamaParts};
+use crate::rope::Rope;
+
+/// Reads the model config from GGUF metadata.
+pub fn config(content: &gguf_file::Content) -> Result<LlamaConfig> {
+    let md = |k: &str| {
+        content
+            .metadata
+            .get(k)
+            .with_context(|| format!("GGUF metadata missing {k}"))
+    };
+    let u = |k: &str| -> Result<usize> { Ok(md(k)?.to_u32()? as usize) };
+    let arch = md("general.architecture")?.to_string()?;
+    anyhow::ensure!(arch == "llama", "unsupported GGUF architecture {arch:?}");
+    let embd = content
+        .tensor_infos
+        .get("token_embd.weight")
+        .context("no token_embd.weight")?;
+    Ok(LlamaConfig {
+        hidden_size: u("llama.embedding_length")?,
+        intermediate_size: u("llama.feed_forward_length")?,
+        num_hidden_layers: u("llama.block_count")?,
+        num_attention_heads: u("llama.attention.head_count")?,
+        num_key_value_heads: u("llama.attention.head_count_kv")?,
+        head_dim: Some(u("llama.rope.dimension_count")?),
+        vocab_size: embd.shape.dims()[0],
+        rms_norm_eps: md("llama.attention.layer_norm_rms_epsilon")?.to_f32()? as f64,
+        rope_theta: md("llama.rope.freq_base")?.to_f32()? as f64,
+        rope_scaling: None,
+        max_position_embeddings: u("llama.context_length")?,
+        tie_word_embeddings: !content.tensor_infos.contains_key("output.weight"),
+        bos_token_id: md("tokenizer.ggml.bos_token_id")
+            .ok()
+            .and_then(|v| v.to_u32().ok()),
+    })
+}
+
+/// Base inverse frequencies divided by the `rope_freqs` factors, when present.
+pub fn inv_freqs(cfg: &LlamaConfig, rope_freqs: Option<&[f32]>) -> Vec<f32> {
+    let base = crate::rope::inv_freqs(cfg);
+    match rope_freqs {
+        Some(f) => base.iter().zip(f).map(|(b, f)| b / f).collect(),
+        None => base,
+    }
+}
+
+struct Reader<'a> {
+    content: &'a gguf_file::Content,
+    file: std::fs::File,
+    device: &'a Device,
+}
+
+impl Reader<'_> {
+    fn qtensor(&mut self, name: &str) -> Result<QTensor> {
+        self.content
+            .tensor(&mut self.file, name, self.device)
+            .with_context(|| format!("loading {name}"))
+    }
+
+    fn dense_f32(&mut self, name: &str) -> Result<candle_core::Tensor> {
+        Ok(self
+            .qtensor(name)?
+            .dequantize(self.device)?
+            .to_dtype(DType::F32)?)
+    }
+
+    fn linear(&mut self, name: &str) -> Result<Linear> {
+        Ok(Linear::Quantized(QMatMul::from_qtensor(
+            self.qtensor(name)?,
+        )?))
+    }
+}
+
+pub fn load(path: &Path, device: &Device, max_seq_len: usize) -> Result<Llama> {
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let content = gguf_file::Content::read(&mut file)?;
+    let cfg = config(&content)?;
+    let mut r = Reader {
+        content: &content,
+        file,
+        device,
+    };
+    let rope_freqs = match content.tensor_infos.contains_key("rope_freqs.weight") {
+        true => Some(r.dense_f32("rope_freqs.weight")?.to_vec1::<f32>()?),
+        false => None,
+    };
+    let norm = |t| RmsNorm::new(t, cfg.rms_norm_eps);
+    let mut blocks = Vec::with_capacity(cfg.num_hidden_layers);
+    for i in 0..cfg.num_hidden_layers {
+        let b = |n: &str| format!("blk.{i}.{n}.weight");
+        blocks.push(BlockWeights {
+            q: r.linear(&b("attn_q"))?,
+            k: r.linear(&b("attn_k"))?,
+            v: r.linear(&b("attn_v"))?,
+            o: r.linear(&b("attn_output"))?,
+            gate: r.linear(&b("ffn_gate"))?,
+            up: r.linear(&b("ffn_up"))?,
+            down: r.linear(&b("ffn_down"))?,
+            input_norm: norm(r.dense_f32(&b("attn_norm"))?),
+            post_attn_norm: norm(r.dense_f32(&b("ffn_norm"))?),
+        });
+    }
+    let final_norm = norm(r.dense_f32("output_norm.weight")?);
+    let embed = Arc::new(r.qtensor("token_embd.weight")?);
+    let lm_head = match cfg.tie_word_embeddings {
+        true => Linear::Quantized(QMatMul::from_arc(embed.clone())?),
+        false => r.linear("output.weight")?,
+    };
+    let max_pos = max_seq_len.min(cfg.max_position_embeddings);
+    let rope = Rope::from_inv_freqs(
+        inv_freqs(&cfg, rope_freqs.as_deref()),
+        max_pos,
+        DType::F32,
+        device,
+    )?
+    .interleaved(true);
+    // Quantized matmuls produce f32; keep KV at f16 on GPUs to hold the spec's 32 KB/token.
+    let kv_dtype = if device.is_cpu() {
+        DType::F32
+    } else {
+        DType::F16
+    };
+    Ok(Llama::from_parts(LlamaParts {
+        cfg,
+        embed: Embedding::Quantized(embed),
+        blocks,
+        norm: final_norm,
+        lm_head,
+        rope,
+        dtype: DType::F32,
+        kv_dtype,
+        device: device.clone(),
+    }))
+}

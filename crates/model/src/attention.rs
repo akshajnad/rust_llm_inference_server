@@ -18,6 +18,24 @@ pub struct Attention {
 }
 
 impl Attention {
+    pub fn new(
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+        o_proj: Linear,
+        cfg: &LlamaConfig,
+    ) -> Self {
+        Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            n_heads: cfg.num_attention_heads,
+            n_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim(),
+        }
+    }
+
     pub fn load(vb: VarBuilder, cfg: &LlamaConfig) -> Result<Self> {
         let (h, hd) = (cfg.hidden_size, cfg.head_dim());
         let (nh, nkv) = (cfg.num_attention_heads, cfg.num_key_value_heads);
@@ -86,12 +104,49 @@ pub fn attend_segments(
     }
 }
 
+/// Largest f32 score matrix one attention call materializes. Prefill splits its query rows
+/// into tiles under this, so transient memory stays flat however long the chunk and context.
+pub const MAX_SCORE_BYTES: usize = 64 << 20;
+
 /// Grouped-query attention without materializing repeated K/V.
 ///
 /// Query head `h` uses KV head `h / n_rep`, so `(b, n_heads, seq, d)` reshapes to
 /// `(b, n_kv, n_rep * seq, d)` and each KV head is multiplied once against its whole group.
-/// Softmax runs in f32, as in the reference implementation.
+/// Softmax runs in f32, as in the reference implementation. Long queries are processed in row
+/// tiles (each row's softmax is independent, so tiling doesn't change the math).
 pub fn gqa_attention(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
+    gqa_attention_tiled(q, k, v, mask, MAX_SCORE_BYTES)
+}
+
+pub fn gqa_attention_tiled(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    max_score_bytes: usize,
+) -> Result<Tensor> {
+    let (b, n_heads, seq, _) = q.dims4()?;
+    let total = k.dim(2)?;
+    let row_bytes = b * n_heads * total * DType::F32.size_in_bytes();
+    let tile = (max_score_bytes / row_bytes.max(1)).max(1);
+    if seq <= tile {
+        return attention_block(q, k, v, mask);
+    }
+    let mut outs = Vec::with_capacity(seq.div_ceil(tile));
+    for start in (0..seq).step_by(tile) {
+        let len = tile.min(seq - start);
+        let m = mask.map(|m| m.narrow(0, start, len)).transpose()?;
+        outs.push(attention_block(
+            &q.narrow(2, start, len)?,
+            k,
+            v,
+            m.as_ref(),
+        )?);
+    }
+    Tensor::cat(&outs, 2)
+}
+
+fn attention_block(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) -> Result<Tensor> {
     let (b, n_heads, seq, d) = q.dims4()?;
     let (_, n_kv, total, _) = k.dims4()?;
     let n_rep = n_heads / n_kv;
@@ -112,21 +167,14 @@ pub fn gqa_attention(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>) 
         .reshape((b, n_heads, seq, v.dim(D::Minus1)?))
 }
 
-/// Additive causal mask of shape `(seq, start_pos + seq)` in f32.
+/// Additive causal mask of shape `(seq, start_pos + seq)` in f32, built on the device.
 pub fn causal_mask(seq: usize, start_pos: usize, dev: &candle_core::Device) -> Result<Tensor> {
     let total = start_pos + seq;
-    let data: Vec<f32> = (0..seq)
-        .flat_map(|i| {
-            (0..total).map(move |j| {
-                if j > start_pos + i {
-                    f32::NEG_INFINITY
-                } else {
-                    0.0
-                }
-            })
-        })
-        .collect();
-    Tensor::from_vec(data, (seq, total), dev)
+    let rows = Tensor::arange(start_pos as u32, total as u32, dev)?.reshape((seq, 1))?;
+    let cols = Tensor::arange(0u32, total as u32, dev)?.reshape((1, total))?;
+    let blocked = cols.broadcast_gt(&rows)?;
+    let neg = Tensor::full(f32::NEG_INFINITY, (seq, total), dev)?;
+    blocked.where_cond(&neg, &neg.zeros_like()?)
 }
 
 #[cfg(test)]
@@ -165,6 +213,23 @@ mod tests {
         let want = naive(&q, &k, &v, Some(&mask))?;
         let diff = (got - want)?.abs()?.max_all()?.to_scalar::<f32>()?;
         assert!(diff < 1e-5, "max diff {diff}");
+        Ok(())
+    }
+
+    #[test]
+    fn tiled_matches_untiled() -> Result<()> {
+        let dev = Device::Cpu;
+        let (nh, nkv, seq, start, d) = (8, 2, 37, 11, 16);
+        let q = Tensor::randn(0f32, 1.0, (1, nh, seq, d), &dev)?;
+        let k = Tensor::randn(0f32, 1.0, (1, nkv, start + seq, d), &dev)?;
+        let v = Tensor::randn(0f32, 1.0, (1, nkv, start + seq, d), &dev)?;
+        let mask = causal_mask(seq, start, &dev)?;
+        let whole = gqa_attention_tiled(&q, &k, &v, Some(&mask), usize::MAX)?;
+        // A budget of 5 rows' scores forces 8 tiles, the last one partial.
+        let row = nh * (start + seq) * 4;
+        let tiled = gqa_attention_tiled(&q, &k, &v, Some(&mask), 5 * row)?;
+        let diff = (whole - tiled)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-6, "max diff {diff}");
         Ok(())
     }
 

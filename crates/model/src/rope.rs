@@ -10,6 +10,7 @@ use crate::config::LlamaConfig;
 pub struct Rope {
     cos: Tensor,
     sin: Tensor,
+    interleaved: bool,
 }
 
 /// Inverse frequencies, with Llama 3 scaling applied when configured.
@@ -54,7 +55,15 @@ impl Rope {
         dtype: DType,
         dev: &Device,
     ) -> Result<Self> {
-        let inv = inv_freqs(cfg);
+        Self::from_inv_freqs(inv_freqs(cfg), max_positions, dtype, dev)
+    }
+
+    pub fn from_inv_freqs(
+        inv: Vec<f32>,
+        max_positions: usize,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Self> {
         let half = inv.len();
         let inv = Tensor::from_vec(inv, (1, half), dev)?;
         let pos = Tensor::arange(0u32, max_positions as u32, dev)?
@@ -64,7 +73,15 @@ impl Rope {
         Ok(Self {
             cos: angles.cos()?.to_dtype(dtype)?,
             sin: angles.sin()?.to_dtype(dtype)?,
+            interleaved: false,
         })
+    }
+
+    /// Rotate adjacent pairs instead of halves: llama.cpp's GGUF converter permutes Q/K rows
+    /// for that layout.
+    pub fn interleaved(mut self, yes: bool) -> Self {
+        self.interleaved = yes;
+        self
     }
 
     pub fn max_positions(&self) -> usize {
@@ -76,6 +93,7 @@ impl Rope {
         Ok(RopeBatch {
             cos: self.cos.index_select(positions, 0)?.contiguous()?,
             sin: self.sin.index_select(positions, 0)?.contiguous()?,
+            interleaved: self.interleaved,
         })
     }
 }
@@ -85,12 +103,17 @@ impl Rope {
 pub struct RopeBatch {
     cos: Tensor,
     sin: Tensor,
+    interleaved: bool,
 }
 
 impl RopeBatch {
     /// Rotates `x` of shape `(1, heads, total_tokens, head_dim)`.
     pub fn apply(&self, x: &Tensor) -> Result<Tensor> {
-        candle_nn::rotary_emb::rope(&x.contiguous()?, &self.cos, &self.sin)
+        let x = x.contiguous()?;
+        match self.interleaved {
+            true => candle_nn::rotary_emb::rope_i(&x, &self.cos, &self.sin),
+            false => candle_nn::rotary_emb::rope(&x, &self.cos, &self.sin),
+        }
     }
 }
 

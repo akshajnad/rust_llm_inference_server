@@ -304,6 +304,14 @@ impl KvBatch for PagedBatch<'_> {
         segments: &[Segment],
     ) -> Result<Tensor> {
         let (kc, vc) = (&self.cache.k[layer], &self.cache.v[layer]);
+        // Attention runs in the cache dtype (f16 KV under f32 activations for quantized
+        // models); casts are no-ops when the dtypes already match.
+        let act_dtype = q.dtype();
+        let (q, k, v) = (
+            &q.to_dtype(kc.dtype())?,
+            &k.to_dtype(kc.dtype())?,
+            &v.to_dtype(kc.dtype())?,
+        );
         // (1, n_kv, T, d) -> (T, n_kv, d), one scatter for the whole batch.
         let rows = |t: &Tensor| t.squeeze(0)?.transpose(0, 1)?.contiguous();
         kc.scatter_set(&self.write_index, &rows(k)?, 0)?;
@@ -314,7 +322,8 @@ impl KvBatch for PagedBatch<'_> {
                     self.cache.gather(kc, self.slots(i)?)?,
                     self.cache.gather(vc, self.slots(i)?)?,
                 ))
-            });
+            })?
+            .to_dtype(act_dtype);
         };
         // (1, n_heads, T, d) -> (T, n_heads, d) query rows.
         let q_rows = q.squeeze(0)?.transpose(0, 1)?;
@@ -342,7 +351,7 @@ impl KvBatch for PagedBatch<'_> {
                 Tensor::cat(&parts, 0)?.index_select(reorder, 0)?
             }
         };
-        out_rows.transpose(0, 1)?.unsqueeze(0)
+        out_rows.transpose(0, 1)?.unsqueeze(0)?.to_dtype(act_dtype)
     }
 }
 

@@ -24,12 +24,33 @@ enum Command {
     Generate(GenerateArgs),
     /// Serve the OpenAI-compatible HTTP API.
     Serve(ServeArgs),
+    /// Perplexity of a text file (WikiText-2: `make wikitext`), llama.cpp-compatible method.
+    Perplexity(PerplexityArgs),
+}
+
+#[derive(clap::Args)]
+struct PerplexityArgs {
+    #[command(flatten)]
+    model: ModelArgs,
+    #[arg(long, default_value = "models/wikitext-2-raw/wiki.test.raw")]
+    file: PathBuf,
+    /// Window length; the second half of each window is scored.
+    #[arg(long, default_value_t = 512)]
+    ctx: usize,
+    /// Score only the first N windows (0 = all).
+    #[arg(long, default_value_t = 0)]
+    max_windows: usize,
 }
 
 #[derive(clap::Args)]
 struct ModelArgs {
-    #[arg(long, default_value = "models/llama-3.2-1b-instruct")]
+    /// A `.gguf` file or a directory of HF safetensors.
+    #[arg(long, default_value = "models/Llama-3.2-1B-Instruct-Q8_0.gguf")]
     model: PathBuf,
+    /// HF directory with tokenizer.json, tokenizer_config.json and generation_config.json.
+    #[arg(long, default_value = "models/llama-3.2-1b-instruct")]
+    tokenizer: PathBuf,
+    /// Weight and activation dtype for safetensors (GGUF runs quantized with f16 KV).
     #[arg(long, value_enum, default_value_t = Dtype::F16)]
     dtype: Dtype,
     #[arg(long, default_value = default_device())]
@@ -175,14 +196,15 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Generate(args) => run_generate(args),
         Command::Serve(args) => run_serve(args),
+        Command::Perplexity(args) => run_perplexity(args),
     }
 }
 
 fn load(args: &ModelArgs) -> Result<(Llama, Arc<Tokenizer>)> {
     let device = model::device(&args.device)?;
     let start = std::time::Instant::now();
-    let llama = Llama::load(&args.model, args.dtype.into(), &device, args.max_seq_len)?;
-    let tokenizer = Arc::new(Tokenizer::load(&args.model)?);
+    let llama = model::load(&args.model, args.dtype.into(), &device, args.max_seq_len)?;
+    let tokenizer = Arc::new(Tokenizer::load(&args.tokenizer)?);
     tracing::info!(model = %args.model.display(), device = %args.device, "loaded in {:.2?}", start.elapsed());
     Ok((llama, tokenizer))
 }
@@ -190,7 +212,7 @@ fn load(args: &ModelArgs) -> Result<(Llama, Arc<Tokenizer>)> {
 fn run_generate(args: GenerateArgs) -> Result<()> {
     let (llama, tokenizer) = load(&args.model)?;
     let prompt = if args.chat {
-        let template = ChatTemplate::load(&args.model.model)?;
+        let template = ChatTemplate::load(&args.model.tokenizer)?;
         let msgs = [engine::ChatMessage {
             role: "user".into(),
             content: args.prompt.clone(),
@@ -234,9 +256,41 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
     }
 }
 
+fn run_perplexity(args: PerplexityArgs) -> Result<()> {
+    let (llama, tokenizer) = load(&args.model)?;
+    let text = std::fs::read_to_string(&args.file)
+        .with_context(|| format!("reading {}", args.file.display()))?;
+    let tokens = tokenizer.encode(&text)?;
+    let bos = tokens[0];
+    eprintln!("{} tokens from {}", tokens.len(), args.file.display());
+    let report = engine::perplexity::perplexity(
+        &llama,
+        &tokens,
+        bos,
+        args.ctx,
+        args.max_windows,
+        |done, total, ppl| {
+            if done % 50 == 0 || done == total {
+                eprintln!("[{done}/{total}] ppl {ppl:.4}");
+            }
+        },
+    )?;
+    eprintln!(
+        "PPL = {:.4} +/- {:.4} over {} tokens ({} windows of {}) in {:.1}s",
+        report.ppl,
+        report.ppl_stderr,
+        report.tokens_scored,
+        report.windows,
+        report.ctx,
+        report.seconds
+    );
+    println!("{}", serde_json::to_string(&report)?);
+    Ok(())
+}
+
 fn run_serve(args: ServeArgs) -> Result<()> {
     let (llama, tokenizer) = load(&args.model)?;
-    let chat_template = match ChatTemplate::load(&args.model.model) {
+    let chat_template = match ChatTemplate::load(&args.model.tokenizer) {
         Ok(t) => Some(Arc::new(t)),
         Err(e) => {
             tracing::warn!("chat endpoint disabled: {e:#}");
@@ -248,7 +302,9 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         tokenizer.clone(),
         args.engine.config(args.queue_size),
     )?;
+    let metrics = Some(server::install_prometheus()?);
     let state = AppState {
+        metrics,
         engine,
         tokenizer,
         chat_template,

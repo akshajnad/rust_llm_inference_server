@@ -26,6 +26,9 @@ tracing-subscriber.workspace = true
 axum.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 futures-util.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 engine = { workspace = true, features = ["test-util"] }

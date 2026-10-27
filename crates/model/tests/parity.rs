@@ -60,26 +60,31 @@ fn load_cases() -> Vec<Case> {
 }
 
 fn setup() -> (Llama, Device, DType) {
-    let dev_name = std::env::var("PARITY_DEVICE").unwrap_or_else(|_| {
-        if cfg!(feature = "metal") {
-            "metal"
-        } else if cfg!(feature = "cuda") {
-            "cuda"
-        } else {
-            "cpu"
-        }
-        .to_string()
-    });
+    let (dev_name, device) = device();
     let dtype = match std::env::var("PARITY_DTYPE").as_deref() {
         Ok("f16") => DType::F16,
         Ok("bf16") => DType::BF16,
         _ => DType::F32,
     };
-    let device = model::device(&dev_name).unwrap();
     let dir = root().join("models/llama-3.2-1b-instruct");
     let model = Llama::load(&dir, dtype, &device, 1024).unwrap();
     eprintln!("parity: device={dev_name} dtype={dtype:?}");
     (model, device, dtype)
+}
+
+fn device() -> (String, Device) {
+    let dev_name = std::env::var("PARITY_DEVICE").unwrap_or_else(|_| {
+        let name = if cfg!(feature = "metal") {
+            "metal"
+        } else if cfg!(feature = "cuda") {
+            "cuda"
+        } else {
+            "cpu"
+        };
+        name.to_string()
+    });
+    let device = model::device(&dev_name).unwrap();
+    (dev_name, device)
 }
 
 fn argmax(v: &[f32]) -> u32 {
@@ -274,5 +279,83 @@ fn paged_batch_of_32_matches_reference() {
     );
     for f in &flips {
         eprintln!("  near-tie {f}");
+    }
+}
+
+/// GGUF checkpoints against the f32 HF reference. Quantization changes the logits, so this
+/// measures rather than demands equality: top-1 agreement under teacher forcing (the model is
+/// fed the reference's tokens, so one disagreement doesn't cascade) and the logit error.
+#[test]
+#[ignore = "needs models/ (make models) and a GPU"]
+fn gguf_tracks_reference() {
+    use candle_core::quantized::gguf_file;
+    let (_, device) = device();
+    let hf = model::LlamaConfig::from_file(root().join("models/llama-3.2-1b-instruct/config.json"))
+        .unwrap();
+    let cases = load_cases();
+    for (file, min_agree) in [
+        ("Llama-3.2-1B-Instruct-Q8_0.gguf", 0.98),
+        ("Llama-3.2-1B-Instruct-Q4_K_M.gguf", 0.92),
+    ] {
+        let path = root().join("models").join(file);
+        // RoPE from rope_freqs must reproduce the HF llama3-scaled frequencies.
+        let mut f = std::fs::File::open(&path).unwrap();
+        let content = gguf_file::Content::read(&mut f).unwrap();
+        let freqs = content
+            .tensor(&mut f, "rope_freqs.weight", &Device::Cpu)
+            .unwrap();
+        let freqs = freqs
+            .dequantize(&Device::Cpu)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cfg = model::gguf::config(&content).unwrap();
+        let from_gguf = model::gguf::inv_freqs(&cfg, Some(&freqs));
+        for (i, (a, b)) in from_gguf
+            .iter()
+            .zip(model::rope::inv_freqs(&hf))
+            .enumerate()
+        {
+            assert!(
+                ((a - b) / b).abs() < 1e-5,
+                "{file}: inv_freq[{i}] {a} vs HF {b}"
+            );
+        }
+
+        let model = model::load(&path, DType::F32, &device, 1024).unwrap();
+        let (mut agree, mut total, mut worst, mut sum_err) = (0usize, 0usize, 0f32, 0f64);
+        for case in &cases {
+            let mut kv = ContiguousKvCache::new(
+                model.config(),
+                case.prompt_ids.len() + STEPS,
+                model.dtype(),
+                &device,
+            )
+            .unwrap();
+            let mut logits = model.forward(&case.prompt_ids, &mut kv).unwrap();
+            for step in 0..STEPS {
+                let v = logits.to_vec1::<f32>().unwrap();
+                agree += usize::from(argmax(&v) == case.topk_indices[step][0]);
+                total += 1;
+                let err =
+                    (v[case.topk_indices[step][0] as usize] - case.topk_values[step][0]).abs();
+                worst = worst.max(err);
+                sum_err += err as f64;
+                if step + 1 < STEPS {
+                    logits = model.forward(&[case.greedy_ids[step]], &mut kv).unwrap();
+                }
+            }
+        }
+        let rate = agree as f64 / total as f64;
+        eprintln!(
+            "{file}: top-1 agreement {:.2}% over {total} steps, top logit error mean {:.3} max {:.3}",
+            rate * 100.0,
+            sum_err / total as f64,
+            worst
+        );
+        assert!(
+            rate >= min_agree,
+            "{file}: top-1 agreement {rate:.4} below {min_agree}"
+        );
     }
 }
