@@ -7,3 +7,7 @@
 *.safetensors
 !/tests/fixtures/**/*.safetensors
 .DS_Store
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/Cargo.lock

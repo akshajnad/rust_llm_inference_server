@@ -11,6 +11,10 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
+    pub fn new(inner: tokenizers::Tokenizer, eos_ids: Vec<u32>) -> Self {
+        Self { inner, eos_ids }
+    }
+
     pub fn load(model_dir: &Path) -> Result<Self> {
         let inner = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(anyhow::Error::msg)
@@ -21,7 +25,20 @@ impl Tokenizer {
 
     /// Encodes `text` with special tokens, which for Llama 3 prepends `<|begin_of_text|>`.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let enc = self.inner.encode(text, true).map_err(anyhow::Error::msg)?;
+        self.encode_with(text, true)
+    }
+
+    /// Encodes without adding BOS, for text such as a rendered chat template that already
+    /// contains it.
+    pub fn encode_raw(&self, text: &str) -> Result<Vec<u32>> {
+        self.encode_with(text, false)
+    }
+
+    fn encode_with(&self, text: &str, special: bool) -> Result<Vec<u32>> {
+        let enc = self
+            .inner
+            .encode(text, special)
+            .map_err(anyhow::Error::msg)?;
         Ok(enc.get_ids().to_vec())
     }
 

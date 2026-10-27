@@ -32,32 +32,57 @@ impl Attention {
         })
     }
 
-    /// `x` is `(b, seq, hidden)`; `mask` is an additive `(seq, total)` causal mask, or `None`
-    /// when `seq == 1`.
+    /// `x` is `(1, total_tokens, hidden)`: the new tokens of every sequence in the batch,
+    /// concatenated. Projections run once over all of them; RoPE, the KV store and attention
+    /// run per sequence, each against its own cache.
     pub fn forward(
         &self,
         x: &Tensor,
         layer: usize,
-        start_pos: usize,
+        segments: &[Segment],
         rope: &Rope,
-        kv: &mut dyn KvStore,
-        mask: Option<&Tensor>,
+        seqs: &mut [SeqInput],
     ) -> Result<Tensor> {
-        let (b, seq, _) = x.dims3()?;
+        let (b, total, _) = x.dims3()?;
         let split =
-            |t: Tensor, heads: usize| t.reshape((b, seq, heads, self.head_dim))?.transpose(1, 2);
+            |t: Tensor, heads: usize| t.reshape((b, total, heads, self.head_dim))?.transpose(1, 2);
         let q = split(self.q_proj.forward(x)?, self.n_heads)?;
         let k = split(self.k_proj.forward(x)?, self.n_kv_heads)?;
         let v = split(self.v_proj.forward(x)?, self.n_kv_heads)?;
-        let q = rope.apply(&q, start_pos)?;
-        let k = rope.apply(&k, start_pos)?;
-        let (k, v) = kv.append(layer, &k, &v)?;
-        let out = gqa_attention(&q, &k, &v, mask, self.head_dim)?;
+        let mut outs = Vec::with_capacity(segments.len());
+        for (seg, seq) in segments.iter().zip(seqs.iter_mut()) {
+            let part = |t: &Tensor| t.narrow(2, seg.offset, seg.len);
+            let q = rope.apply(&part(&q)?, seg.start_pos)?;
+            let k = rope.apply(&part(&k)?, seg.start_pos)?;
+            let (k, v) = seq.kv.append(layer, &k, &part(&v)?)?;
+            outs.push(gqa_attention(&q, &k, &v, seg.mask.as_ref(), self.head_dim)?);
+        }
+        let out = match outs.len() {
+            1 => outs.pop().expect("one segment"),
+            _ => Tensor::cat(&outs, 2)?,
+        };
         let out = out
             .transpose(1, 2)?
-            .reshape((b, seq, self.n_heads * self.head_dim))?;
+            .reshape((b, total, self.n_heads * self.head_dim))?;
         self.o_proj.forward(&out)
     }
+}
+
+/// One sequence's slice of a batched forward pass: the tokens to run now and the cache that
+/// holds everything before them.
+pub struct SeqInput<'a> {
+    pub tokens: &'a [u32],
+    pub kv: &'a mut dyn KvStore,
+}
+
+/// Where a sequence's tokens sit in the concatenated batch, computed once per forward pass.
+#[derive(Debug, Clone)]
+pub struct Segment {
+    pub offset: usize,
+    pub len: usize,
+    pub start_pos: usize,
+    /// Causal mask for prefill; `None` for a single decode token.
+    pub mask: Option<Tensor>,
 }
 
 /// Grouped-query attention without materializing repeated K/V.

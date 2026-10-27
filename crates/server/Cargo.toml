@@ -19,5 +19,15 @@ engine.workspace = true
 candle-core.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+futures-util.workspace = true
+
+[dev-dependencies]
+engine = { workspace = true, features = ["test-util"] }
+tower.workspace = true
+http-body-util.workspace = true

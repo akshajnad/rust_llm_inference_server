@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/model", "crates/engine", "crates/server"]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,6 +22,15 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = "1.54"
+futures-util = "0.3"
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+rand_chacha = "0.10"
+minijinja = { version = "3.0", features = ["json", "serde"] }
+proptest = "1.12"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [profile.release]
 debug = "line-tables-only"

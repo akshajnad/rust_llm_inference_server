@@ -1,11 +1,18 @@
-//! Request execution: tokenization, sampling, detokenization and the generation loop.
-//! The continuous-batching scheduler lands here in M3.
+//! Request execution: the engine thread, sampling, stop strings, detokenization and chat
+//! templating. The continuous-batching scheduler lands here in M3.
 
+pub mod chat;
 pub mod detokenizer;
-pub mod generate;
+pub mod engine;
 pub mod sampler;
+pub mod stop;
+#[cfg(feature = "test-util")]
+pub mod testing;
 pub mod tokenizer;
 
-pub use generate::{FinishReason, Generation, generate};
-pub use sampler::Sampler;
+pub use chat::{ChatMessage, ChatTemplate};
+pub use engine::{
+    EngineConfig, EngineHandle, Event, Finish, FinishReason, Request, SubmitError, spawn,
+};
+pub use sampler::{Sampler, SamplingParams};
 pub use tokenizer::Tokenizer;

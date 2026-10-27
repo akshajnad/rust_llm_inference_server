@@ -3,7 +3,7 @@ use std::path::Path;
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 
-use crate::attention::{Attention, causal_mask};
+use crate::attention::{Attention, Segment, SeqInput, causal_mask};
 use crate::config::LlamaConfig;
 use crate::kv::KvStore;
 use crate::layers::{Linear, Mlp, RmsNorm};
@@ -112,49 +112,70 @@ impl Llama {
         self.rope.max_positions()
     }
 
-    /// Runs `tokens` (one sequence) through the model, continuing after the positions already in
-    /// `kv`, and returns final hidden states `(1, seq, hidden)`.
-    fn hidden(&self, tokens: &[u32], kv: &mut dyn KvStore) -> Result<Tensor> {
-        let start_pos = kv.seq_len();
-        let seq = tokens.len();
-        if start_pos + seq > self.max_seq_len() {
-            candle_core::bail!(
-                "sequence of {} positions exceeds max_seq_len {}",
-                start_pos + seq,
-                self.max_seq_len()
-            );
+    /// Runs every sequence's new tokens through the model in one pass and returns the final
+    /// hidden states `(1, total_tokens, hidden)` with each sequence's segment.
+    fn hidden(&self, seqs: &mut [SeqInput]) -> Result<(Tensor, Vec<Segment>)> {
+        let mut segments = Vec::with_capacity(seqs.len());
+        let mut offset = 0;
+        for seq in seqs.iter() {
+            let (start_pos, len) = (seq.kv.seq_len(), seq.tokens.len());
+            if len == 0 {
+                candle_core::bail!("empty sequence in batch");
+            }
+            if start_pos + len > self.max_seq_len() {
+                candle_core::bail!(
+                    "sequence of {} positions exceeds max_seq_len {}",
+                    start_pos + len,
+                    self.max_seq_len()
+                );
+            }
+            let mask = match len {
+                1 => None,
+                _ => Some(causal_mask(len, start_pos, &self.device)?),
+            };
+            segments.push(Segment {
+                offset,
+                len,
+                start_pos,
+                mask,
+            });
+            offset += len;
         }
-        let ids = Tensor::new(tokens, &self.device)?;
+        let ids: Vec<u32> = seqs.iter().flat_map(|s| s.tokens.iter().copied()).collect();
+        let ids = Tensor::new(ids, &self.device)?;
         let mut x = self.embed.index_select(&ids, 0)?.unsqueeze(0)?;
-        let mask = match seq {
-            1 => None,
-            _ => Some(causal_mask(seq, start_pos, &self.device)?),
-        };
         for (i, block) in self.blocks.iter().enumerate() {
             let h = block.input_norm.forward(&x)?;
-            let h = block
-                .attn
-                .forward(&h, i, start_pos, &self.rope, kv, mask.as_ref())?;
+            let h = block.attn.forward(&h, i, &segments, &self.rope, seqs)?;
             x = (x + h)?;
             let h = block.mlp.forward(&block.post_attn_norm.forward(&x)?)?;
             x = (x + h)?;
         }
-        self.norm.forward(&x)
+        Ok((self.norm.forward(&x)?, segments))
+    }
+
+    /// Batched step: logits at each sequence's last new position, shape `(n_seqs, vocab)`, in
+    /// f32. Sequences may mix prefill (many tokens) and decode (one token).
+    pub fn forward_batch(&self, seqs: &mut [SeqInput]) -> Result<Tensor> {
+        let (h, segments) = self.hidden(seqs)?;
+        let last: Vec<u32> = segments
+            .iter()
+            .map(|s| (s.offset + s.len - 1) as u32)
+            .collect();
+        let last = Tensor::new(last, &self.device)?;
+        let h = h.squeeze(0)?.index_select(&last, 0)?;
+        self.lm_head.forward(&h)?.to_dtype(DType::F32)
     }
 
     /// Logits for the last position only, shape `(vocab,)`, in f32.
     pub fn forward(&self, tokens: &[u32], kv: &mut dyn KvStore) -> Result<Tensor> {
-        let h = self.hidden(tokens, kv)?;
-        let last = h.narrow(1, tokens.len() - 1, 1)?;
-        self.lm_head
-            .forward(&last)?
-            .to_dtype(DType::F32)?
-            .flatten_all()
+        self.forward_batch(&mut [SeqInput { tokens, kv }])?
+            .squeeze(0)
     }
 
     /// Logits for every position, shape `(seq, vocab)`, in f32.
     pub fn forward_all_logits(&self, tokens: &[u32], kv: &mut dyn KvStore) -> Result<Tensor> {
-        let h = self.hidden(tokens, kv)?;
+        let (h, _) = self.hidden(&mut [SeqInput { tokens, kv }])?;
         self.lm_head.forward(&h)?.to_dtype(DType::F32)?.squeeze(0)
     }
 }
@@ -197,6 +218,57 @@ mod tests {
             .to_scalar::<f32>()?;
         assert!(diff < 1e-4, "max logit diff {diff}");
         assert_eq!(kv.seq_len(), tokens.len());
+        Ok(())
+    }
+
+    /// A sequence's logits must not depend on what else is in the batch.
+    #[test]
+    fn batched_forward_matches_individual() -> Result<()> {
+        let model = tiny_model()?;
+        let cfg = model.config().clone();
+        let cache = || ContiguousKvCache::new(&cfg, 64, DType::F32, &Device::Cpu);
+        let prompts: [&[u32]; 3] = [&[1, 5, 9], &[7], &[2, 40, 41, 42, 43, 44]];
+
+        let mut alone = Vec::new();
+        let mut alone_kv = Vec::new();
+        for p in prompts {
+            let mut kv = cache()?;
+            alone.push(model.forward(p, &mut kv)?);
+            alone_kv.push(kv);
+        }
+
+        let mut kvs = [cache()?, cache()?, cache()?];
+        let mut seqs: Vec<SeqInput> = prompts
+            .iter()
+            .zip(kvs.iter_mut())
+            .map(|(&tokens, kv)| SeqInput { tokens, kv })
+            .collect();
+        let batched = model.forward_batch(&mut seqs)?;
+        let close = |a: &Tensor, b: &Tensor| -> Result<f32> {
+            (a - b)?.abs()?.max_all()?.to_scalar::<f32>()
+        };
+        for (i, a) in alone.iter().enumerate() {
+            assert!(close(a, &batched.get(i)?)? < 1e-4, "prefill seq {i}");
+        }
+
+        // Then one mixed step: two decodes alongside a fresh prefill for sequence 2.
+        let next: [&[u32]; 3] = [&[11], &[12], &[3, 4]];
+        kvs[2].reset();
+        let mut seqs: Vec<SeqInput> = next
+            .iter()
+            .zip(kvs.iter_mut())
+            .map(|(&tokens, kv)| SeqInput { tokens, kv })
+            .collect();
+        let batched = model.forward_batch(&mut seqs)?;
+        let mut fresh = cache()?;
+        let want = [
+            model.forward(next[0], &mut alone_kv[0])?,
+            model.forward(next[1], &mut alone_kv[1])?,
+            model.forward(next[2], &mut fresh)?,
+        ];
+        for (i, w) in want.iter().enumerate() {
+            assert!(close(w, &batched.get(i)?)? < 1e-4, "mixed step seq {i}");
+        }
         Ok(())
     }
 

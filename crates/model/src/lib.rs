@@ -7,6 +7,7 @@ pub mod layers;
 pub mod llama;
 pub mod rope;
 
+pub use attention::SeqInput;
 pub use config::LlamaConfig;
 pub use kv::{ContiguousKvCache, KvStore};
 pub use llama::Llama;

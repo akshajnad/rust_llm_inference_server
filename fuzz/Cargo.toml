@@ -1,0 +1,28 @@
+[package]
+name = "rlis-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+engine = { path = "../crates/engine" }
+server = { path = "../crates/server" }
+
+[[bin]]
+name = "request_parser"
+path = "fuzz_targets/request_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stop_matcher"
+path = "fuzz_targets/stop_matcher.rs"
+test = false
+doc = false
+bench = false

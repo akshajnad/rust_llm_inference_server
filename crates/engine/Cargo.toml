@@ -8,11 +8,24 @@ publish.workspace = true
 [features]
 metal = ["model/metal"]
 cuda = ["model/cuda"]
+# Tiny random model and byte-level tokenizer for tests that run without weights.
+test-util = ["dep:candle-nn"]
 
 [dependencies]
 model.workspace = true
 candle-core.workspace = true
+candle-nn = { workspace = true, optional = true }
 tokenizers.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+rand_chacha.workspace = true
+minijinja.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+engine = { path = ".", features = ["test-util"] }
