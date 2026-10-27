@@ -1,0 +1,21 @@
+[package]
+name = "model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+metal = ["candle-core/metal", "candle-nn/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+
+[dependencies]
+candle-core.workspace = true
+candle-nn.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tokenizers.workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rlis"
+path = "src/main.rs"
+
+[features]
+metal = ["engine/metal", "model/metal"]
+cuda = ["engine/cuda", "model/cuda"]
+
+[dependencies]
+model.workspace = true
+engine.workspace = true
+candle-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,22 @@
+[
+  "The capital of France is",
+  "Once upon a time, in a small village by the sea,",
+  "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
+  "Explain the difference between a process and a thread in operating systems.",
+  "1, 1, 2, 3, 5, 8, 13,",
+  "Translate to French: The weather is beautiful today and I want to go for a walk.",
+  "Der schnellste Weg, Deutsch zu lernen, ist",
+  "東京は日本の首都で、",
+  "Emoji story: 🚀🌕👩‍🚀 The astronaut",
+  "SELECT name, COUNT(*) FROM orders WHERE",
+  "<|start_header_id|>user<|end_header_id|>\n\nWrite a haiku about Rust's borrow checker.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+  "The mitochondria is",
+  "Q: What is 17 times 23?\nA:",
+  "In 1969, Apollo 11",
+  "fn main() {\n    let v: Vec<i32> = (1..=10).collect();\n",
+  "Résumé of a café owner in Montréal: naïve façade, déjà vu.",
+  "A list of the planets in our solar system, in order from the sun:\n1.",
+  "Привет! Как дела? Сегодня я хочу рассказать о",
+  "The following is a JSON object describing a book: {\"title\":",
+  "Large language model inference is memory-bandwidth bound because"
+]

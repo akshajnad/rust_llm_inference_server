@@ -1,0 +1,9 @@
+/target
+/models
+/third_party
+/.venv
+/.uv-cache
+*.gguf
+*.safetensors
+!/tests/fixtures/**/*.safetensors
+.DS_Store
