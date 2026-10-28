@@ -55,6 +55,26 @@ instead of starting a server), and `rlis serve` flags after `--` for a server it
 `rlis -- --model models/Llama-3.2-1B-Instruct-Q4_K_M.gguf --kv-cache-gb 2`. A started
 server logs to `target/release/rlis-chat-server.log`.
 
+### `rlis code` (coding agent)
+
+```sh
+make models-qwen-3b # Qwen2.5-Coder 3B Instruct, Q4_K_M (1.9 GB)
+cd path/to/project && rlis code
+```
+
+The terminal chat as a coding agent for the current directory: the model reads, creates and
+edits its files to do what you ask, and keeps going (reading, then editing) until it replies
+with a summary. It asks in plain text, in formats a 3B model writes reliably: `READ path` lines,
+and a file's path followed by a fenced `SEARCH`/`REPLACE` block (an edit) or by the whole file
+(a write). Generation stops as soon as a request is complete, so the model never makes up a
+file's contents, and the requests show as cards instead of raw text: reads at once, changes as
+a diff that waits for `y` (apply), `n` (decline; the model hears so and goes on), `a` (apply
+this and every later change) or esc (decline and stop). It may only change files it has read
+in the conversation (or new ones), and no path outside the directory. The system prompt lists
+the project's files (what git doesn't ignore). With no server running it starts one with the
+Qwen 3B model and a 16,384-token context. `--yes` applies changes without asking; the chat's
+other options and commands work too (`/clear` starts over).
+
 ### `rlis fix` (prototype)
 
 ```sh

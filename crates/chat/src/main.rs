@@ -1,7 +1,8 @@
 //! `rlis-chat`: chat with an rlis server (or any OpenAI-compatible one) in the terminal. Starts
 //! `rlis serve` in the background when nothing answers at `--url`, and stops it on exit.
 //! `make install` puts it on the PATH as `rlis`, so it also hands the server binary's own
-//! subcommands (`rlis serve`, ...) through to it. `rlis fix` is its own (see `fix.rs`).
+//! subcommands (`rlis serve`, ...) through to it. `rlis fix` is its own (see `fix.rs`), and
+//! `rlis code` is the chat with tools for the files in the current directory (see `tools.rs`).
 
 mod api;
 mod fix;
@@ -9,6 +10,7 @@ mod frame;
 mod http;
 mod input;
 mod render;
+mod tools;
 
 use std::env;
 use std::fmt::Display;
@@ -60,21 +62,63 @@ const COMMANDS: &[SlashCommand] = &[
     ("/exit", "", "quit"),
 ];
 
+/// Rounds of requests (reads, edits) in one turn before the agent is stopped, so a model stuck
+/// in a loop ends.
+const MAX_STEPS: usize = 25;
+/// Diff lines shown for a change before the rest are summarized.
+const MAX_DIFF_ROWS: usize = 40;
+/// What `rlis code` starts when no server is running: the coding model, with room for several
+/// files in context.
+const CODE_SERVE_ARGS: &[&str] = &[
+    "--model",
+    "models/Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf",
+    "--tokenizer",
+    "models/qwen2.5-coder-3b-instruct",
+    "--served-model-name",
+    "qwen2.5-coder-3b-instruct",
+    "--max-seq-len",
+    "16384",
+];
+
 #[derive(Parser)]
 #[command(
     name = "rlis",
     about = "Chat with an rlis server in the terminal",
     after_help = "`rlis serve`, `rlis generate` and `rlis perplexity` run the server binary.\n\
+                  `rlis code --help`: a coding agent for the files in this directory.\n\
                   `rlis fix --help`: parallel attempts at a patch that makes a test pass."
 )]
 struct Args {
+    #[command(flatten)]
+    chat: ChatArgs,
+}
+
+#[derive(Parser)]
+#[command(
+    name = "rlis code",
+    about = "A coding agent: chat with a model that can read, create and edit the files in the \
+             current directory. Changes are shown as diffs and wait for your approval.",
+    after_help = "With no server running it starts one with Qwen2.5-Coder 3B \
+                  (`make models-qwen-3b`)."
+)]
+struct CodeArgs {
+    #[command(flatten)]
+    chat: ChatArgs,
+    /// Apply file changes without asking.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(clap::Args)]
+struct ChatArgs {
     /// Server to talk to; a local one is started if nothing answers there.
     #[arg(long, default_value = "http://127.0.0.1:8000")]
     url: String,
     #[arg(long)]
     system: Option<String>,
-    #[arg(long, default_value_t = 0.6)]
-    temperature: f32,
+    /// Sampling temperature [default: 0.6, or 0.2 for `rlis code`]
+    #[arg(long)]
+    temperature: Option<f32>,
     #[arg(long, default_value_t = 0.9)]
     top_p: f32,
     /// Longest reply; by default a reply may use the rest of the context window.
@@ -86,6 +130,33 @@ struct Args {
     /// Extra arguments for `rlis serve` when starting one, e.g. `-- --kv-cache-gb 2`.
     #[arg(last = true)]
     serve_args: Vec<String>,
+}
+
+/// `rlis code`'s state on top of the chat's.
+struct Agent {
+    ws: tools::Workspace,
+    /// The instructions and the project's files, listed again at each message from the user.
+    prompt: String,
+    /// Apply changes without asking (`--yes`, or `a` at a prompt).
+    approve_all: bool,
+}
+
+/// What a request did to the agent's turn.
+#[derive(PartialEq)]
+enum Flow {
+    /// Something happened the model should hear about.
+    Next,
+    /// Nothing happened (an unchanged file).
+    Idle,
+    /// The user stopped the turn.
+    Stop,
+}
+
+enum Approval {
+    Yes,
+    No,
+    /// Declined, and the turn ends.
+    Stop,
 }
 
 /// The server binary's subcommands, run in place of the chat.
@@ -101,21 +172,44 @@ fn main() -> Result<()> {
     if env::args().nth(1).as_deref() == Some("fix") {
         return fix::run(fix::FixArgs::parse_from(env::args().skip(1)));
     }
-    let args = Args::parse();
-    let _server = ensure_server(&args.url, args.no_start, &args.serve_args)?;
+    if env::args().nth(1).as_deref() == Some("code") {
+        let args = CodeArgs::parse_from(env::args().skip(1));
+        return chat(args.chat, Some(args.yes));
+    }
+    chat(Args::parse().chat, None)
+}
+
+/// The chat, or with `code` (whether to approve all changes) the coding agent.
+fn chat(args: ChatArgs, code: Option<bool>) -> Result<()> {
+    let serve_args = match (code, args.serve_args.is_empty()) {
+        (Some(_), true) => CODE_SERVE_ARGS.iter().map(|s| s.to_string()).collect(),
+        _ => args.serve_args,
+    };
+    let _server = ensure_server(&args.url, args.no_start, &serve_args)?;
     let model = model_name(&args.url).unwrap_or_else(|| "unknown model".to_string());
+    let agent = match code {
+        Some(yes) => Some(Agent {
+            ws: tools::Workspace::new(env::current_dir()?),
+            prompt: String::new(),
+            approve_all: yes,
+        }),
+        None => None,
+    };
+    let default_temp = if agent.is_some() { 0.2 } else { 0.6 };
     let _terminal = Terminal::enter()?;
     let mut chat = Chat {
         url: args.url,
         model,
         system: args.system,
-        temperature: args.temperature,
+        temperature: args.temperature.unwrap_or(default_temp),
         top_p: args.top_p,
         max_tokens: args.max_tokens,
         messages: Vec::new(),
+        agent,
         editor: Editor::new(COMMANDS),
         out: io::stdout(),
     };
+    chat.refresh_prompt();
     chat.run()
 }
 
@@ -318,11 +412,15 @@ fn term_width() -> usize {
 struct Message {
     role: &'static str,
     content: String,
+    /// What the agent's tools returned, sent as a user message.
+    tool: bool,
 }
 
 enum Outcome {
     /// What the model wrote (possibly cut short); empty if nothing arrived.
     Reply(String),
+    /// What the model wrote before the user stopped it.
+    Interrupted(String),
     /// The conversation no longer fits the context window.
     TooLong(String),
     Failed(String),
@@ -336,6 +434,7 @@ struct Chat {
     top_p: f32,
     max_tokens: Option<usize>,
     messages: Vec<Message>,
+    agent: Option<Agent>,
     editor: Editor,
     out: Stdout,
 }
@@ -362,43 +461,159 @@ impl Chat {
                 self.messages.push(Message {
                     role: "user",
                     content: line,
+                    tool: false,
                 });
+                // Lists files the agent created since the last message; the prompt is unchanged
+                // (and stays cached on the server) when there are none.
+                self.refresh_prompt();
                 self.respond()?;
             }
             self.print("")?;
         }
     }
 
-    /// Runs one reply to the last user message inside the open card and closes it, dropping
-    /// the oldest exchanges if the conversation outgrew the context window.
+    /// Runs one reply to the last user message inside the open card and closes it, making room
+    /// if the conversation outgrew the context window. For the agent, each request in the reply
+    /// (a read or a change) runs in a card of its own and the model answers again in a new
+    /// card, until it replies without one.
     fn respond(&mut self) -> Result<()> {
+        let mut steps = 0;
         loop {
-            match self.generate()? {
-                Outcome::Reply(text) if text.is_empty() => {
-                    self.messages.pop();
+            let (text, interrupted) = match self.generate()? {
+                Outcome::Reply(text) => (text, false),
+                Outcome::Interrupted(text) => (text, true),
+                Outcome::TooLong(message) => match self.shrink() {
+                    Some(note) => {
+                        self.note(note)?;
+                        continue;
+                    }
+                    None => {
+                        self.fail(&message)?;
+                        return Ok(());
+                    }
+                },
+                Outcome::Failed(message) => {
+                    self.fail(&message)?;
+                    return Ok(());
                 }
-                Outcome::Reply(text) => self.messages.push(Message {
-                    role: "assistant",
-                    content: text,
-                }),
-                Outcome::TooLong(_) if self.messages.len() > 2 => {
-                    self.messages.drain(..2);
-                    self.note("Dropped the oldest exchange to fit the context window")?;
+            };
+            if text.is_empty() {
+                self.pop_user();
+                return Ok(());
+            }
+            let requests = match self.agent {
+                Some(_) if !interrupted => tools::Reply::parse(&text),
+                _ => Vec::new(),
+            };
+            // A model that only says again what it said last does nothing new by going on.
+            let repeated = self
+                .messages
+                .iter()
+                .rev()
+                .take_while(|m| m.tool || m.role == "assistant")
+                .any(|m| m.role == "assistant" && m.content == text);
+            self.messages.push(Message {
+                role: "assistant",
+                content: text,
+                tool: false,
+            });
+            if requests.is_empty() {
+                return Ok(());
+            }
+            if steps == MAX_STEPS {
+                self.edge(['┌', '┐'], "stopped", Color::Yellow, "", BORDER)?;
+                self.note(&format!(
+                    "{MAX_STEPS} rounds of reading and editing without finishing; send a \
+                     message to let it go on"
+                ))?;
+                return self.close();
+            }
+            steps += 1;
+            // All of a reply's results go back in one message.
+            let mut results = Vec::new();
+            let (mut stopped, mut progress) = (false, false);
+            for request in &requests {
+                if stopped {
+                    results.push(format!(
+                        "Skipped {}: the user stopped you.",
+                        request.title()
+                    ));
                     continue;
                 }
-                Outcome::TooLong(message) | Outcome::Failed(message) => {
-                    self.messages.pop();
-                    self.error(&message)?;
-                    self.close()?;
-                }
+                let (result, flow) = self.tool(request)?;
+                results.push(result);
+                stopped = flow == Flow::Stop;
+                progress |= flow == Flow::Next;
             }
-            return Ok(());
+            self.messages.push(Message {
+                role: "user",
+                content: results.join("\n\n"),
+                tool: true,
+            });
+            if stopped || !progress {
+                return Ok(());
+            }
+            if repeated {
+                self.edge(['┌', '┐'], "stopped", Color::Yellow, "", BORDER)?;
+                self.note("The model repeated its last reply; send a message to steer it")?;
+                return self.close();
+            }
+            self.edge(['┌', '┐'], "rlis", ACCENT, "", BORDER)?;
+        }
+    }
+
+    /// Reports a reply that failed in the open card and closes it, forgetting the user's
+    /// message if nothing has answered it yet.
+    fn fail(&mut self, message: &str) -> Result<()> {
+        self.pop_user();
+        self.error(message)?;
+        self.close()
+    }
+
+    fn pop_user(&mut self) {
+        if self
+            .messages
+            .last()
+            .is_some_and(|m| m.role == "user" && !m.tool)
+        {
+            self.messages.pop();
+        }
+    }
+
+    /// Makes room when the conversation outgrew the context window: drops the oldest exchange
+    /// (with its tool calls), else, in a turn too long on its own, shortens its oldest tool
+    /// result. Returns what was done, or `None` when nothing can go.
+    fn shrink(&mut self) -> Option<&'static str> {
+        const ELIDED: &str = "[output removed to save space]";
+        let users: Vec<usize> = (0..self.messages.len())
+            .filter(|&i| self.messages[i].role == "user" && !self.messages[i].tool)
+            .collect();
+        if let [_, second, ..] = users[..] {
+            self.messages.drain(..second);
+            return Some("Dropped the oldest exchange to fit the context window");
+        }
+        let m = self
+            .messages
+            .iter_mut()
+            .find(|m| m.tool && m.content != ELIDED)?;
+        m.content = ELIDED.to_string();
+        Some("Removed an earlier tool result to fit the context window")
+    }
+
+    /// Lists the project's files again into the agent's system prompt.
+    fn refresh_prompt(&mut self) {
+        if let Some(a) = &mut self.agent {
+            a.prompt = a.ws.system_prompt(self.system.as_deref());
         }
     }
 
     fn body(&self) -> Vec<u8> {
         let mut messages = Vec::new();
-        if let Some(s) = &self.system {
+        let system = match &self.agent {
+            Some(a) => Some(&a.prompt),
+            None => self.system.as_ref(),
+        };
+        if let Some(s) = system {
             messages.push(json!({"role": "system", "content": s}));
         }
         messages.extend(
@@ -435,10 +650,14 @@ impl Chat {
         let start = Instant::now();
         let mut first_token = None;
         let mut text = String::new();
+        // The agent's requests are shown in cards of their own, and it stops once one is
+        // complete (`cut`) instead of imagining the result.
+        let mut reply = self.agent.is_some().then(tools::Reply::default);
         let (mut pieces, mut usage, mut finish) = (0u64, None, None);
         let (mut socket, mut interrupted, mut rejected) = (None::<TcpStream>, false, None);
+        let mut cut = false;
         let mut writing = false;
-        let error = loop {
+        let mut error = loop {
             if event::poll(Duration::from_millis(40))?
                 && let Event::Key(k) = event::read()?
                 && k.kind != KeyEventKind::Release
@@ -455,17 +674,28 @@ impl Chat {
             for update in rx.try_iter() {
                 match update {
                     Update::Connected(s) => {
-                        if interrupted {
+                        if interrupted || cut {
                             let _ = s.shutdown(Shutdown::Both);
                         }
                         socket = Some(s);
                     }
-                    Update::Text(_) if interrupted => {}
+                    Update::Text(_) if interrupted || cut => {}
                     Update::Text(t) => {
                         first_token.get_or_insert_with(|| start.elapsed());
                         pieces += 1;
-                        r.push(&t);
                         text.push_str(&t);
+                        match &mut reply {
+                            Some(p) => {
+                                r.push(&p.push(&t));
+                                if p.cut() {
+                                    cut = true;
+                                    if let Some(s) = &socket {
+                                        let _ = s.shutdown(Shutdown::Both);
+                                    }
+                                }
+                            }
+                            None => r.push(&t),
+                        }
                     }
                     Update::Finish(f) => finish = Some(f),
                     Update::Usage(n) => usage = Some(n),
@@ -486,7 +716,12 @@ impl Chat {
             if let Some(e) = ended {
                 break e;
             }
-            let (status, status_w) = status_line(start, first_token, pieces, width);
+            let phase = match (first_token, reply.as_ref().and_then(tools::Reply::writing)) {
+                (None, _) => "prefill".to_string(),
+                (Some(_), Some(path)) => format!("writing {path}"),
+                (Some(_), None) => "decoding".to_string(),
+            };
+            let (status, status_w) = status_line(start, &phase, first_token, pieces, width);
             let status = frame::row(&status, status_w, BORDER, width);
             if writing {
                 write!(self.out, "\r\n{status}")?;
@@ -498,6 +733,14 @@ impl Chat {
             self.out.flush()?;
         };
 
+        if let Some(p) = &mut reply {
+            r.push(&p.finish(finish.as_deref() == Some("length")));
+            // Closing the connection to stop at the cut is no error.
+            if cut {
+                error = None;
+            }
+            text = p.text().to_string();
+        }
         let tail = r.finish();
         if !tail.is_empty() && !writing {
             write!(self.out, "{left}")?;
@@ -523,6 +766,7 @@ impl Chat {
                 "interrupted".to_string()
             };
             self.edge(['└', '┘'], "", BORDER, &status, Color::Yellow)?;
+            return Ok(Outcome::Interrupted(text));
         } else if let Some(e) = error {
             if text.is_empty() {
                 return Ok(Outcome::Failed(e));
@@ -556,6 +800,10 @@ impl Chat {
             "/exit" | "/quit" => return Ok(false),
             "/clear" => {
                 self.messages.clear();
+                if let Some(a) = &mut self.agent {
+                    a.ws.forget();
+                }
+                self.refresh_prompt();
                 queue!(self.out, Clear(ClearType::All), MoveTo(0, 0))?;
                 self.banner()?;
                 // `run` prints a blank line after every command; the banner ends with one.
@@ -583,11 +831,17 @@ impl Chat {
                 }
                 "none" => {
                     self.system = None;
+                    self.refresh_prompt();
                     self.note("System prompt removed")?;
                 }
                 s => {
                     self.system = Some(s.to_string());
-                    self.note("System prompt set")?;
+                    self.refresh_prompt();
+                    let note = match self.agent {
+                        Some(_) => "System prompt set; it follows the agent's instructions",
+                        None => "System prompt set",
+                    };
+                    self.note(note)?;
                 }
             },
             "/temp" => match arg.parse::<f32>() {
@@ -623,11 +877,30 @@ impl Chat {
             self.model.as_str().bold(),
             url.dark_grey()
         ))?;
-        let tips = [
-            "local inference chat",
-            "type / for commands",
-            "esc stops a reply",
-        ];
+        let tips = match &self.agent {
+            Some(a) => {
+                let root = a.ws.root();
+                let mut dir = root.display().to_string();
+                // The whole path, or just the directory's name where that doesn't fit.
+                if dir.width() + 20 > width {
+                    dir = root
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into();
+                }
+                vec![
+                    format!("coding agent in {dir}"),
+                    "it asks before changing files".to_string(),
+                    "esc stops it".to_string(),
+                ]
+            }
+            None => vec![
+                "local inference chat".to_string(),
+                "type / for commands".to_string(),
+                "esc stops a reply".to_string(),
+            ],
+        };
         let tips = frame::fit(&tips, width.saturating_sub(4));
         self.print(format!("  {}", tips.dark_grey()))?;
         self.print("")
@@ -636,10 +909,14 @@ impl Chat {
     /// The settings shown in the prompt card's top edge.
     fn status(&self) -> String {
         let mut parts = vec![self.model.clone(), format!("temp {}", self.temperature)];
+        if let Some(a) = &self.agent {
+            let dir = a.ws.root().file_name().unwrap_or_default();
+            parts.insert(0, format!("code · {}", dir.to_string_lossy()));
+        }
         if self.system.is_some() {
             parts.push("system prompt".to_string());
         }
-        parts.push(match self.messages.len() {
+        parts.push(match self.messages.iter().filter(|m| !m.tool).count() {
             0 => "new chat".to_string(),
             1 => "1 message".to_string(),
             n => format!("{n} messages"),
@@ -689,12 +966,179 @@ impl Chat {
             self.columns(&head, 16, d)?;
         }
         self.row("", 0)?;
+        if self.agent.is_some() {
+            self.row(&"agent".with(ACCENT).bold().to_string(), 5)?;
+            let tools = [
+                ("read", "files and directories, at once"),
+                ("edit", "part of a file, after you approve the diff"),
+                ("write", "a new or whole file, after you approve the diff"),
+            ];
+            for (t, d) in tools {
+                let head = format!("  {}", format!("{t:<14}").with(ACCENT));
+                self.columns(&head, 16, d)?;
+            }
+            self.columns(
+                "  ",
+                2,
+                "At a change: y applies it, n declines it (the model hears so and goes on), \
+                 a applies it and every later one, esc declines it and stops the turn.",
+            )?;
+            self.row("", 0)?;
+        }
         self.note(&format!(
             "temperature {} · top-p {} · {} messages in context",
             self.temperature,
             self.top_p,
             self.messages.len()
         ))
+    }
+
+    /// Runs one of the agent's requests in a card of its own: a read at once, a change once
+    /// the user approves its diff. Returns the result for the model and what it means for the
+    /// turn.
+    fn tool(&mut self, request: &tools::Request) -> Result<(String, Flow)> {
+        let action = self
+            .agent
+            .as_mut()
+            .expect("tools run for the agent")
+            .ws
+            .run(request);
+        let title = request.title();
+        let change = match action {
+            Err(e) => {
+                self.edge(['┌', '┐'], &title, ACCENT, "", BORDER)?;
+                self.error(&format!("{e:#}"))?;
+                self.close()?;
+                return Ok((format!("Error: {e:#}"), Flow::Next));
+            }
+            Ok(tools::Action::Done { output, summary }) => {
+                self.edge(['┌', '┐'], &title, ACCENT, &summary, Color::DarkGrey)?;
+                self.close()?;
+                return Ok((output, Flow::Next));
+            }
+            Ok(tools::Action::Unchanged { output }) => {
+                self.edge(['┌', '┐'], &title, ACCENT, "unchanged", Color::DarkGrey)?;
+                self.close()?;
+                return Ok((output, Flow::Idle));
+            }
+            Ok(tools::Action::Change(change)) => change,
+        };
+
+        let diff = tools::diff(change.old.as_deref().unwrap_or(""), &change.new);
+        let count = |t: char| diff.iter().filter(|(tag, _)| *tag == t).count();
+        let stats = match change.old {
+            None => format!("new file · {} lines", count('+')),
+            Some(_) => format!("+{} −{}", count('+'), count('-')),
+        };
+        self.edge(['┌', '┐'], &title, ACCENT, &stats, Color::DarkGrey)?;
+        self.show_diff(&diff)?;
+        let (result, flow) = match self.approve()? {
+            Approval::Yes => match self
+                .agent
+                .as_mut()
+                .expect("changes come from the agent")
+                .ws
+                .apply(&change)
+            {
+                Ok(done) => {
+                    self.marked("✓".with(ACCENT), &done, Color::DarkGrey)?;
+                    (done, Flow::Next)
+                }
+                Err(e) => {
+                    self.error(&format!("{e:#}"))?;
+                    (format!("Error: {e:#}"), Flow::Next)
+                }
+            },
+            Approval::No => {
+                self.note("Declined")?;
+                let msg = format!(
+                    "The user declined the change to {}; it is unchanged.",
+                    change.path
+                );
+                (msg, Flow::Next)
+            }
+            Approval::Stop => {
+                self.note("Declined; the turn stops here")?;
+                let msg = format!(
+                    "The user declined the change to {} and stopped you; it is unchanged.",
+                    change.path
+                );
+                (msg, Flow::Stop)
+            }
+        };
+        self.close()?;
+        Ok((result, flow))
+    }
+
+    /// The changed lines of `diff` with a little context, up to `MAX_DIFF_ROWS` rows.
+    fn show_diff(&mut self, diff: &[(char, String)]) -> Result<()> {
+        let width = frame::text_width();
+        let shown = tools::excerpt(diff, 2);
+        for (n, line) in shown.iter().enumerate() {
+            if n == MAX_DIFF_ROWS {
+                let rest = shown[n..]
+                    .iter()
+                    .flatten()
+                    .filter(|&&i| diff[i].0 != ' ')
+                    .count();
+                if rest > 0 {
+                    self.note(&format!("… {rest} more changed lines"))?;
+                }
+                break;
+            }
+            let Some(i) = *line else {
+                self.row(&"⋯".dark_grey().to_string(), 1)?;
+                continue;
+            };
+            let (tag, text) = &diff[i];
+            let text = frame::truncate(&format!("{tag} {}", text.replace('\t', "    ")), width);
+            let w = text.width();
+            let styled = match tag {
+                '+' => text.green(),
+                '-' => text.red(),
+                _ => text.dark_grey(),
+            };
+            self.row(&styled.to_string(), w)?;
+        }
+        Ok(())
+    }
+
+    /// Asks whether to apply a change, in a row of the open card, unless every change is
+    /// approved already.
+    fn approve(&mut self) -> Result<Approval> {
+        let agent = self.agent.as_mut().expect("changes come from the agent");
+        if agent.approve_all {
+            return Ok(Approval::Yes);
+        }
+        let keys = "y yes · n no · a yes to all · esc stop";
+        let prompt = format!("{} {}", "apply?".with(ACCENT).bold(), keys.dark_grey());
+        let row = frame::row(&prompt, 7 + keys.width(), BORDER, frame::text_width());
+        write!(self.out, "{row}")?;
+        self.out.flush()?;
+        let answer = loop {
+            let Event::Key(k) = event::read()? else {
+                continue;
+            };
+            if k.kind == KeyEventKind::Release {
+                continue;
+            }
+            match k.code {
+                KeyCode::Char('y' | 'Y') => break Approval::Yes,
+                KeyCode::Char('a' | 'A') => {
+                    agent.approve_all = true;
+                    break Approval::Yes;
+                }
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    break Approval::Stop;
+                }
+                KeyCode::Char('n' | 'N') => break Approval::No,
+                KeyCode::Esc => break Approval::Stop,
+                _ => {}
+            }
+        };
+        // The outcome takes the prompt's row.
+        queue!(self.out, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+        Ok(answer)
     }
 
     /// A card row of `head` (`head_w` columns) and then `text`, wrapped beside it.
@@ -775,16 +1219,12 @@ impl Chat {
 /// its width.
 fn status_line(
     start: Instant,
+    phase: &str,
     first_token: Option<Duration>,
     pieces: u64,
     width: usize,
 ) -> (String, usize) {
     let elapsed = start.elapsed();
-    let phase = if first_token.is_some() {
-        "decoding"
-    } else {
-        "prefill"
-    };
     let mut parts = vec![format!("{:.1}s", elapsed.as_secs_f64())];
     if let Some(ttft) = first_token {
         parts.push(format!("{pieces} tokens"));
