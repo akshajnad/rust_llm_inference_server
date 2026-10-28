@@ -18,8 +18,9 @@ downloaded or built.
 
 ### Terminal chat
 
-`make chat` opens a chat in the terminal. `make install` links `rlis-chat` into
-`~/.cargo/bin` so you can run it from any directory (`make uninstall` removes the link).
+`make chat` opens a chat in the terminal. `make install` puts it on your PATH as `rlis` (a link
+in `~/.cargo/bin` to this build), so from any directory `rlis` opens the chat and `rlis serve`,
+`rlis generate` and `rlis perplexity` run the server binary. `make uninstall` removes the link.
 Replies stream in with Markdown styling (headings, bold, code, lists) and a status
 line, and each one ends with its token count, decode speed and time to first token. If no
 server answers at `--url` (default `http://127.0.0.1:8000`), it starts `rlis serve` in the
@@ -46,7 +47,7 @@ dropped when it outgrows the 2,048-token context.
 
 Options: `--system`, `--temperature`, `--top-p`, `--max-tokens`, `--url`, `--no-start` (fail
 instead of starting a server), and `rlis serve` flags after `--` for a server it starts, e.g.
-`rlis-chat -- --model models/Llama-3.2-1B-Instruct-Q4_K_M.gguf --kv-cache-gb 2`. A started
+`rlis -- --model models/Llama-3.2-1B-Instruct-Q4_K_M.gguf --kv-cache-gb 2`. A started
 server logs to `target/release/rlis-chat-server.log`.
 
 ### Server and API

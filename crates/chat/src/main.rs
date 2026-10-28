@@ -1,5 +1,7 @@
 //! `rlis-chat`: chat with an rlis server (or any OpenAI-compatible one) in the terminal. Starts
 //! `rlis serve` in the background when nothing answers at `--url`, and stops it on exit.
+//! `make install` puts it on the PATH as `rlis`, so it also hands the server binary's own
+//! subcommands (`rlis serve`, ...) through to it.
 
 mod api;
 mod http;
@@ -11,6 +13,7 @@ use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{self, Stdout, Write};
 use std::net::{Shutdown, TcpStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -61,7 +64,11 @@ const VERBS: &[&str] = &[
 const SPINNER: &[&str] = &["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
 
 #[derive(Parser)]
-#[command(name = "rlis-chat", about = "Chat with an rlis server in the terminal")]
+#[command(
+    name = "rlis",
+    about = "Chat with an rlis server in the terminal",
+    after_help = "`rlis serve`, `rlis generate` and `rlis perplexity` run the server binary."
+)]
 struct Args {
     /// Server to talk to; a local one is started if nothing answers there.
     #[arg(long, default_value = "http://127.0.0.1:8000")]
@@ -83,7 +90,16 @@ struct Args {
     serve_args: Vec<String>,
 }
 
+/// The server binary's subcommands, run in place of the chat.
+const SERVER_COMMANDS: &[&str] = &["serve", "generate", "perplexity"];
+
 fn main() -> Result<()> {
+    if env::args()
+        .nth(1)
+        .is_some_and(|a| SERVER_COMMANDS.contains(&a.as_str()))
+    {
+        return run_server_command();
+    }
     let args = Args::parse();
     let _server = ensure_server(&args)?;
     let model = model_name(&args.url).unwrap_or_else(|| "unknown model".to_string());
@@ -176,6 +192,29 @@ fn server_dir(exe: &Path) -> PathBuf {
         .map_or_else(|| env::current_dir().unwrap_or_default(), Path::to_path_buf)
 }
 
+/// Replaces this process with the server binary, run from the repo so its default
+/// `models/...` paths resolve wherever the command was typed.
+fn run_server_command() -> Result<()> {
+    let exe = env::current_exe()?.canonicalize()?;
+    let bin = server_bin(&exe)?;
+    let err = Command::new(&bin)
+        .args(env::args_os().skip(1))
+        .current_dir(server_dir(&exe))
+        .exec();
+    Err(err).with_context(|| format!("running {}", bin.display()))
+}
+
+fn server_bin(exe: &Path) -> Result<PathBuf> {
+    let bin = exe.with_file_name("rlis");
+    if !bin.exists() {
+        bail!(
+            "{} not found; build both binaries with `make chat`",
+            bin.display()
+        );
+    }
+    Ok(bin)
+}
+
 fn ensure_server(args: &Args) -> Result<Option<Server>> {
     if healthy(&args.url) {
         return Ok(None);
@@ -188,13 +227,7 @@ fn ensure_server(args: &Args) -> Result<Option<Server>> {
     }
     // Resolved through the symlink `make install` puts on the PATH, to find the build.
     let exe = env::current_exe()?.canonicalize()?;
-    let bin = exe.with_file_name("rlis");
-    if !bin.exists() {
-        bail!(
-            "{} not found; build both binaries with `make chat`",
-            bin.display()
-        );
-    }
+    let bin = server_bin(&exe)?;
     let log_path = exe.with_file_name("rlis-chat-server.log");
     let log =
         File::create(&log_path).with_context(|| format!("creating {}", log_path.display()))?;
