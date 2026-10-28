@@ -119,10 +119,9 @@ bench-mac: models
 # Parity first, then the same sweep against llama.cpp (CUDA); results land in results/cuda/.
 # Needs ~/.kaggle/kaggle.json from a phone-verified account (GPU and internet access).
 bench-cuda:
-	uv venv .venv --python 3.12
+	uv venv --clear .venv --python 3.12
 	VIRTUAL_ENV=.venv uv pip install kaggle
-	KAGGLE=.venv/bin/kaggle scripts/cuda/kaggle.sh
-	rm -rf .venv .uv-cache
+	KAGGLE=.venv/bin/kaggle scripts/cuda/kaggle.sh; rc=$$?; rm -rf .venv .uv-cache; exit $$rc
 
 bench-ablations: models
 	cargo build --release --features $(FEATURES) -p server
