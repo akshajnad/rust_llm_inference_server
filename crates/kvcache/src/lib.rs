@@ -266,6 +266,11 @@ impl BlockManager {
         num_tokens.div_ceil(self.block_size)
     }
 
+    /// Tables holding block `b` (0 for free and evictable blocks).
+    pub fn refcount(&self, b: BlockId) -> u32 {
+        self.alloc.refcount(b)
+    }
+
     pub fn table(&self, seq: SeqId) -> Option<&BlockTable> {
         self.tables.get(&seq)
     }
@@ -555,7 +560,7 @@ mod tests {
     fn op() -> impl Strategy<Value = Op> {
         prop_oneof![
             4 => (0..6u64, 1..20usize).prop_map(|(seq, extra)| Op::Reserve { seq, extra }),
-            1 => (0..6u64, 0..6u64).prop_map(|(parent, child)| Op::Fork { parent, child }),
+            2 => (0..6u64, 0..6u64).prop_map(|(parent, child)| Op::Fork { parent, child }),
             2 => (0..6u64).prop_map(|seq| Op::Free { seq }),
             2 => (0..6u64, 0..3u64).prop_map(|(seq, salt)| Op::Register { seq, salt }),
             2 => (0..6u64, 0..3u64, 1..4usize).prop_map(|(seq, salt, blocks)| Op::Adopt { seq, salt, blocks }),
@@ -581,7 +586,17 @@ mod tests {
                             Ok(copies) => {
                                 prop_assert_eq!(before.num_free_blocks() - m.num_free_blocks(), needed);
                                 prop_assert!(copies.len() <= 1);
-                                prop_assert_eq!(m.table(seq).unwrap().num_tokens, have + extra);
+                                let t = m.table(seq).unwrap();
+                                prop_assert_eq!(t.num_tokens, have + extra);
+                                // Every block the new tokens land in is this table's alone, so
+                                // writing them can't change what another table sees.
+                                for &b in &t.blocks[have / bs..] {
+                                    prop_assert_eq!(m.refcount(b), 1);
+                                }
+                                for c in &copies {
+                                    prop_assert_eq!(before.refcount(c.src) > 1, true);
+                                    prop_assert_eq!(m.refcount(c.src), before.refcount(c.src) - 1);
+                                }
                             }
                             Err(OutOfBlocks) => {
                                 prop_assert!(needed > before.num_free_blocks());

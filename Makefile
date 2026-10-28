@@ -20,7 +20,7 @@ LLAMA_CPP_CMAKE_FLAGS ?= -DGGML_METAL=ON
 LLAMA_CPP_JOBS ?=
 WIKITEXT_URL := $(HF)/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
 
-.PHONY: serve chat install uninstall models models-all wikitext llama-cpp bench-mac bench-cuda bench-ablations bench-charts soak build test test-metal parity-ref chat-ref parity lint fuzz teardown
+.PHONY: serve chat install uninstall models models-all wikitext llama-cpp bench-mac bench-cuda bench-ablations bench-fork bench-charts soak build test test-metal parity-ref chat-ref parity lint fuzz teardown
 
 # One command from a fresh clone to a running server on http://127.0.0.1:8000.
 serve: models
@@ -148,6 +148,13 @@ bench-ablations: models
 	cargo build --release --features $(FEATURES) -p server
 	cargo build --release -p bench
 	scripts/bench/ablations.sh
+
+# Cost of N completions of one prompt vs one (results/mac/fork-*.json, docs/fix-bench.md);
+# needs `make llama-cpp` and `make wikitext`.
+bench-fork: models
+	cargo build --release --features $(FEATURES) -p server
+	cargo build --release -p bench
+	scripts/bench/fork.sh
 
 bench-charts:
 	cargo build --release -p bench

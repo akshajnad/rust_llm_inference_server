@@ -2,6 +2,7 @@
 //! server (ours or llama.cpp's), SVG charts, and a soak test.
 
 mod chart;
+mod fork;
 mod http;
 mod load;
 mod prompts;
@@ -50,6 +51,27 @@ enum Command {
     },
     /// Draw an SVG chart from result files.
     Chart(ChartArgs),
+    /// Cost of N completions of one prompt vs one, as N requests or one request with n = N.
+    Fork(ForkArgs),
+    /// Print fork result files as one Markdown table (medians over repetitions).
+    ForkTable {
+        #[arg(long, required = true, num_args = 1..)]
+        inputs: Vec<PathBuf>,
+    },
+    /// Chart cost ratio wall(N) / wall(1), or wall time, vs N for one prompt length.
+    ForkChart {
+        #[arg(long, required = true, num_args = 1..)]
+        inputs: Vec<PathBuf>,
+        #[arg(long)]
+        prompt_tokens: usize,
+        /// ratio | wall
+        #[arg(long, default_value = "ratio")]
+        metric: String,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value = "")]
+        title: String,
+    },
     /// Long run with random client hang-ups; checks KV blocks and memory return to baseline.
     Soak {
         #[command(flatten)]
@@ -103,6 +125,38 @@ struct RunArgs {
     /// Text file prepended to every prompt (a shared system prompt), for prefix-caching runs.
     #[arg(long)]
     shared_prefix: Option<PathBuf>,
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct ForkArgs {
+    #[arg(long, default_value = "http://127.0.0.1:8000")]
+    url: String,
+    /// Server process id, to sample its memory footprint.
+    #[arg(long)]
+    pid: Option<u32>,
+    /// Series name in tables and charts.
+    #[arg(long)]
+    label: String,
+    #[arg(long, default_value = "rlis")]
+    engine: String,
+    #[arg(long, value_enum)]
+    mode: fork::Mode,
+    #[arg(long, value_delimiter = ',', default_value = "2048,8192")]
+    prompt_tokens: Vec<usize>,
+    #[arg(long, value_delimiter = ',', default_value = "1,2,4,8")]
+    n: Vec<usize>,
+    #[arg(long, default_value_t = 512)]
+    max_tokens: usize,
+    #[arg(long, default_value_t = 0.7)]
+    temperature: f32,
+    #[arg(long, default_value_t = 3)]
+    reps: usize,
+    #[arg(long, default_value = "models/wikitext-2-raw/wiki.test.raw")]
+    corpus: PathBuf,
+    #[arg(long, default_value = "models/llama-3.2-1b-instruct")]
+    tokenizer: PathBuf,
     #[arg(long)]
     out: PathBuf,
 }
@@ -171,6 +225,15 @@ async fn main() -> Result<()> {
         Command::Run(a) => run(a).await?,
         Command::Chart(a) => chart(a)?,
         Command::Table { inputs } => table(&inputs)?,
+        Command::Fork(a) => fork_sweep(a).await?,
+        Command::ForkTable { inputs } => fork_table(&inputs)?,
+        Command::ForkChart {
+            inputs,
+            prompt_tokens,
+            metric,
+            out,
+            title,
+        } => fork_chart(&inputs, prompt_tokens, &metric, &out, title)?,
         Command::Soak {
             target,
             duration_s,
@@ -404,5 +467,156 @@ fn table(inputs: &[PathBuf]) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+async fn fork_sweep(a: ForkArgs) -> Result<()> {
+    let t = load::Target::new(&a.url, "default");
+    let mut maker = fork::PromptMaker::new(&a.corpus, &a.tokenizer)?;
+    let (gpu, gpu_driver) = sys::gpu();
+    let mut file = fork::ForkFile {
+        provenance: sys::Provenance {
+            label: a.label,
+            engine: a.engine,
+            model: "Llama-3.2-1B-Instruct".into(),
+            quantization: "Q8_0".into(),
+            gpu,
+            gpu_driver,
+            os: sys::os(),
+            commit: sys::commit(),
+            timestamp: sys::timestamp(),
+        },
+        mode: a.mode,
+        max_tokens: a.max_tokens,
+        temperature: a.temperature,
+        runs: Vec::new(),
+    };
+    for &len in &a.prompt_tokens {
+        // Warm up kernels for this prompt size; not recorded.
+        let p = maker.make(len)?;
+        fork::run_once(&t, a.mode, &p, len, 2, 0, 8, a.temperature, None).await?;
+        // Repetitions interleave the N values, so slow drift (thermals) hits all of them.
+        for rep in 0..a.reps {
+            for &n in &a.n {
+                let p = maker.make(len)?;
+                let r = fork::run_once(
+                    &t,
+                    a.mode,
+                    &p,
+                    len,
+                    n,
+                    rep,
+                    a.max_tokens,
+                    a.temperature,
+                    a.pid,
+                )
+                .await?;
+                eprintln!(
+                    "{} prompt {:>5} n {n} rep {rep}: wall {:6.2} s | ttft mean {:6.2} s | {:6.1} tok/s | peak {} | kv blocks {}",
+                    file.provenance.label,
+                    r.prompt_tokens,
+                    r.wall_s,
+                    r.ttft_mean_s,
+                    r.tok_s,
+                    r.footprint_peak_bytes
+                        .map_or("-".into(), |b| format!("{:.2} GB", b as f64 / 1e9)),
+                    r.kv_blocks_peak.map_or("-".into(), |b| b.to_string()),
+                );
+                file.runs.push(r);
+            }
+        }
+    }
+    if let Some(dir) = a.out.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&a.out, serde_json::to_string_pretty(&file)?)?;
+    eprintln!("wrote {}", a.out.display());
+    Ok(())
+}
+
+fn read_fork_file(path: &PathBuf) -> Result<fork::ForkFile> {
+    serde_json::from_str(
+        &std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?,
+    )
+    .with_context(|| format!("parsing {}", path.display()))
+}
+
+fn fork_table(inputs: &[PathBuf]) -> Result<()> {
+    println!(
+        "| configuration | prompt | N | wall (s) | cost ratio | mean TTFT (s) | output tok/s | peak footprint | peak KV blocks (tokens) |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|");
+    for path in inputs {
+        let f = read_fork_file(path)?;
+        for c in fork::cells(&f) {
+            let bs = f.runs.iter().find_map(|r| r.kv_block_size).unwrap_or(0);
+            println!(
+                "| {} | {}k | {} | {:.2} | {:.2}× | {:.2} | {:.0} | {} | {} |",
+                f.provenance.label,
+                c.nominal / 1024,
+                c.n,
+                c.wall_s,
+                c.ratio,
+                c.ttft_mean_s,
+                c.tok_s,
+                c.footprint_peak_bytes
+                    .map_or("-".into(), |b| format!("{:.2} GB", b as f64 / 1e9)),
+                c.kv_blocks_peak
+                    .map_or("n/a".into(), |b| format!("{b} ({})", b * bs)),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn fork_chart(
+    inputs: &[PathBuf],
+    prompt_tokens: usize,
+    metric: &str,
+    out: &PathBuf,
+    title: String,
+) -> Result<()> {
+    let (value, y_label): (fn(&fork::Cell) -> f64, &str) = match metric {
+        "ratio" => (|c| c.ratio, "cost ratio: wall time(N) / wall time(1)"),
+        "wall" => (|c| c.wall_s, "wall time for all N completions (s)"),
+        other => anyhow::bail!("unknown metric {other}"),
+    };
+    let mut series = Vec::new();
+    let mut ns = Vec::new();
+    for path in inputs {
+        let f = read_fork_file(path)?;
+        let points: Vec<(f64, f64)> = fork::cells(&f)
+            .iter()
+            .filter(|c| c.nominal == prompt_tokens)
+            .map(|c| (c.n as f64, value(c)))
+            .collect();
+        ns.extend(points.iter().map(|p| p.0));
+        series.push(chart::Series {
+            label: f.provenance.label,
+            points,
+            point_labels: Vec::new(),
+        });
+    }
+    ns.sort_by(f64::total_cmp);
+    ns.dedup();
+    if metric == "ratio" {
+        series.push(chart::Series {
+            label: "N separate runs (N×)".into(),
+            points: ns.iter().map(|&n| (n, n)).collect(),
+            point_labels: Vec::new(),
+        });
+    }
+    let c = chart::Chart {
+        title,
+        x_label: "completions of one prompt (N)".into(),
+        y_label: y_label.into(),
+        log2_x: true,
+        series,
+    };
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(out, c.svg())?;
+    eprintln!("wrote {}", out.display());
     Ok(())
 }

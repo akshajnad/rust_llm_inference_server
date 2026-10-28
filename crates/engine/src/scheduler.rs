@@ -17,6 +17,9 @@
 //! - With `prefix_caching`, every block is registered once all its tokens are computed, and an
 //!   admitted sequence starts from the longest cached chain of its leading blocks. That also
 //!   makes recompute after preemption cheap: the victim's blocks stay cached until reclaimed.
+//! - A sequence added with `forks` children is admitted only if it has seats and blocks for
+//!   them too. Once its prompt is computed, `fork` gives each child the parent's blocks: the
+//!   prompt is prefilled once, and only the partially filled last block is copied (on write).
 
 use std::collections::VecDeque;
 
@@ -59,6 +62,8 @@ struct SeqState {
     /// Leading blocks registered in the prefix cache, and the hash chain through them.
     registered: usize,
     chain: u64,
+    /// Children still to be forked off once the prompt is computed.
+    forks: usize,
 }
 
 impl SeqState {
@@ -129,7 +134,17 @@ impl Scheduler {
 
     /// Queues a new sequence with its prompt tokens.
     pub fn add(&mut self, id: SeqId, prompt: Vec<u32>) {
+        self.add_forked(id, prompt, 0);
+    }
+
+    /// Queues a sequence that will `fork` into `forks` more once its prompt is computed.
+    pub fn add_forked(&mut self, id: SeqId, prompt: Vec<u32>, forks: usize) {
         assert!(!prompt.is_empty(), "empty sequence");
+        assert!(
+            forks < self.cfg.max_num_seqs,
+            "{} sequences can never run at once",
+            forks + 1
+        );
         self.waiting.push_back(SeqState {
             id,
             arrival: self.next_arrival,
@@ -137,8 +152,42 @@ impl Scheduler {
             num_computed: 0,
             registered: 0,
             chain: 0,
+            forks,
         });
         self.next_arrival += 1;
+    }
+
+    /// Children `id` has yet to fork.
+    pub fn pending_forks(&self, id: SeqId) -> usize {
+        self.running
+            .iter()
+            .find(|s| s.id == id)
+            .map_or(0, |s| s.forks)
+    }
+
+    /// Starts `child` as a copy of `parent`, sharing its KV blocks. The parent must be running
+    /// with every token computed and a fork pending; the child runs from the next step.
+    pub fn fork(&mut self, parent: SeqId, child: SeqId) {
+        let p = self
+            .running
+            .iter_mut()
+            .find(|s| s.id == parent)
+            .expect("fork of a sequence that isn't running");
+        assert!(
+            p.forks > 0 && p.num_computed == p.num_tokens(),
+            "fork of seq {parent} before its prompt is computed or past its fork count"
+        );
+        p.forks -= 1;
+        let s = SeqState {
+            id: child,
+            arrival: self.next_arrival,
+            forks: 0,
+            ..p.clone()
+        };
+        self.next_arrival += 1;
+        self.blocks.fork(parent, child);
+        // Newest arrival, so it stays sorted and is the first preemption victim.
+        self.running.push(s);
     }
 
     pub fn schedule(&mut self) -> Schedule {
@@ -196,15 +245,25 @@ impl Scheduler {
         self.preempted.insert(at, s);
     }
 
+    /// Running sequences plus the children they have yet to fork.
+    fn seats(&self) -> usize {
+        self.running.iter().map(|s| 1 + s.forks).sum()
+    }
+
     fn admit(&mut self, out: &mut Schedule, budget: &mut usize) {
         let ignore_budget = self.cfg.policy == Policy::Static;
-        while self.running.len() < self.cfg.max_num_seqs && (ignore_budget || *budget > 0) {
+        while self.seats() < self.cfg.max_num_seqs && (ignore_budget || *budget > 0) {
+            let seats = self.seats();
             let queue = if self.preempted.is_empty() {
                 &mut self.waiting
             } else {
                 &mut self.preempted
             };
             let Some(head) = queue.front() else { break };
+            // Its children will need seats, and one block each to copy the shared last block.
+            if seats + 1 + head.forks > self.cfg.max_num_seqs {
+                break;
+            }
             // Cached leading blocks, never the one holding the last token: its logits are
             // needed, so at least one token is always computed.
             let hashes = match self.cfg.prefix_caching {
@@ -212,7 +271,7 @@ impl Scheduler {
                 false => Vec::new(),
             };
             let (matched, matched_evictable) = self.blocks.prefix_match(&hashes);
-            let need = self.blocks.blocks_for(head.num_tokens()) - matched;
+            let need = self.blocks.blocks_for(head.num_tokens()) - matched + head.forks;
             let available = self.blocks.num_free_blocks() - matched_evictable;
             if need + self.cfg.watermark_blocks > available {
                 break;
@@ -703,6 +762,206 @@ mod tests {
                 blocks,
                 "every block is free or reclaimable"
             );
+        }
+    }
+
+    #[test]
+    fn forks_share_the_prompt_and_copy_only_its_last_block() {
+        let mut s = Scheduler::new(cfg(64, Policy::Continuous));
+        s.add_forked(0, toks(0, 10), 3);
+        let q = s.schedule().seqs[0];
+        assert_eq!((q.start, q.end), (0, 10));
+        s.advance(0, 10);
+        assert_eq!(s.pending_forks(0), 3);
+        for child in 1..4 {
+            s.fork(0, child);
+        }
+        assert_eq!(s.pending_forks(0), 0);
+        assert_eq!(s.num_free_blocks(), 64 - 3, "children allocate nothing");
+        for id in 0..4 {
+            assert_eq!(s.block_table(id), s.block_table(0));
+            s.append_token(id, 50 + id as u32);
+        }
+        // Token 10 lands in the shared, half-full third block: the first three writers copy
+        // it, and the last one finds it unshared.
+        let step = s.schedule();
+        assert_eq!(step.seqs.len(), 4);
+        assert_eq!(step.copies.len(), 3);
+        assert_eq!(
+            s.num_free_blocks(),
+            64 - 6,
+            "vs 12 blocks for 4 separate prompts"
+        );
+        s.check();
+        for id in 0..4 {
+            s.remove(id);
+        }
+        assert_eq!(s.num_free_blocks(), 64);
+    }
+
+    #[test]
+    fn admission_holds_seats_for_pending_forks() {
+        let mut s = Scheduler::new(SchedulerConfig {
+            max_num_seqs: 4,
+            ..cfg(64, Policy::Continuous)
+        });
+        s.add_forked(0, toks(0, 4), 2);
+        s.add(1, toks(1, 4));
+        s.add(2, toks(2, 4));
+        let ids: Vec<_> = s.schedule().seqs.iter().map(|q| q.id).collect();
+        assert_eq!(ids, [0, 1], "seq 2 would leave no seat for a child");
+    }
+
+    /// One sequence of a fork workload: a prompt (optionally sharing a prefix with others),
+    /// children to fork, and per-member output lengths and cancellation steps (index 0 is the
+    /// parent).
+    #[derive(Debug, Clone)]
+    struct ForkCase {
+        prompt: usize,
+        shared: bool,
+        outputs: Vec<usize>,
+        cancel_at: Vec<Option<usize>>,
+    }
+
+    fn fork_case() -> impl proptest::strategy::Strategy<Value = ForkCase> {
+        use proptest::prelude::*;
+        (1..30usize, any::<bool>(), 0..4usize).prop_flat_map(|(prompt, shared, forks)| {
+            (
+                proptest::collection::vec(1..15usize, forks + 1),
+                proptest::collection::vec(proptest::option::weighted(0.2, 0..40usize), forks + 1),
+            )
+                .prop_map(move |(outputs, cancel_at)| ForkCase {
+                    prompt,
+                    shared,
+                    outputs,
+                    cancel_at,
+                })
+        })
+    }
+
+    /// Runs `cases` against a fake KV pool that stores token ids. Each step: perform the
+    /// copies, check every block about to be written has refcount 1, write the tokens, then
+    /// check every running sequence's computed slots hold exactly its tokens. A parent forks
+    /// its children when its prompt is done; members finish after their output count or are
+    /// removed at their cancellation step.
+    fn run_forks(sched: &mut Scheduler, cases: &[ForkCase]) {
+        let bs = sched.cfg.block_size;
+        let shared: Vec<u32> = (900_000..900_016).collect();
+        // Member `m` of case `i`: id i * 10 + m, so ids stay unique and decode to (case, member).
+        let member = |id: SeqId| ((id / 10) as usize, (id % 10) as usize);
+        for (i, c) in cases.iter().enumerate() {
+            let mut prompt = toks(i as SeqId, c.prompt);
+            if c.shared {
+                prompt.splice(0..0, shared.iter().copied());
+            }
+            sched.add_forked(i as SeqId * 10, prompt, c.outputs.len() - 1);
+        }
+        let mut pool: Vec<Option<u32>> = vec![None; sched.cfg.num_blocks * bs];
+        let mut produced: HashMap<SeqId, usize> = HashMap::new();
+        for step_no in 0..100_000 {
+            // Cancellations, of members that exist (a cancelled parent takes its unforked
+            // children with it).
+            let ids: Vec<SeqId> = (0..cases.len())
+                .flat_map(|i| (0..cases[i].outputs.len()).map(move |m| (i * 10 + m) as SeqId))
+                .collect();
+            for id in ids {
+                let (i, m) = member(id);
+                if cases[i].cancel_at[m] == Some(step_no) {
+                    sched.remove(id);
+                    sched.check();
+                }
+            }
+            if !sched.has_work() {
+                assert_eq!(
+                    sched.num_free_blocks(),
+                    sched.cfg.num_blocks,
+                    "every block is free or reclaimable"
+                );
+                return;
+            }
+            let step = sched.schedule();
+            assert!(!step.seqs.is_empty(), "no progress with work pending");
+            assert!(step.seqs.len() <= sched.cfg.max_num_seqs);
+            for c in &step.copies {
+                let (src, dst) = (c.src as usize * bs, c.dst as usize * bs);
+                pool.copy_within(src..src + bs, dst);
+            }
+            for q in &step.seqs {
+                let s = sched.running.iter().find(|s| s.id == q.id).unwrap();
+                let table = sched.block_table(q.id);
+                for pos in q.start..q.end {
+                    let b = table[pos / bs];
+                    assert_eq!(
+                        sched.blocks.refcount(b),
+                        1,
+                        "seq {} writes position {pos} into shared block {b}",
+                        q.id
+                    );
+                    pool[b as usize * bs + pos % bs] = Some(s.tokens[pos]);
+                }
+            }
+            for q in &step.seqs {
+                sched.advance(q.id, q.end);
+                if !sched.is_caught_up(q.id) {
+                    continue;
+                }
+                let mut members = vec![q.id];
+                while sched.pending_forks(q.id) > 0 {
+                    let child = q.id
+                        + (cases[member(q.id).0].outputs.len() - sched.pending_forks(q.id))
+                            as SeqId;
+                    sched.fork(q.id, child);
+                    members.push(child);
+                }
+                for id in members {
+                    let (i, m) = member(id);
+                    let n = produced.entry(id).or_default();
+                    *n += 1;
+                    if *n == cases[i].outputs[m] {
+                        sched.remove(id);
+                    } else {
+                        // Members sample different tokens, so a write into a shared block
+                        // would show up in a sibling's contents.
+                        sched.append_token(id, id as u32 * 1000 + *n as u32);
+                    }
+                }
+            }
+            sched.check();
+            for s in &sched.running {
+                let table = sched.block_table(s.id);
+                for pos in 0..s.num_computed {
+                    assert_eq!(
+                        pool[table[pos / bs] as usize * bs + pos % bs],
+                        Some(s.tokens[pos]),
+                        "seq {} sees the wrong token at {pos}",
+                        s.id
+                    );
+                }
+            }
+        }
+        panic!("simulation did not finish");
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(500))]
+
+        /// Forked workloads under memory pressure, with and without prefix caching, random
+        /// chunking and random cancellation of parents and children: no block leaks, refcounts
+        /// match holders after every step and removal, copy-on-write never writes a shared
+        /// block, and every sequence always reads back exactly its own tokens.
+        #[test]
+        fn forks_never_leak_or_corrupt(
+            cases in proptest::collection::vec(fork_case(), 1..8),
+            blocks in 24..64usize,
+            max_batched_tokens in 8..64usize,
+            prefix_caching: bool,
+        ) {
+            let mut s = Scheduler::new(SchedulerConfig {
+                max_batched_tokens,
+                prefix_caching,
+                ..cfg(blocks, Policy::Continuous)
+            });
+            run_forks(&mut s, &cases);
         }
     }
 }

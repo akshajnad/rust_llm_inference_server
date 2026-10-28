@@ -310,3 +310,85 @@ fn prefix_caching_changes_nothing_but_speed() {
         "expected the shared prefix to be reused, got {hits} cached tokens"
     );
 }
+
+fn submit_forked(
+    h: &EngineHandle,
+    tok: &engine::Tokenizer,
+    prompt: &str,
+    params: Vec<SamplingParams>,
+) -> Vec<UnboundedReceiver<Event>> {
+    let (req, rxs) = Request::with_forks(tok.encode(prompt).unwrap(), params);
+    h.submit(req).unwrap();
+    rxs
+}
+
+/// Waits for the engine to publish an empty KV pool (stats lag the last step slightly).
+fn assert_pool_drains(h: &EngineHandle) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.kv_utilization() > 0.0 {
+        assert!(Instant::now() < deadline, "KV blocks still in use");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Forked completions share one prefill and copy the prompt's last block on write; each must
+/// produce exactly what a separate request with the same parameters does. Prompt lengths
+/// cover a last block that is full (no copy needed) and partial (copied by all but one).
+#[test]
+fn forked_completions_match_separate_requests() {
+    let (h, tok) = start(8);
+    let params = |seed| SamplingParams {
+        temperature: 0.9,
+        seed: Some(seed),
+        ..SamplingParams::greedy(20)
+    };
+    // "<s>" plus 11 or 13 bytes: 12 and 14 tokens with 4-token blocks.
+    for prompt in ["fork prompt", "a fork prompt"] {
+        let solo: Vec<String> = (0..4)
+            .map(|i| collect(submit(&h, &tok, prompt, params(i))).0)
+            .collect();
+        assert_ne!(solo[0], solo[1], "seeds should give different text");
+        let forked: Vec<String> = submit_forked(&h, &tok, prompt, (0..4).map(params).collect())
+            .into_iter()
+            .map(|rx| collect(rx).0)
+            .collect();
+        assert_eq!(forked, solo, "{prompt:?}");
+        let greedy = collect(submit(&h, &tok, prompt, SamplingParams::greedy(20))).0;
+        for rx in submit_forked(&h, &tok, prompt, vec![SamplingParams::greedy(20); 3]) {
+            assert_eq!(collect(rx).0, greedy);
+        }
+    }
+    assert_pool_drains(&h);
+}
+
+/// The parent's client hanging up doesn't cancel its children; everyone hanging up frees all.
+#[test]
+fn children_outlive_their_parents_client() {
+    let (h, tok) = start(8);
+    let expected = collect(submit(&h, &tok, "orphans", SamplingParams::greedy(30))).0;
+    let mut rxs = submit_forked(&h, &tok, "orphans", vec![SamplingParams::greedy(30); 3]);
+    drop(rxs.remove(0));
+    for rx in rxs {
+        let (text, fin) = collect(rx);
+        assert_eq!((text, fin.completion_tokens), (expected.clone(), 30));
+    }
+    let rxs = submit_forked(&h, &tok, "orphans", vec![SamplingParams::greedy(200); 4]);
+    drop(rxs);
+    assert_pool_drains(&h);
+    // The engine is still healthy afterwards.
+    assert_eq!(
+        collect(submit(&h, &tok, "orphans", SamplingParams::greedy(30))).0,
+        expected
+    );
+}
+
+#[test]
+fn more_forks_than_seats_is_an_error_for_every_receiver() {
+    let (h, tok) = start(4);
+    for mut rx in submit_forked(&h, &tok, "x", vec![SamplingParams::greedy(4); 5]) {
+        match rx.blocking_recv() {
+            Some(Event::Error(e)) => assert!(e.contains("max_num_seqs"), "{e}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+}

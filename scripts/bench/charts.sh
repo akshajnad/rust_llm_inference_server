@@ -25,6 +25,21 @@ $B chart --inputs "$R/ablation-baseline.json" "$R/ablation-static.json" --x conc
 } > "$R/tables.md"
 echo "wrote docs/*.svg and $R/tables.md"
 
+# Cost of N completions of one prompt (make bench-fork), when its results are present.
+F=("$R"/fork-rlis-independent.json "$R"/fork-rlis-n.json "$R"/fork-rlis-independent-apc.json
+   "$R"/fork-llamacpp-independent.json "$R"/fork-llamacpp-n.json)
+if [ -f "${F[0]}" ]; then
+  for p in 2048 8192; do
+    k=$((p / 1024))
+    $B fork-chart --inputs "${F[@]}" --prompt-tokens $p --out docs/fix-cost-${k}k.svg \
+      --title "Cost of N completions vs 1, ${k}k-token prompt, 512 tokens each (M4 Pro)"
+    $B fork-chart --inputs "${F[@]}" --prompt-tokens $p --metric wall --out docs/fix-wall-${k}k.svg \
+      --title "Wall time for N completions, ${k}k-token prompt, 512 tokens each (M4 Pro)"
+  done
+  $B fork-table --inputs "${F[@]}" > "$R/fork-table.md"
+  echo "wrote docs/fix-cost-*.svg and $R/fork-table.md"
+fi
+
 # The CUDA run (make bench-cuda), when its results are present.
 C=results/cuda
 CCMP=("$C/rlis-q8_0.json" "$C/llamacpp-q8_0.json")

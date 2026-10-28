@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ab1af84221b8c3e7e459dd348432514e9c0eeb103ee28cd6756e38301e993c20 # shrinks to cases = [ForkCase { prompt: 1, shared: false, outputs: [2, 2], cancel_at: [None, None] }], blocks = 24, max_batched_tokens = 8, prefix_caching = false

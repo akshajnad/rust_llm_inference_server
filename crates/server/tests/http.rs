@@ -176,6 +176,45 @@ async fn chat_non_streamed_counts_template_tokens() {
     assert_eq!(v["usage"]["prompt_tokens"], 21);
 }
 
+/// `n` completions come back as indexed choices: seeded choices differ from each other, and
+/// the streamed text of each choice equals the non-streamed one.
+#[tokio::test]
+async fn n_completions_are_indexed_choices() {
+    let st = state();
+    let req = |stream| {
+        json!({"prompt": "abc", "max_tokens": 12, "temperature": 0.9, "seed": 7, "n": 3,
+               "stream": stream, "stream_options": {"include_usage": true}})
+    };
+    let (status, _, body) = send(&st, post("/v1/completions", req(false))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let texts: Vec<&str> = (0..3)
+        .map(|i| {
+            assert_eq!(v["choices"][i]["index"], i);
+            v["choices"][i]["text"].as_str().unwrap()
+        })
+        .collect();
+    assert_ne!(
+        texts[0], texts[1],
+        "seed + i gives each choice its own draw"
+    );
+    assert_eq!(v["usage"]["prompt_tokens"], 4);
+    assert_eq!(v["usage"]["completion_tokens"], 36);
+
+    let (_, _, body) = send(&st, post("/v1/completions", req(true))).await;
+    let mut streamed = vec![String::new(); 3];
+    let mut finished = 0;
+    let payloads = sse_payloads(&body);
+    for p in &payloads[..payloads.len() - 1] {
+        let c = &p["choices"][0];
+        streamed[c["index"].as_u64().unwrap() as usize] += c["text"].as_str().unwrap();
+        finished += usize::from(!c["finish_reason"].is_null());
+    }
+    assert_eq!(finished, 3);
+    assert_eq!(streamed, texts);
+    assert_eq!(payloads.last().unwrap()["usage"]["completion_tokens"], 36);
+}
+
 #[tokio::test]
 async fn invalid_requests_get_openai_errors() {
     let st = state();
@@ -188,7 +227,8 @@ async fn invalid_requests_get_openai_errors() {
             "repetition_penalty",
         ),
         (json!({"prompt": "x", "max_tokens": 0}), "max_tokens"),
-        (json!({"prompt": "x", "n": 2}), "n"),
+        (json!({"prompt": "x", "n": 0}), "n"),
+        (json!({"prompt": "x", "n": 17}), "n"),
         (
             json!({"prompt": "x", "stop": ["a", "b", "c", "d", "e"]}),
             "stop",

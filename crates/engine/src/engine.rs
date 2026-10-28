@@ -5,6 +5,10 @@
 //! Each iteration: take new requests off the queue, drop cancelled ones, ask the scheduler
 //! what to run, run one forward pass over the shared paged KV pool, and sample one token for
 //! every sequence whose tokens are all computed.
+//!
+//! A request can ask for several completions of one prompt (`Request::with_forks`): the prompt
+//! is prefilled once, then the sequence forks into children that share its KV blocks and
+//! sample their first tokens from the same logits, each with its own sampling parameters.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -63,6 +67,14 @@ pub struct Request {
     pub params: SamplingParams,
     pub events: mpsc::UnboundedSender<Event>,
     pub arrived: Instant,
+    /// More completions of the same prompt, forked off once it is prefilled.
+    pub forks: Vec<Fork>,
+}
+
+/// One extra completion of a forked request, with its own parameters (seed) and stream.
+pub struct Fork {
+    pub params: SamplingParams,
+    pub events: mpsc::UnboundedSender<Event>,
 }
 
 impl Request {
@@ -75,9 +87,27 @@ impl Request {
                 params,
                 events,
                 arrived: Instant::now(),
+                forks: Vec::new(),
             },
             rx,
         )
+    }
+
+    /// One completion per entry of `params`, sharing one prefill of `prompt`. Receivers are in
+    /// the order of `params`.
+    pub fn with_forks(
+        prompt: Vec<u32>,
+        params: Vec<SamplingParams>,
+    ) -> (Self, Vec<mpsc::UnboundedReceiver<Event>>) {
+        let mut params = params.into_iter();
+        let (mut req, rx) = Self::new(prompt, params.next().expect("at least one completion"));
+        let mut rxs = vec![rx];
+        for params in params {
+            let (events, rx) = mpsc::unbounded_channel();
+            req.forks.push(Fork { params, events });
+            rxs.push(rx);
+        }
+        (req, rxs)
     }
 }
 
@@ -136,6 +166,10 @@ pub struct EngineStats {
     pub preemptions: AtomicU64,
     /// KV block utilization in parts per million.
     pub kv_usage_ppm: AtomicU64,
+    /// KV blocks referenced by some sequence, of `kv_blocks_total`, each `kv_block_size` tokens.
+    pub kv_blocks_used: AtomicUsize,
+    pub kv_blocks_total: AtomicUsize,
+    pub kv_block_size: AtomicUsize,
     /// Prompt tokens admitted, and how many came from the prefix cache.
     pub admitted_tokens: AtomicU64,
     pub cached_tokens: AtomicU64,
@@ -255,6 +289,8 @@ pub fn spawn(
     );
     let (handle, rx) = EngineHandle::channel(&cfg, max_seq_len);
     let stats = handle.stats.clone();
+    stats.kv_blocks_total.store(num_blocks, Ordering::Relaxed);
+    stats.kv_block_size.store(cfg.block_size, Ordering::Relaxed);
     std::thread::Builder::new()
         .name("engine".into())
         .spawn(move || {
@@ -288,21 +324,34 @@ struct Sequence {
     first_token_at: Option<Instant>,
     last_token_at: Option<Instant>,
     finished: bool,
+    /// Children not yet forked (until the prompt is computed).
+    forks: Vec<Fork>,
 }
 
 impl Sequence {
-    fn new(req: Request, max_seq_len: usize) -> Option<Self> {
-        let total = req.prompt.len() + req.params.max_tokens;
-        if req.prompt.is_empty() || req.params.max_tokens == 0 {
-            let _ = req
-                .events
-                .send(Event::Error("empty prompt or max_tokens of 0".into()));
-            return None;
-        }
-        if total > max_seq_len {
-            let _ = req.events.send(Event::Error(format!(
-                "{total} tokens exceeds max_seq_len {max_seq_len}"
-            )));
+    fn new(req: Request, max_seq_len: usize, max_num_seqs: usize) -> Option<Self> {
+        let max_tokens = std::iter::once(&req.params)
+            .chain(req.forks.iter().map(|f| &f.params))
+            .map(|p| p.max_tokens);
+        let error = if req.prompt.is_empty() || max_tokens.clone().any(|m| m == 0) {
+            Some("empty prompt or max_tokens of 0".to_string())
+        } else if let Some(total) = max_tokens
+            .map(|m| req.prompt.len() + m)
+            .find(|&t| t > max_seq_len)
+        {
+            Some(format!("{total} tokens exceeds max_seq_len {max_seq_len}"))
+        } else if req.forks.len() >= max_num_seqs {
+            Some(format!(
+                "{} completions exceed max_num_seqs {max_num_seqs}",
+                req.forks.len() + 1
+            ))
+        } else {
+            None
+        };
+        if let Some(e) = error {
+            for events in std::iter::once(&req.events).chain(req.forks.iter().map(|f| &f.events)) {
+                let _ = events.send(Event::Error(e.clone()));
+            }
             return None;
         }
         Some(Self {
@@ -318,7 +367,27 @@ impl Sequence {
             first_token_at: None,
             last_token_at: None,
             finished: false,
+            forks: req.forks,
         })
+    }
+
+    /// A child of this sequence (whose prompt is computed, nothing generated yet).
+    fn fork(&self, f: Fork) -> Self {
+        Self {
+            detok: Detokenizer::new(&self.tokens),
+            stop: StopMatcher::new(f.params.stop.clone()),
+            max_tokens: f.params.max_tokens,
+            ignore_eos: f.params.ignore_eos,
+            sampler: Sampler::new(f.params),
+            prompt_len: self.prompt_len,
+            tokens: self.tokens.clone(),
+            events: f.events,
+            arrived: self.arrived,
+            first_token_at: None,
+            last_token_at: None,
+            finished: false,
+            forks: Vec::new(),
+        }
     }
 
     fn output_len(&self) -> usize {
@@ -394,8 +463,15 @@ impl Sequence {
         Ok(())
     }
 
+    /// Its client and every child still waiting to fork have gone away.
     fn cancelled(&self) -> bool {
-        self.events.is_closed()
+        self.events.is_closed() && self.forks.iter().all(|f| f.events.is_closed())
+    }
+
+    fn send_error(&self, msg: &str) {
+        for events in std::iter::once(&self.events).chain(self.forks.iter().map(|f| &f.events)) {
+            let _ = events.send(Event::Error(msg.to_string()));
+        }
     }
 }
 
@@ -455,12 +531,31 @@ impl Engine {
     }
 
     fn add(&mut self, req: Request) {
-        if let Some(seq) = Sequence::new(req, self.max_seq_len) {
+        let max_num_seqs = self.sched.config().max_num_seqs;
+        if let Some(seq) = Sequence::new(req, self.max_seq_len, max_num_seqs) {
             let id = self.next_id;
             self.next_id += 1;
-            self.sched.add(id, seq.tokens.clone());
+            self.sched
+                .add_forked(id, seq.tokens.clone(), seq.forks.len());
             self.seqs.insert(id, seq);
         }
+    }
+
+    /// Forks `id`'s pending children now that its prompt is computed; returns their ids.
+    /// Children whose clients already left are dropped next iteration like any other.
+    fn fork_children(&mut self, id: SeqId) -> Vec<SeqId> {
+        let parent = self.seqs.get_mut(&id).expect("scheduled sequence exists");
+        let forks = std::mem::take(&mut parent.forks);
+        let mut children = Vec::new();
+        for f in forks {
+            let child = self.seqs[&id].fork(f);
+            let child_id = self.next_id;
+            self.next_id += 1;
+            self.sched.fork(id, child_id);
+            self.seqs.insert(child_id, child);
+            children.push(child_id);
+        }
+        children
     }
 
     /// A dropped event receiver means the client went away: free its blocks now.
@@ -485,7 +580,7 @@ impl Engine {
     fn fail(&mut self, ids: &[SeqId], msg: &str) {
         for id in ids {
             if let Some(seq) = self.seqs.remove(id) {
-                let _ = seq.events.send(Event::Error(msg.to_string()));
+                seq.send_error(msg);
             }
             self.sched.remove(*id);
         }
@@ -512,6 +607,9 @@ impl Engine {
             (self.sched.kv_utilization() * 1e6) as u64,
             Ordering::Relaxed,
         );
+        let total = self.sched.config().num_blocks;
+        s.kv_blocks_used
+            .store(total - self.sched.num_free_blocks(), Ordering::Relaxed);
     }
 
     /// One forward pass over everything scheduled, then one sampled token for each sequence
@@ -542,24 +640,43 @@ impl Engine {
         let logits = self.model.forward_batch(&tokens, &mut batch)?;
         drop((tokens, paged, batch));
 
-        // Rows that produce a token this step (not mid-prefill), and whether each can take the
-        // GPU argmax: greedy without repetition penalty needs nothing else from the logits.
         // Rows that produce a token this step (not mid-prefill). Greedy and temperature-only
         // rows are picked on the device in one kernel; only rows with top-k, top-p or a
-        // repetition penalty bring their logits back to the host.
+        // repetition penalty bring their logits back to the host. A sequence that just finished
+        // its prompt forks here, and each child samples from a copy of the parent's row.
         let mut sampled = Vec::new();
         let mut device_rows = vec![RowSampling::Greedy; step.seqs.len()];
+        let mut source_rows: Vec<u32> = (0..step.seqs.len() as u32).collect();
         for (row, q) in step.seqs.iter().enumerate() {
             self.sched.advance(q.id, q.end);
-            if self.sched.is_caught_up(q.id) {
-                let seq = &self.seqs[&q.id];
+            if !self.sched.is_caught_up(q.id) {
+                continue;
+            }
+            let children = match self.sched.pending_forks(q.id) {
+                0 => Vec::new(),
+                _ => self.fork_children(q.id),
+            };
+            for (i, id) in std::iter::once(q.id).chain(children).enumerate() {
+                let sample_row = match i {
+                    0 => row,
+                    _ => {
+                        source_rows.push(row as u32);
+                        device_rows.push(RowSampling::Greedy);
+                        source_rows.len() - 1
+                    }
+                };
+                let seq = &self.seqs[&id];
                 let mode = seq.sampler.device_mode(seq.tokens.len());
                 if let Some(m) = mode {
-                    device_rows[row] = m;
+                    device_rows[sample_row] = m;
                 }
-                sampled.push((row, q.id, mode.is_some()));
+                sampled.push((sample_row, id, mode.is_some()));
             }
         }
+        let logits = match source_rows.len() > step.seqs.len() {
+            true => logits.index_select(&Tensor::new(source_rows, logits.device())?, 0)?,
+            false => logits,
+        };
         // Reading results back waits for the GPU, so `forward_us` covers the whole pass.
         let device_tokens = match sampled.iter().any(|s| s.2) {
             true => sample_rows(&logits, &device_rows)?,

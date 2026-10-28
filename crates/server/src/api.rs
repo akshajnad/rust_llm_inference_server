@@ -78,6 +78,8 @@ pub struct StreamOptions {
 /// OpenAI default for `/v1/completions`; chat defaults to the rest of the context window.
 pub const COMPLETIONS_DEFAULT_MAX_TOKENS: usize = 16;
 const MAX_STOP_SEQUENCES: usize = 4;
+/// Completions per request (`n`); they share one prefill.
+pub const MAX_N: usize = 16;
 
 impl SamplingFields {
     pub fn include_usage(&self) -> bool {
@@ -86,18 +88,37 @@ impl SamplingFields {
             .is_some_and(|o| o.include_usage)
     }
 
-    /// Checks ranges and builds engine params. `max_tokens` here is the already-resolved value
+    /// Checks ranges and builds engine params, one per completion (`n`); with a `seed`,
+    /// completion `i` uses `seed + i`. `max_tokens` here is the already-resolved value
     /// (request field or endpoint default); the context-length check happens after tokenizing.
     pub fn to_params(
         &self,
         max_tokens: Option<i64>,
         default_max: usize,
+    ) -> Result<Vec<SamplingParams>, ApiError> {
+        let n = match self.n.unwrap_or(1) {
+            n if (1..=MAX_N as i64).contains(&n) => n as u64,
+            _ => {
+                return Err(ApiError::invalid(
+                    format!("n must be between 1 and {MAX_N}"),
+                    "n",
+                ));
+            }
+        };
+        let params = self.to_one_params(max_tokens, default_max)?;
+        Ok((0..n)
+            .map(|i| SamplingParams {
+                seed: params.seed.map(|s| s.wrapping_add(i)),
+                ..params.clone()
+            })
+            .collect())
+    }
+
+    fn to_one_params(
+        &self,
+        max_tokens: Option<i64>,
+        default_max: usize,
     ) -> Result<SamplingParams, ApiError> {
-        if let Some(n) = self.n
-            && n != 1
-        {
-            return Err(ApiError::invalid("only n=1 is supported", "n"));
-        }
         let temperature = self.temperature.unwrap_or(1.0);
         if !(0.0..=2.0).contains(&temperature) {
             return Err(ApiError::invalid(

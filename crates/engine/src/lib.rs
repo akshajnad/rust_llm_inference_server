@@ -15,7 +15,7 @@ pub mod tokenizer;
 
 pub use chat::{ChatMessage, ChatTemplate};
 pub use engine::{
-    EngineConfig, EngineHandle, Event, Finish, FinishReason, Request, SubmitError, gib, spawn,
+    EngineConfig, EngineHandle, Event, Finish, FinishReason, Fork, Request, SubmitError, gib, spawn,
 };
 pub use model::AttentionImpl;
 pub use sampler::{Sampler, SamplingParams};

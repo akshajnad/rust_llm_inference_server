@@ -47,7 +47,10 @@ impl PagedKvCache {
             cfg.num_key_value_heads,
             cfg.head_dim(),
         );
-        let alloc = || Tensor::zeros(shape, dtype, dev);
+        // Zeroed on the CPU and uploaded: candle's Metal allocator rounds a fresh buffer up to
+        // the next power of two and zero-fills all of it, so a 2.25 GiB pool built with
+        // `Tensor::zeros` on the device took 4 GiB. Uploads are allocated at their exact size.
+        let alloc = || Tensor::zeros(shape, dtype, &Device::Cpu)?.to_device(dev);
         let layers = cfg.num_hidden_layers;
         Ok(Self {
             k: (0..layers).map(|_| alloc()).collect::<Result<_>>()?,

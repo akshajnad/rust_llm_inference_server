@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 460" font-family="system-ui, -apple-system, sans-serif" font-size="12">
+<rect width="760" height="460" fill="white"/>
+<text x="78" y="26" font-size="16" font-weight="600" fill="#0f172a">Cost of N completions vs 1, 8k-token prompt, 512 tokens each (M4 Pro)</text>
+<line x1="78" x2="736" y1="402.0" y2="402.0" stroke="#e2e8f0"/><text x="70" y="406.0" text-anchor="end" fill="#475569">0</text>
+<line x1="78" x2="736" y1="331.2" y2="331.2" stroke="#e2e8f0"/><text x="70" y="335.2" text-anchor="end" fill="#475569">2</text>
+<line x1="78" x2="736" y1="260.4" y2="260.4" stroke="#e2e8f0"/><text x="70" y="264.4" text-anchor="end" fill="#475569">4</text>
+<line x1="78" x2="736" y1="189.6" y2="189.6" stroke="#e2e8f0"/><text x="70" y="193.6" text-anchor="end" fill="#475569">6</text>
+<line x1="78" x2="736" y1="118.8" y2="118.8" stroke="#e2e8f0"/><text x="70" y="122.8" text-anchor="end" fill="#475569">8</text>
+<line x1="78" x2="736" y1="48.0" y2="48.0" stroke="#e2e8f0"/><text x="70" y="52.0" text-anchor="end" fill="#475569">10</text>
+<line x1="78.0" x2="78.0" y1="48" y2="402" stroke="#f1f5f9"/><text x="78.0" y="420" text-anchor="middle" fill="#475569">1</text>
+<line x1="297.3" x2="297.3" y1="48" y2="402" stroke="#f1f5f9"/><text x="297.3" y="420" text-anchor="middle" fill="#475569">2</text>
+<line x1="516.7" x2="516.7" y1="48" y2="402" stroke="#f1f5f9"/><text x="516.7" y="420" text-anchor="middle" fill="#475569">4</text>
+<line x1="736.0" x2="736.0" y1="48" y2="402" stroke="#f1f5f9"/><text x="736.0" y="420" text-anchor="middle" fill="#475569">8</text>
+<line x1="78" x2="736" y1="402" y2="402" stroke="#94a3b8"/>
+<text x="407" y="446" text-anchor="middle" fill="#334155">completions of one prompt (N)</text>
+<text transform="translate(18,225) rotate(-90)" text-anchor="middle" fill="#334155">cost ratio: wall time(N) / wall time(1)</text>
+<polyline fill="none" stroke="#2563eb" stroke-width="2.2" points="78.0,366.6 297.3,357.8 516.7,339.2 736.0,279.3"/>
+<circle cx="78.0" cy="366.6" r="3.6" fill="#2563eb"/>
+<circle cx="297.3" cy="357.8" r="3.6" fill="#2563eb"/>
+<circle cx="516.7" cy="339.2" r="3.6" fill="#2563eb"/>
+<circle cx="736.0" cy="279.3" r="3.6" fill="#2563eb"/>
+<rect x="92" y="56" width="14" height="3" fill="#2563eb"/><text x="112" y="60" fill="#0f172a">rlis: N requests, no sharing (a)</text>
+<polyline fill="none" stroke="#ea580c" stroke-width="2.2" points="78.0,366.6 297.3,366.5 516.7,360.1 736.0,337.3"/>
+<circle cx="78.0" cy="366.6" r="3.6" fill="#ea580c"/>
+<circle cx="297.3" cy="366.5" r="3.6" fill="#ea580c"/>
+<circle cx="516.7" cy="360.1" r="3.6" fill="#ea580c"/>
+<circle cx="736.0" cy="337.3" r="3.6" fill="#ea580c"/>
+<rect x="92" y="74" width="14" height="3" fill="#ea580c"/><text x="112" y="78" fill="#0f172a">rlis: n=N, forked from one prefill (b)</text>
+<polyline fill="none" stroke="#16a34a" stroke-width="2.2" points="78.0,366.6 297.3,364.8 516.7,359.5 736.0,334.5"/>
+<circle cx="78.0" cy="366.6" r="3.6" fill="#16a34a"/>
+<circle cx="297.3" cy="364.8" r="3.6" fill="#16a34a"/>
+<circle cx="516.7" cy="359.5" r="3.6" fill="#16a34a"/>
+<circle cx="736.0" cy="334.5" r="3.6" fill="#16a34a"/>
+<rect x="92" y="92" width="14" height="3" fill="#16a34a"/><text x="112" y="96" fill="#0f172a">rlis: N requests, prefix caching (a')</text>
+<polyline fill="none" stroke="#9333ea" stroke-width="2.2" points="78.0,366.6 297.3,342.5 516.7,302.4 736.0,221.2"/>
+<circle cx="78.0" cy="366.6" r="3.6" fill="#9333ea"/>
+<circle cx="297.3" cy="342.5" r="3.6" fill="#9333ea"/>
+<circle cx="516.7" cy="302.4" r="3.6" fill="#9333ea"/>
+<circle cx="736.0" cy="221.2" r="3.6" fill="#9333ea"/>
+<rect x="92" y="110" width="14" height="3" fill="#9333ea"/><text x="112" y="114" fill="#0f172a">llama.cpp: N requests, prompt cache (c)</text>
+<polyline fill="none" stroke="#0891b2" stroke-width="2.2" points="78.0,366.6 297.3,362.0 516.7,358.6 736.0,350.1"/>
+<circle cx="78.0" cy="366.6" r="3.6" fill="#0891b2"/>
+<circle cx="297.3" cy="362.0" r="3.6" fill="#0891b2"/>
+<circle cx="516.7" cy="358.6" r="3.6" fill="#0891b2"/>
+<circle cx="736.0" cy="350.1" r="3.6" fill="#0891b2"/>
+<rect x="92" y="128" width="14" height="3" fill="#0891b2"/><text x="112" y="132" fill="#0f172a">llama.cpp: n=N (c')</text>
+<polyline fill="none" stroke="#64748b" stroke-width="2.2" points="78.0,366.6 297.3,331.2 516.7,260.4 736.0,118.8"/>
+<circle cx="78.0" cy="366.6" r="3.6" fill="#64748b"/>
+<circle cx="297.3" cy="331.2" r="3.6" fill="#64748b"/>
+<circle cx="516.7" cy="260.4" r="3.6" fill="#64748b"/>
+<circle cx="736.0" cy="118.8" r="3.6" fill="#64748b"/>
+<rect x="92" y="146" width="14" height="3" fill="#64748b"/><text x="112" y="150" fill="#0f172a">N separate runs (N×)</text>
+</svg>

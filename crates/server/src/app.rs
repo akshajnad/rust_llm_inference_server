@@ -50,6 +50,9 @@ async fn health(State(st): State<AppState>) -> Response {
         "queued": st.engine.queue_depth(),
         "preemptions": st.engine.stats().preemptions.load(Ordering::Relaxed),
         "kv_cache_utilization": st.engine.kv_utilization(),
+        "kv_blocks_used": st.engine.stats().kv_blocks_used.load(Ordering::Relaxed),
+        "kv_blocks_total": st.engine.stats().kv_blocks_total.load(Ordering::Relaxed),
+        "kv_block_size": st.engine.stats().kv_block_size.load(Ordering::Relaxed),
         "prefix_cache_hit_tokens": st.engine.stats().cached_tokens.load(Ordering::Relaxed),
         "admitted_tokens": st.engine.stats().admitted_tokens.load(Ordering::Relaxed),
     });
@@ -154,11 +157,12 @@ async fn tokenize(st: &AppState, text: String, add_bos: bool) -> Result<Vec<u32>
     .map_err(|e| ApiError::internal(e.to_string()))
 }
 
+/// `params` holds one entry per completion (`n`); they differ only in seed.
 async fn run(
     st: AppState,
     kind: Kind,
     prompt: Vec<u32>,
-    params: SamplingParams,
+    params: Vec<SamplingParams>,
     stream: bool,
     include_usage: bool,
 ) -> Result<Response, ApiError> {
@@ -177,19 +181,21 @@ async fn run(
             param,
         ));
     }
-    let requested = prompt.len() + params.max_tokens;
+    let max_tokens = params[0].max_tokens;
+    let requested = prompt.len() + max_tokens;
     if requested > limit {
         return Err(ApiError::invalid(
             format!(
                 "this model's maximum context length is {limit} tokens, but {requested} were requested \
                  ({} in the prompt, {} for the completion)",
                 prompt.len(),
-                params.max_tokens
+                max_tokens
             ),
             "max_tokens",
         ));
     }
-    let (req, rx) = Request::new(prompt, params);
+    let prompt_tokens = prompt.len();
+    let (req, rxs) = Request::with_forks(prompt, params);
     st.engine.submit(req).map_err(|e| match e {
         SubmitError::QueueFull => ApiError::overloaded(),
         SubmitError::Stopped => ApiError::internal("engine has stopped"),
@@ -211,11 +217,13 @@ async fn run(
         kind,
     };
     if stream {
-        Ok(Sse::new(sse_stream(meta, rx, include_usage))
-            .keep_alive(KeepAlive::default())
-            .into_response())
+        Ok(
+            Sse::new(sse_stream(meta, rxs, prompt_tokens, include_usage))
+                .keep_alive(KeepAlive::default())
+                .into_response(),
+        )
     } else {
-        collect(meta, rx).await.map(|v| Json(v).into_response())
+        collect(meta, rxs).await.map(|v| Json(v).into_response())
     }
 }
 
@@ -239,91 +247,121 @@ impl Meta {
         json!({"id": self.id, "object": self.object(chunk), "created": self.created, "model": self.model, "choices": choices})
     }
 
-    /// One streamed choice carrying `text` (and `finish_reason` on the last chunk).
-    fn chunk(&self, text: Option<&str>, finish: Option<&str>) -> Value {
+    /// One streamed chunk of choice `index` carrying `text` (and `finish_reason` on its last).
+    fn chunk(&self, index: usize, text: Option<&str>, finish: Option<&str>) -> Value {
         let choice = match self.kind {
             Kind::Completion => {
-                json!({"index": 0, "text": text.unwrap_or(""), "logprobs": null, "finish_reason": finish})
+                json!({"index": index, "text": text.unwrap_or(""), "logprobs": null, "finish_reason": finish})
             }
             Kind::Chat => {
                 let delta = text.map_or(json!({}), |t| json!({"content": t}));
-                json!({"index": 0, "delta": delta, "logprobs": null, "finish_reason": finish})
+                json!({"index": index, "delta": delta, "logprobs": null, "finish_reason": finish})
             }
         };
         self.envelope(true, json!([choice]))
     }
 }
 
-async fn collect(meta: Meta, mut rx: UnboundedReceiver<Event>) -> Result<Value, ApiError> {
-    let mut text = String::new();
-    loop {
-        match rx.recv().await {
-            Some(Event::Text(t)) => text.push_str(&t),
-            Some(Event::Finished(f)) => return Ok(full_response(&meta, &text, &f)),
-            Some(Event::Error(e)) => return Err(ApiError::internal(e)),
-            None => return Err(ApiError::internal("engine dropped the request")),
-        }
+async fn collect(meta: Meta, rxs: Vec<UnboundedReceiver<Event>>) -> Result<Value, ApiError> {
+    let mut choices = Vec::new();
+    let mut usage = Usage::new(0, 0);
+    for (index, mut rx) in rxs.into_iter().enumerate() {
+        let mut text = String::new();
+        let f = loop {
+            match rx.recv().await {
+                Some(Event::Text(t)) => text.push_str(&t),
+                Some(Event::Finished(f)) => break f,
+                Some(Event::Error(e)) => return Err(ApiError::internal(e)),
+                None => return Err(ApiError::internal("engine dropped the request")),
+            }
+        };
+        choices.push(full_choice(&meta, index, &text, &f));
+        usage = Usage::new(
+            f.prompt_tokens,
+            usage.completion_tokens + f.completion_tokens,
+        );
     }
+    let mut v = meta.envelope(false, json!(choices));
+    v["usage"] = json!(usage);
+    Ok(v)
 }
 
-fn full_response(meta: &Meta, text: &str, f: &Finish) -> Value {
+fn full_choice(meta: &Meta, index: usize, text: &str, f: &Finish) -> Value {
     let reason = f.reason.as_openai();
-    let choice = match meta.kind {
+    match meta.kind {
         Kind::Completion => {
-            json!({"index": 0, "text": text, "logprobs": null, "finish_reason": reason})
+            json!({"index": index, "text": text, "logprobs": null, "finish_reason": reason})
         }
         Kind::Chat => json!({
-            "index": 0,
+            "index": index,
             "message": {"role": "assistant", "content": text},
             "logprobs": null,
             "finish_reason": reason,
         }),
-    };
-    let mut v = meta.envelope(false, json!([choice]));
-    v["usage"] = json!(Usage::new(f.prompt_tokens, f.completion_tokens));
-    v
+    }
 }
 
-/// Turns engine events into SSE `data:` lines: an initial role delta for chat, one chunk per
-/// text event, a final chunk with `finish_reason`, optional usage, then `[DONE]`.
+/// Turns engine events into SSE `data:` lines: an initial role delta per choice for chat, one
+/// chunk per text event, a final chunk per choice with `finish_reason`, then (once every
+/// choice is done) optional usage and `[DONE]`. Choices interleave as their tokens arrive.
 fn sse_stream(
     meta: Meta,
-    rx: UnboundedReceiver<Event>,
+    rxs: Vec<UnboundedReceiver<Event>>,
+    prompt_tokens: usize,
     include_usage: bool,
 ) -> impl Stream<Item = Result<SseEvent, Infallible>> {
     let data = |v: &Value| SseEvent::default().data(v.to_string());
-    let opening = match meta.kind {
-        Kind::Chat => {
-            let role = json!([{"index": 0, "delta": {"role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null}]);
-            vec![data(&meta.envelope(true, role))]
-        }
+    let opening: Vec<SseEvent> = match meta.kind {
+        Kind::Chat => (0..rxs.len())
+            .map(|i| {
+                let role = json!([{"index": i, "delta": {"role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null}]);
+                data(&meta.envelope(true, role))
+            })
+            .collect(),
         Kind::Completion => Vec::new(),
     };
-    let body = stream::unfold(Some((meta, rx)), move |state| async move {
-        let (meta, mut rx) = state?;
-        let events: Vec<SseEvent> = match rx.recv().await {
-            Some(Event::Text(t)) => {
-                let ev = data(&meta.chunk(Some(&t), None));
-                return Some((vec![ev], Some((meta, rx))));
-            }
-            Some(Event::Finished(f)) => {
-                let mut out = vec![data(&meta.chunk(None, Some(f.reason.as_openai())))];
-                if include_usage {
-                    let mut u = meta.envelope(true, json!([]));
-                    u["usage"] = json!(Usage::new(f.prompt_tokens, f.completion_tokens));
-                    out.push(data(&u));
+    let remaining = rxs.len();
+    let events = stream::select_all(rxs.into_iter().enumerate().map(|(i, rx)| {
+        stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|e| (e, rx)) })
+            .map(move |e| (i, e))
+            .boxed()
+    }));
+    let body = stream::unfold(
+        Some((meta, events, remaining, 0usize)),
+        move |state| async move {
+            let (meta, mut events, mut remaining, mut completion_tokens) = state?;
+            let mut out = match events.next().await {
+                Some((i, Event::Text(t))) => {
+                    let ev = data(&meta.chunk(i, Some(&t), None));
+                    return Some((vec![ev], Some((meta, events, remaining, completion_tokens))));
                 }
-                out
-            }
-            Some(Event::Error(e)) => vec![data(&ApiError::internal(e).body())],
-            None => vec![data(
-                &ApiError::internal("engine dropped the request").body(),
-            )],
-        };
-        let mut events = events;
-        events.push(SseEvent::default().data("[DONE]"));
-        Some((events, None))
-    });
+                Some((i, Event::Finished(f))) => {
+                    let ev = data(&meta.chunk(i, None, Some(f.reason.as_openai())));
+                    remaining -= 1;
+                    completion_tokens += f.completion_tokens;
+                    if remaining > 0 {
+                        return Some((
+                            vec![ev],
+                            Some((meta, events, remaining, completion_tokens)),
+                        ));
+                    }
+                    let mut out = vec![ev];
+                    if include_usage {
+                        let mut u = meta.envelope(true, json!([]));
+                        u["usage"] = json!(Usage::new(prompt_tokens, completion_tokens));
+                        out.push(data(&u));
+                    }
+                    out
+                }
+                Some((_, Event::Error(e))) => vec![data(&ApiError::internal(e).body())],
+                None => vec![data(
+                    &ApiError::internal("engine dropped the request").body(),
+                )],
+            };
+            out.push(SseEvent::default().data("[DONE]"));
+            Some((out, None))
+        },
+    );
     stream::iter(opening)
         .chain(body.flat_map(stream::iter))
         .map(Ok)
