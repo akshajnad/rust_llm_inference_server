@@ -29,8 +29,13 @@ pub enum RowSampling {
     Temperature { temperature: f32, key: u32 },
 }
 
-/// Picks one token per row of `logits (rows, vocab)` f32.
+/// Picks one token per row of `logits (rows, vocab)` f32. The kernel is Metal-only; on CUDA the
+/// logits come back to the host and the CPU reference picks the same tokens.
 pub fn sample_rows(logits: &Tensor, rows: &[RowSampling]) -> Result<Vec<u32>> {
+    let logits = match logits.device() {
+        candle_core::Device::Cuda(_) => &logits.to_device(&candle_core::Device::Cpu)?,
+        _ => logits,
+    };
     let params: Vec<u32> = rows
         .iter()
         .flat_map(|r| match *r {
