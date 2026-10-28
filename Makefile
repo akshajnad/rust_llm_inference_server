@@ -15,6 +15,9 @@ DEFAULT_GGUF := Llama-3.2-1B-Instruct-Q8_0.gguf
 LLAMA_CPP_TAG := b11936
 LLAMA_CPP_DIR := third_party/llama.cpp
 LLAMA_CPP_CMAKE_FLAGS ?= -DGGML_METAL=ON
+# Parallel compile jobs; empty means unlimited (fine for Metal, but CUDA's template-heavy
+# kernels run a 31 GB machine out of memory that way).
+LLAMA_CPP_JOBS ?=
 WIKITEXT_URL := $(HF)/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
 
 .PHONY: serve models models-all wikitext llama-cpp bench-mac bench-cuda bench-ablations bench-charts soak build test test-metal parity-ref chat-ref parity lint fuzz teardown
@@ -62,7 +65,7 @@ llama-cpp:
 	VIRTUAL_ENV=.venv uv pip install cmake
 	.venv/bin/cmake -S $(LLAMA_CPP_DIR) -B $(LLAMA_CPP_DIR)/build -DCMAKE_BUILD_TYPE=Release \
 		$(LLAMA_CPP_CMAKE_FLAGS) -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
-	.venv/bin/cmake --build $(LLAMA_CPP_DIR)/build --target llama-server -j
+	.venv/bin/cmake --build $(LLAMA_CPP_DIR)/build --target llama-server -j $(LLAMA_CPP_JOBS)
 	rm -rf .venv .uv-cache
 	@ls -l $(LLAMA_CPP_DIR)/build/bin/llama-server
 
