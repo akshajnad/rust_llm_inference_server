@@ -101,11 +101,19 @@ build_llama_cpp() (
 step rust install_rust
 step models make models-all
 step build-rlis build_rlis
+# llama.cpp compiles on the CPUs while parity runs on the GPU (free GPU time is rationed); only
+# the sweep needs both, and nothing is recorded unless parity passes.
+build_llama_cpp >"$OUT/llama-cpp-build.log" 2>&1 &
+LLAMA_CPP_BUILD=$!
 if ! step parity parity; then
   session failed
   echo "parity failed: recording nothing" >&2
   exit 1
 fi
-step build-llama-cpp build_llama_cpp
+step build-llama-cpp wait "$LLAMA_CPP_BUILD" || {
+  tail -40 "$OUT/llama-cpp-build.log"
+  session passed-but-llama-cpp-build-failed
+  exit 1
+}
 step sweep scripts/bench/sweep.sh
 session passed
