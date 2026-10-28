@@ -55,8 +55,20 @@ install_rust() {
     curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none; } &&
     rustup toolchain install # the version pinned in rust-toolchain.toml
 }
+# candle-kernels 0.11.0 defines __hmax_nan/__hmin_nan for GPUs below sm_80, but CUDA 12.8's
+# headers already define them for every architecture, so nvcc rejects the redefinition. Skip
+# candle's copies on those toolkits (same NaN-propagating semantics). Edits this session's
+# registry copy only, so Cargo.lock and the checkout stay untouched.
+patch_candle() {
+  local h
+  cargo fetch &&
+    h=$(echo "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/candle-kernels-0.11.0/src/compatibility.cuh) &&
+    sed -i 's/^#if __CUDA_ARCH__ < 800$/#if __CUDA_ARCH__ < 800 \&\& (__CUDACC_VER_MAJOR__ < 12 || (__CUDACC_VER_MAJOR__ == 12 \&\& __CUDACC_VER_MINOR__ < 8))/' "$h" &&
+    grep -q '__CUDACC_VER_MINOR__ < 8' "$h"
+}
 build_rlis() {
-  cargo build --release --features cuda -p server && cargo build --release -p bench
+  patch_candle &&
+    cargo build --release --features cuda -p server && cargo build --release -p bench
 }
 parity() {
   make parity FEATURES=cuda 2>&1 | tee "$OUT/parity.log"
