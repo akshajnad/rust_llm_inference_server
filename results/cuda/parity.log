@@ -1,0 +1,173 @@
+PARITY_DTYPE=f32 cargo test --release -p model --features cuda --test parity -- --ignored --nocapture --test-threads=1
+   Compiling syn v3.0.9
+   Compiling zerocopy-derive v0.8.63
+   Compiling serde_json v1.0.154
+   Compiling regex-automata v0.4.18
+   Compiling zerocopy v0.8.63
+   Compiling synstructure v0.14.0
+   Compiling hashbrown v0.16.1
+   Compiling bytemuck_derive v1.12.1
+   Compiling serde_derive v1.0.229
+   Compiling bytemuck v1.25.2
+   Compiling num-complex v0.4.6
+   Compiling pulp v0.22.3
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling rand v0.9.5
+   Compiling dyn-stack v0.13.2
+   Compiling thiserror-impl v2.0.21
+   Compiling rand_distr v0.5.1
+   Compiling half v2.7.1
+   Compiling serde v1.0.229
+   Compiling gemm-common v0.19.0
+   Compiling thiserror v2.0.21
+   Compiling zerofrom-derive v0.1.8
+   Compiling cudaforge v0.1.6
+   Compiling gemm-f32 v0.19.0
+   Compiling zerofrom v0.1.8
+   Compiling gemm-f16 v0.19.0
+   Compiling candle-kernels v0.11.0
+   Compiling gemm-c64 v0.19.0
+   Compiling gemm-f64 v0.19.0
+   Compiling gemm-c32 v0.19.0
+   Compiling dary_heap v0.3.9
+   Compiling spm_precompiled v0.1.4
+   Compiling compact_str v0.9.1
+   Compiling ahash v0.8.12
+   Compiling float8 v0.7.0
+   Compiling yoke-derive v0.8.4
+   Compiling regex v1.13.1
+   Compiling tokenizers v0.22.2
+   Compiling cudarc v0.19.10
+   Compiling yoke v0.8.4
+   Compiling gemm v0.19.0
+   Compiling safetensors v0.8.0
+   Compiling candle-core v0.11.0
+   Compiling candle-nn v0.11.0
+   Compiling model v0.1.0 (/tmp/rlis/crates/model)
+    Finished `release` profile [optimized + debuginfo] target(s) in 16m 07s
+     Running tests/parity.rs (target/release/deps/parity-c1717687027a2baa)
+
+running 5 tests
+test gguf_tracks_reference ... Llama-3.2-1B-Instruct-Q8_0.gguf: top-1 agreement 99.06% over 2560 steps, top logit error mean 0.073 max 0.586
+Llama-3.2-1B-Instruct-Q4_K_M.gguf: top-1 agreement 94.41% over 2560 steps, top logit error mean 0.460 max 4.479
+ok
+test greedy_tokens_match_reference ... parity: device=cuda dtype=F32
+greedy: 20/20 prompts match for 128 tokens, 0 near-tie flips
+ok
+test paged_batch_of_32_matches_reference ... parity: device=cuda dtype=F32
+paged batch of 32 (Gather): 32/32 exact for 128 tokens, 0 near-tie flips
+ok
+test teacher_forced_logits_match_reference ... parity: device=cuda dtype=F32
+prompt  0: max |logit diff| 3.81e-5
+prompt  1: max |logit diff| 4.39e-5
+prompt  2: max |logit diff| 4.39e-5
+prompt  3: max |logit diff| 3.62e-5
+prompt  4: max |logit diff| 3.86e-5
+prompt  5: max |logit diff| 5.72e-5
+prompt  6: max |logit diff| 3.34e-5
+prompt  7: max |logit diff| 2.48e-5
+prompt  8: max |logit diff| 3.53e-5
+prompt  9: max |logit diff| 3.62e-5
+prompt 10: max |logit diff| 4.39e-5
+prompt 11: max |logit diff| 3.43e-5
+prompt 12: max |logit diff| 5.34e-5
+prompt 13: max |logit diff| 2.86e-5
+prompt 14: max |logit diff| 3.91e-5
+prompt 15: max |logit diff| 4.48e-5
+prompt 16: max |logit diff| 4.20e-5
+prompt 17: max |logit diff| 2.91e-5
+prompt 18: max |logit diff| 4.58e-5
+prompt 19: max |logit diff| 2.86e-5
+teacher-forced: worst max |logit diff| 5.72e-5 (tolerance 5.0e-4)
+ok
+test tokenizer_matches_reference ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 261.67s
+
+PARITY_DTYPE=f16 cargo test --release -p model --features cuda --test parity -- --ignored --nocapture --test-threads=1 --skip gguf_tracks_reference
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.42s
+     Running tests/parity.rs (target/release/deps/parity-c1717687027a2baa)
+
+running 4 tests
+test greedy_tokens_match_reference ... parity: device=cuda dtype=F16
+greedy: 19/20 prompts match for 128 tokens, 1 near-tie flips
+  near-tie prompt 15 step 64: got 7731 want 31710 (reference top-2 margin 0.0055)
+ok
+test paged_batch_of_32_matches_reference ... parity: device=cuda dtype=F16
+paged batch of 32 (Gather): 31/32 exact for 128 tokens, 1 near-tie flips
+  near-tie seq 19 step 113: got 279 want 4332 (margin 0.0096)
+ok
+test teacher_forced_logits_match_reference ... parity: device=cuda dtype=F16
+prompt  0: max |logit diff| 2.77e-2
+prompt  1: max |logit diff| 2.30e-2
+prompt  2: max |logit diff| 4.49e-2
+prompt  3: max |logit diff| 2.98e-2
+prompt  4: max |logit diff| 5.75e-2
+prompt  5: max |logit diff| 2.12e-2
+prompt  6: max |logit diff| 3.17e-2
+prompt  7: max |logit diff| 2.06e-2
+prompt  8: max |logit diff| 2.80e-2
+prompt  9: max |logit diff| 3.07e-2
+prompt 10: max |logit diff| 7.73e-2
+prompt 11: max |logit diff| 2.58e-2
+prompt 12: max |logit diff| 4.73e-2
+prompt 13: max |logit diff| 3.78e-2
+prompt 14: max |logit diff| 3.03e-2
+prompt 15: max |logit diff| 3.90e-2
+prompt 16: max |logit diff| 2.82e-2
+prompt 17: max |logit diff| 2.29e-2
+prompt 18: max |logit diff| 2.64e-2
+prompt 19: max |logit diff| 2.25e-2
+teacher-forced: worst max |logit diff| 7.73e-2 (tolerance 1.5e-1)
+ok
+test tokenizer_matches_reference ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 133.45s
+
+cargo test --release -p engine --test chat_template -- --ignored
+   Compiling half v2.7.1
+   Compiling getrandom v0.4.3
+   Compiling monostate v0.1.18
+   Compiling ahash v0.8.12
+   Compiling tokenizers v0.22.2
+   Compiling tracing-core v0.1.36
+   Compiling tempfile v3.27.0
+   Compiling gemm-common v0.19.0
+   Compiling gemm-f32 v0.19.0
+   Compiling gemm-f64 v0.19.0
+   Compiling gemm-f16 v0.19.0
+   Compiling gemm-c32 v0.19.0
+   Compiling gemm-c64 v0.19.0
+   Compiling safetensors v0.8.0
+   Compiling gemm v0.19.0
+   Compiling float8 v0.7.0
+   Compiling candle-core v0.11.0
+   Compiling wait-timeout v0.2.1
+   Compiling quick-error v1.2.3
+   Compiling fnv v1.0.7
+   Compiling bit-vec v0.10.1
+   Compiling cpufeatures v0.3.1
+   Compiling chacha20 v0.10.2
+   Compiling bit-set v0.11.1
+   Compiling rusty-fork v0.3.1
+   Compiling tracing v0.1.44
+   Compiling rand v0.10.3
+   Compiling tokio v1.54.1
+   Compiling kvcache v0.1.0 (/tmp/rlis/crates/kvcache)
+   Compiling minijinja v3.0.4
+   Compiling rand_xorshift v0.5.0
+   Compiling core_detect v1.0.0
+   Compiling unarray v0.1.4
+   Compiling proptest v1.12.0
+   Compiling candle-nn v0.11.0
+   Compiling model v0.1.0 (/tmp/rlis/crates/model)
+   Compiling engine v0.1.0 (/tmp/rlis/crates/engine)
+    Finished `release` profile [optimized + debuginfo] target(s) in 3m 08s
+     Running tests/chat_template.rs (target/release/deps/chat_template-a357d0fb9a99773c)
+
+running 1 test
+test llama32_template_matches_transformers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.57s
+

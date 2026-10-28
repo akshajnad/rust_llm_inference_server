@@ -235,3 +235,52 @@ during the pass, so it is GPU-bound, not limited by CPU encoding. In-model, cand
 matmul runs ~1.6× slower than the same matmul in a hot-cache microbenchmark, which points at
 weight re-reads at prefill sizes. That is the main reason llama.cpp prefills faster (2,063 vs
 ~1,700 tok/s on a 1,026-token prompt) and leads at 4–16 concurrent requests.
+
+## CUDA run
+
+The spec's last milestone: the same commit on a free cloud NVIDIA GPU, parity first, then the
+benchmark. `make bench-cuda` pushes `scripts/cuda/kaggle.py` (pinned to `HEAD`) to Kaggle,
+which clones the repo and runs `scripts/cuda/run.sh`: Rust toolchain, models, `--features
+cuda` build, `make parity`, llama.cpp with CUDA, then `scripts/bench/sweep.sh`, the same sweep
+as on the Mac. Parity gates the sweep, so a failed comparison records nothing. Both servers are
+pinned to one of the session's two T4s, since llama.cpp would otherwise split across both.
+
+**What runs differently.** Every Metal kernel has a portable fallback, and the CUDA build uses
+them: attention v1 (gather each sequence's blocks, then standard attention) for decode, plain
+matmul attention for prefill, candle's quantized matmuls without the small-batch GEMV, and the
+CPU reference sampler on logits copied back to the host (~1–2 ms per step at 32 rows). On the
+Mac the gather path alone cost 2.9× the throughput at 32 requests (see Ablations), so the
+paged-attention kernel is the likely bulk of the gap below. The T4 run wasn't profiled, though,
+so that split is an inference, not a measurement.
+
+**Result.** Parity passed on the T4: f32 logits within 5e-4 and greedy output token-for-token
+for 20 prompts × 128 tokens, alone and as a paged batch of 32; f16 within its near-tie rule.
+Single-stream decode is 118 vs llama.cpp's 132 tok/s (89%, against a 60% target), a bit above
+the Mac's 83%. Beyond one stream the picture inverts from the Mac's: llama.cpp leads at 4–32
+(296 / 439 / 426 vs 239 / 305 / 355 tok/s), because on CUDA it keeps its tuned kernels and rlis
+loses its own. What carries over is the scheduler and the fixed pool: rlis's p99 time to first
+token is lower at 16 and 32 (0.82 vs 1.07 s, 2.0 vs 4.4 s), and its memory stays at 3.5–3.7 GB
+while llama.cpp grows to 5.1 GB. On Linux the bench tool measures RSS plus GPU memory in use,
+since RSS alone doesn't count device allocations.
+
+**Getting a clean run took seven Kaggle sessions**, and the failures are the useful part:
+
+- candle 0.11.0's CUDA kernels didn't compile: its `compatibility.cuh` defines `__hmax_nan` and
+  `__hmin_nan` for GPUs below sm_80, and CUDA 12.8's headers now define them for every
+  architecture. `run.sh` adds a toolkit-version check to that guard in the session's copy of
+  the crate (same NaN-propagating semantics; `Cargo.lock` untouched).
+- Nothing could link `-lcuda`: containers mount the driver's `libcuda.so.1` but not the
+  unversioned name, and Kaggle's toolkit has no stub. `run.sh` points a symlink at the driver's
+  library for both the Rust link and llama.cpp's CMake (`CUDA_cuda_driver_LIBRARY`).
+- llama.cpp's build with unlimited `-j` ran the 4-vCPU, 31 GB session out of memory; the
+  OOM-killed build then stalled for over two hours on the weekly GPU quota. Builds now get one
+  job per CPU and a time limit, and every session a hard stop.
+- **A real bug**: the engine's sampler had no CUDA path (`no cuda implementation for
+  sample-rows`), so every step failed. The parity tests drive the model directly and passed
+  three times without reaching it; the sweep's warmup was the first engine-level test on CUDA.
+  On CUDA, `sample_rows` now copies the logits back and uses the CPU reference, which picks the
+  same tokens. Parity gates the model, not the server, so the warmup is the real end-to-end
+  check, and it runs before anything is recorded.
+
+The spec assumed about 30 GPU-hours a week; this account had 6, which is why the cloud sweep
+stops at 32 concurrent requests and builds llama.cpp on the CPUs while parity runs on the GPU.

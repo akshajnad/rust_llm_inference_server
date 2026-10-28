@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 460" font-family="system-ui, -apple-system, sans-serif" font-size="12">
+<rect width="760" height="460" fill="white"/>
+<text x="78" y="26" font-size="16" font-weight="600" fill="#0f172a">Output throughput vs concurrency (Llama 3.2 1B Q8_0, Tesla T4)</text>
+<line x1="78" x2="736" y1="402.0" y2="402.0" stroke="#e2e8f0"/><text x="70" y="406.0" text-anchor="end" fill="#475569">0</text>
+<line x1="78" x2="736" y1="331.2" y2="331.2" stroke="#e2e8f0"/><text x="70" y="335.2" text-anchor="end" fill="#475569">100</text>
+<line x1="78" x2="736" y1="260.4" y2="260.4" stroke="#e2e8f0"/><text x="70" y="264.4" text-anchor="end" fill="#475569">200</text>
+<line x1="78" x2="736" y1="189.6" y2="189.6" stroke="#e2e8f0"/><text x="70" y="193.6" text-anchor="end" fill="#475569">300</text>
+<line x1="78" x2="736" y1="118.8" y2="118.8" stroke="#e2e8f0"/><text x="70" y="122.8" text-anchor="end" fill="#475569">400</text>
+<line x1="78" x2="736" y1="48.0" y2="48.0" stroke="#e2e8f0"/><text x="70" y="52.0" text-anchor="end" fill="#475569">500</text>
+<line x1="78.0" x2="78.0" y1="48" y2="402" stroke="#f1f5f9"/><text x="78.0" y="420" text-anchor="middle" fill="#475569">1</text>
+<line x1="209.6" x2="209.6" y1="48" y2="402" stroke="#f1f5f9"/><text x="209.6" y="420" text-anchor="middle" fill="#475569">2</text>
+<line x1="341.2" x2="341.2" y1="48" y2="402" stroke="#f1f5f9"/><text x="341.2" y="420" text-anchor="middle" fill="#475569">4</text>
+<line x1="472.8" x2="472.8" y1="48" y2="402" stroke="#f1f5f9"/><text x="472.8" y="420" text-anchor="middle" fill="#475569">8</text>
+<line x1="604.4" x2="604.4" y1="48" y2="402" stroke="#f1f5f9"/><text x="604.4" y="420" text-anchor="middle" fill="#475569">16</text>
+<line x1="736.0" x2="736.0" y1="48" y2="402" stroke="#f1f5f9"/><text x="736.0" y="420" text-anchor="middle" fill="#475569">32</text>
+<line x1="78" x2="736" y1="402" y2="402" stroke="#94a3b8"/>
+<text x="407" y="446" text-anchor="middle" fill="#334155">concurrent requests</text>
+<text transform="translate(18,225) rotate(-90)" text-anchor="middle" fill="#334155">output throughput (tok/s)</text>
+<polyline fill="none" stroke="#2563eb" stroke-width="2.2" points="78.0,318.7 341.2,232.5 604.4,186.0 736.0,150.9"/>
+<circle cx="78.0" cy="318.7" r="3.6" fill="#2563eb"/>
+<circle cx="341.2" cy="232.5" r="3.6" fill="#2563eb"/>
+<circle cx="604.4" cy="186.0" r="3.6" fill="#2563eb"/>
+<circle cx="736.0" cy="150.9" r="3.6" fill="#2563eb"/>
+<rect x="92" y="56" width="14" height="3" fill="#2563eb"/><text x="112" y="60" fill="#0f172a">rlis (Q8_0)</text>
+<polyline fill="none" stroke="#ea580c" stroke-width="2.2" points="78.0,308.5 341.2,192.3 604.4,91.3 736.0,100.2"/>
+<circle cx="78.0" cy="308.5" r="3.6" fill="#ea580c"/>
+<circle cx="341.2" cy="192.3" r="3.6" fill="#ea580c"/>
+<circle cx="604.4" cy="91.3" r="3.6" fill="#ea580c"/>
+<circle cx="736.0" cy="100.2" r="3.6" fill="#ea580c"/>
+<rect x="92" y="74" width="14" height="3" fill="#ea580c"/><text x="112" y="78" fill="#0f172a">llama.cpp (Q8_0)</text>
+</svg>

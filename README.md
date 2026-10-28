@@ -138,9 +138,39 @@ One change at a time against the default configuration (concurrency 4 / 16 / 32)
 | **Q8_0** (default) | 14.0035 ± 0.104 | 99.38% | 145 tok/s |
 | Q4_K_M | 14.4563 ± 0.108 | 94.45% | 196 tok/s |
 
+### CUDA (free Kaggle T4)
+
+The same engine code built with `--features cuda`, run in one free Kaggle session on a Tesla T4
+(driver 580.178, CUDA 12.8, 4 vCPUs) at commit `d763c10`. The reference parity tests passed on
+the T4 first (f32 token-for-token, including the paged batch of 32; f16 within its near-tie
+rule), then the same sweep ran against llama.cpp `b11936` built with CUDA, both on one GPU, with
+the same flags as on the Mac. Concurrency stops at 32: Kaggle's free GPU time is 6 hours a week.
+
+![Throughput vs concurrency on a Tesla T4](docs/cuda-throughput.svg)
+
+| Concurrent requests | rlis tok/s | llama.cpp tok/s | rlis ITL p50 | llama.cpp ITL p50 | rlis p99 TTFT | llama.cpp p99 TTFT | rlis peak memory | llama.cpp peak memory |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 118 | **132** | 8.2 ms | **7.2 ms** | **106 ms** | 266 ms | **3.54 GB** | 3.76 GB |
+| 4 | 239 | **296** | 15.0 ms | **10.7 ms** | 273 ms | **214 ms** | **3.54 GB** | 3.80 GB |
+| 16 | 305 | **439** | 39.4 ms | **20.8 ms** | **0.82 s** | 1.07 s | **3.69 GB** | 4.30 GB |
+| 32 | 355 | **426** | 73.3 ms | **43.7 ms** | **2.0 s** | 4.4 s | **3.70 GB** | 5.06 GB |
+
+Single-stream decode reaches 89% of llama.cpp's (the spec's CUDA target is 60%), but unlike on
+the Mac llama.cpp stays ahead at every concurrency. rlis on CUDA runs without its four Metal
+kernels (paged decode attention, small-batch GEMV, GPU sampling, fused prefill attention) and
+falls back to gather-then-attend, candle's generic matmuls and host-side sampling; on the Mac
+the gather path alone cost 2.9× at 32 requests. A CUDA port of the paged-attention kernel is the
+spec's first stretch goal. Memory on Linux is process RSS plus GPU memory in use: rlis's pool is
+reserved up front (3.5–3.7 GB), llama.cpp's grows to 5.1 GB. Details, and what it took to get
+a clean run: [DESIGN.md](DESIGN.md#cuda-run). Results and provenance:
+[`results/cuda/`](results/cuda/tables.md).
+
+Reproduce: `make bench-cuda` (needs a Kaggle account with phone verification; it pushes the
+session pinned to `HEAD`, waits, and downloads the results).
+
 ### Targets
 
-The spec's starting targets against what was measured on the Mac:
+The spec's starting targets against what was measured on the Mac (and the T4 for the CUDA row):
 
 | Target | Result | |
 |---|---|---|
@@ -150,7 +180,7 @@ The spec's starting targets against what was measured on the Mac:
 | KV utilization under load > 90% with no out-of-memory errors | pool reaches 100%; 18 preemptions, 0 errors (64-request stress test) | met |
 | Peak footprint, default run ≤ 3.5 GB | 3.26 GB in the worst case | met |
 | Memory flat over a 1-hour soak | 10-minute averages within 2,589–2,645 MB (+2.9% early to late) | met |
-| Single-stream decode on CUDA ≥ 60% of llama.cpp | — | pending (cloud run) |
+| Single-stream decode on CUDA ≥ 60% of llama.cpp | 89% (118 vs 132 tok/s, Tesla T4) | met |
 
 The time-to-first-token miss comes from the workload: every benchmark client sends a ~300-token
 prompt the moment its last request finishes, so a new prompt queues behind other prompts'
@@ -190,7 +220,10 @@ How it works and why: [DESIGN.md](DESIGN.md). The hardest bug:
 | llama.cpp build (`./third_party`) | 0.36 GB |
 
 `make teardown` stops project processes and deletes `models/`, `target/`, `third_party/` and
-any virtualenv, leaving only code and results.
+any virtualenv, leaving only code and results. Checked on a fresh clone with the models
+downloaded, a release build and a running server: afterwards no project process was left and
+the folder went from 2.3 GB to 3.7 MB. Outside the folder only the Rust toolchain remains
+(`rustup self uninstall` removes it).
 
 ## Development
 
@@ -200,4 +233,5 @@ make test-metal         # GPU kernel tests
 make models-all parity  # parity against transformers (reference fixtures are committed)
 make lint               # fmt + clippy, with and without Metal
 make soak               # one hour at concurrency 32 with random client hang-ups
+make bench-cuda         # parity + sweep on a free Kaggle T4 (results/cuda/)
 ```

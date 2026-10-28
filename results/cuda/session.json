@@ -1,0 +1,22 @@
+{
+  "gpu": "Tesla T4",
+  "driver": "580.178.04",
+  "gpu_memory": "15360 MiB",
+  "compute_capability": "7.5",
+  "cuda_runtime": "CUDA Version: 13.0",
+  "nvcc": "Build cuda_12.8.r12.8/compiler.35583870_0",
+  "commit": "d763c105730ae5efdef78ac3c2bb9f77e9f91f37",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "llama_cpp": "b11936",
+  "os": "Linux 6.18.55+ x86_64",
+  "cpu": "4 vCPU Intel(R) Xeon(R) CPU @ 2.00GHz",
+  "parity": "passed",
+  "step_seconds": {
+    "rust": 13,
+    "models": 39,
+    "build-rlis": 536,
+    "parity": 1557,
+    "build-llama-cpp": 598,
+    "sweep": 241
+  }
+}

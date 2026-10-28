@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 460" font-family="system-ui, -apple-system, sans-serif" font-size="12">
+<rect width="760" height="460" fill="white"/>
+<text x="78" y="26" font-size="16" font-weight="600" fill="#0f172a">p99 time per output token vs throughput (Tesla T4)</text>
+<line x1="78" x2="736" y1="402.0" y2="402.0" stroke="#e2e8f0"/><text x="70" y="406.0" text-anchor="end" fill="#475569">0</text>
+<line x1="78" x2="736" y1="284.0" y2="284.0" stroke="#e2e8f0"/><text x="70" y="288.0" text-anchor="end" fill="#475569">50</text>
+<line x1="78" x2="736" y1="166.0" y2="166.0" stroke="#e2e8f0"/><text x="70" y="170.0" text-anchor="end" fill="#475569">100</text>
+<line x1="78" x2="736" y1="48.0" y2="48.0" stroke="#e2e8f0"/><text x="70" y="52.0" text-anchor="end" fill="#475569">150</text>
+<line x1="78.0" x2="78.0" y1="48" y2="402" stroke="#f1f5f9"/><text x="78.0" y="420" text-anchor="middle" fill="#475569">0</text>
+<line x1="227.9" x2="227.9" y1="48" y2="402" stroke="#f1f5f9"/><text x="227.9" y="420" text-anchor="middle" fill="#475569">100</text>
+<line x1="377.9" x2="377.9" y1="48" y2="402" stroke="#f1f5f9"/><text x="377.9" y="420" text-anchor="middle" fill="#475569">200</text>
+<line x1="527.8" x2="527.8" y1="48" y2="402" stroke="#f1f5f9"/><text x="527.8" y="420" text-anchor="middle" fill="#475569">300</text>
+<line x1="677.7" x2="677.7" y1="48" y2="402" stroke="#f1f5f9"/><text x="677.7" y="420" text-anchor="middle" fill="#475569">400</text>
+<line x1="827.6" x2="827.6" y1="48" y2="402" stroke="#f1f5f9"/><text x="827.6" y="420" text-anchor="middle" fill="#475569">500</text>
+<line x1="78" x2="736" y1="402" y2="402" stroke="#94a3b8"/>
+<text x="407" y="446" text-anchor="middle" fill="#334155">output throughput (tok/s)</text>
+<text transform="translate(18,225) rotate(-90)" text-anchor="middle" fill="#334155">time per output token p99 (ms)</text>
+<polyline fill="none" stroke="#2563eb" stroke-width="2.2" points="254.5,381.9 436.9,362.6 535.3,270.4 609.7,123.3"/>
+<circle cx="254.5" cy="381.9" r="3.6" fill="#2563eb"/>
+<text x="260.5" y="375.9" font-size="10" fill="#2563eb">1</text>
+<circle cx="436.9" cy="362.6" r="3.6" fill="#2563eb"/>
+<text x="442.9" y="356.6" font-size="10" fill="#2563eb">4</text>
+<circle cx="535.3" cy="270.4" r="3.6" fill="#2563eb"/>
+<text x="541.3" y="264.4" font-size="10" fill="#2563eb">16</text>
+<circle cx="609.7" cy="123.3" r="3.6" fill="#2563eb"/>
+<text x="615.7" y="117.3" font-size="10" fill="#2563eb">32</text>
+<rect x="92" y="56" width="14" height="3" fill="#2563eb"/><text x="112" y="60" fill="#0f172a">rlis (Q8_0)</text>
+<polyline fill="none" stroke="#ea580c" stroke-width="2.2" points="276.0,384.8 522.0,363.3 736.0,298.9 717.1,202.3"/>
+<circle cx="276.0" cy="384.8" r="3.6" fill="#ea580c"/>
+<text x="282.0" y="378.8" font-size="10" fill="#ea580c">1</text>
+<circle cx="522.0" cy="363.3" r="3.6" fill="#ea580c"/>
+<text x="528.0" y="357.3" font-size="10" fill="#ea580c">4</text>
+<circle cx="736.0" cy="298.9" r="3.6" fill="#ea580c"/>
+<text x="742.0" y="292.9" font-size="10" fill="#ea580c">16</text>
+<circle cx="717.1" cy="202.3" r="3.6" fill="#ea580c"/>
+<text x="723.1" y="196.3" font-size="10" fill="#ea580c">32</text>
+<rect x="92" y="74" width="14" height="3" fill="#ea580c"/><text x="112" y="78" fill="#0f172a">llama.cpp (Q8_0)</text>
+</svg>
