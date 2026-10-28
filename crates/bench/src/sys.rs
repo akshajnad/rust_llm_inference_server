@@ -5,7 +5,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-/// macOS phys_footprint (counts Metal allocations RSS misses); Linux VmRSS.
+/// macOS phys_footprint (counts Metal allocations RSS misses).
 #[cfg(target_os = "macos")]
 pub fn footprint_bytes(pid: u32) -> Option<u64> {
     // SAFETY: proc_pid_rusage fills the zeroed struct for the given flavor.
@@ -20,15 +20,36 @@ pub fn footprint_bytes(pid: u32) -> Option<u64> {
     }
 }
 
+/// Linux: VmRSS plus the memory in use on the GPU, which RSS doesn't count.
 #[cfg(target_os = "linux")]
 pub fn footprint_bytes(pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
-    line.split_whitespace()
-        .nth(1)?
-        .parse::<u64>()
-        .ok()
-        .map(|k| k * 1024)
+    let rss = line.split_whitespace().nth(1)?.parse::<u64>().ok()? * 1024;
+    Some(rss + gpu_memory_used_bytes().unwrap_or(0))
+}
+
+/// Memory in use on the first GPU in `CUDA_VISIBLE_DEVICES`, per nvidia-smi. Device-wide, not
+/// per process (container PIDs don't match the driver's), which is the server's as long as
+/// only one server runs on the GPU at a time.
+#[cfg(target_os = "linux")]
+fn gpu_memory_used_bytes() -> Option<u64> {
+    let visible = std::env::var("CUDA_VISIBLE_DEVICES").unwrap_or_default();
+    let index = visible
+        .split(',')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("0");
+    let mib = cmd(
+        "nvidia-smi",
+        &[
+            "-i",
+            index,
+            "--query-gpu=memory.used",
+            "--format=csv,noheader,nounits",
+        ],
+    )?;
+    Some(mib.trim().parse::<u64>().ok()? << 20)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
