@@ -16,7 +16,7 @@ use candle_core::quantized::{QMatMul, QTensor, gguf_file};
 use candle_core::{DType, Device};
 
 use crate::config::LlamaConfig;
-use crate::layers::{Embedding, Linear, RmsNorm};
+use crate::layers::{Embedding, Linear, QuantLinear, RmsNorm};
 use crate::llama::{BlockWeights, Llama, LlamaParts};
 use crate::rope::Rope;
 
@@ -84,9 +84,23 @@ impl Reader<'_> {
     }
 
     fn linear(&mut self, name: &str) -> Result<Linear> {
-        Ok(Linear::Quantized(QMatMul::from_qtensor(
+        #[cfg(feature = "metal")]
+        if self.device.is_metal()
+            && self
+                .content
+                .tensor_infos
+                .get(name)
+                .is_some_and(|t| t.ggml_dtype == candle_core::quantized::GgmlDType::Q8_0)
+        {
+            let cpu = self.content.tensor(&mut self.file, name, &Device::Cpu)?;
+            let (q, w) = upload_q8_0(cpu, self.device)?;
+            let mut l = QuantLinear::new(QMatMul::from_qtensor(q)?);
+            l.gemv = Some(w);
+            return Ok(Linear::Quantized(l));
+        }
+        Ok(Linear::Quantized(QuantLinear::new(QMatMul::from_qtensor(
             self.qtensor(name)?,
-        )?))
+        )?)))
     }
 }
 
@@ -123,7 +137,7 @@ pub fn load(path: &Path, device: &Device, max_seq_len: usize) -> Result<Llama> {
     let final_norm = norm(r.dense_f32("output_norm.weight")?);
     let embed = Arc::new(r.qtensor("token_embd.weight")?);
     let lm_head = match cfg.tie_word_embeddings {
-        true => Linear::Quantized(QMatMul::from_arc(embed.clone())?),
+        true => Linear::Quantized(QuantLinear::new(QMatMul::from_arc(embed.clone())?)),
         false => r.linear("output.weight")?,
     };
     let max_pos = max_seq_len.min(cfg.max_position_embeddings);
@@ -151,4 +165,51 @@ pub fn load(path: &Path, device: &Device, max_seq_len: usize) -> Result<Llama> {
         kv_dtype,
         device: device.clone(),
     }))
+}
+
+/// Uploads a CPU Q8_0 tensor to Metal through candle's public loader, keeping a handle on the
+/// raw block buffer for the GEMV kernel. One copy of the weights serves both.
+#[cfg(feature = "metal")]
+pub fn upload_q8_0(cpu: QTensor, device: &Device) -> Result<(QTensor, crate::gemv::Q8Weight)> {
+    use candle_core::quantized::GgmlDType;
+    use candle_core::quantized::k_quants::BlockQ8_0;
+    use candle_core::quantized::{QStorage, metal::load_quantized};
+    anyhow::ensure!(
+        cpu.dtype() == GgmlDType::Q8_0,
+        "expected Q8_0, got {:?}",
+        cpu.dtype()
+    );
+    let Device::Metal(metal) = device else {
+        anyhow::bail!("upload_q8_0 needs a Metal device")
+    };
+    let (n, k) = cpu.shape().dims2()?;
+    let bytes = cpu.data()?;
+    let size = std::mem::size_of::<BlockQ8_0>();
+    anyhow::ensure!(
+        bytes.len() == n * k / 32 * size,
+        "Q8_0 data has {} bytes for ({n}, {k})",
+        bytes.len()
+    );
+    // Copy into properly aligned blocks (the byte buffer is only 1-aligned).
+    let mut blocks: Vec<BlockQ8_0> = Vec::with_capacity(bytes.len() / size);
+    // SAFETY: BlockQ8_0 is #[repr(C)] f16 + [i8; 32] (34 bytes, asserted by candle); every bit
+    // pattern is valid, and the copy fills exactly the reserved capacity.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            blocks.as_mut_ptr().cast::<u8>(),
+            bytes.len(),
+        );
+        blocks.set_len(bytes.len() / size);
+    }
+    let storage = load_quantized(metal, &blocks)?;
+    let QStorage::Metal(m) = &storage else {
+        anyhow::bail!("expected Metal storage")
+    };
+    let weight = crate::gemv::Q8Weight {
+        buffer: m.buffer().clone(),
+        n,
+        k,
+    };
+    Ok((QTensor::new(storage, (n, k))?, weight))
 }

@@ -3,10 +3,11 @@ use std::path::Path;
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::VarBuilder;
 
-use crate::attention::{Attention, Segment, causal_mask};
+use crate::attention::{Attention, Segment, causal_mask, fused_prefill};
 use crate::config::LlamaConfig;
 use crate::kv::{KvBatch, KvStore, PerSeqKv};
 use crate::layers::{Embedding, Linear, Mlp, RmsNorm};
+use crate::profile::span;
 use crate::rope::Rope;
 
 #[derive(Debug, Clone)]
@@ -234,9 +235,10 @@ impl Llama {
                     self.max_seq_len()
                 );
             }
-            let mask = match len {
-                1 => None,
-                _ => Some(causal_mask(len, start_pos, &self.device)?),
+            // The fused kernel applies causality itself; only the fallback needs a mask.
+            let mask = match len > 1 && !fused_prefill(&self.device, self.cfg.head_dim()) {
+                true => Some(causal_mask(len, start_pos, &self.device)?),
+                false => None,
             };
             segments.push(Segment {
                 offset,
@@ -255,12 +257,14 @@ impl Llama {
             .lookup(&ids)?
             .to_dtype(self.dtype)?
             .unsqueeze(0)?;
+        let dev = &self.device;
         for (i, block) in self.blocks.iter().enumerate() {
-            let h = block.input_norm.forward(&x)?;
+            let h = span(dev, "rms norm", || block.input_norm.forward(&x))?;
             let h = block.attn.forward(&h, i, &segments, &rope, kv)?;
-            x = (x + h)?;
-            let h = block.mlp.forward(&block.post_attn_norm.forward(&x)?)?;
-            x = (x + h)?;
+            x = span(dev, "residual add", || x + h)?;
+            let h = span(dev, "rms norm", || block.post_attn_norm.forward(&x))?;
+            let h = block.mlp.forward(&h)?;
+            x = span(dev, "residual add", || x + h)?;
         }
         Ok((self.norm.forward(&x)?, segments))
     }

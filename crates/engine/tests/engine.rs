@@ -25,6 +25,7 @@ fn config(max_num_seqs: usize, kv_tokens: usize) -> EngineConfig {
         block_size: 4,
         policy: Policy::Continuous,
         attention: engine::AttentionImpl::Kernel,
+        prefix_caching: true,
     }
 }
 
@@ -180,7 +181,16 @@ fn preemption_and_recompute_do_not_change_output() {
             > 0,
         "pool was meant to be too small"
     );
-    assert_eq!(tight.kv_utilization(), 0.0, "every block returned");
+    // Stats publish after the step that finished the last request; give it a moment.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tight.kv_utilization() != 0.0 {
+        assert!(
+            Instant::now() < deadline,
+            "blocks still in use: {}",
+            tight.kv_utilization()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// A prompt longer than the token budget is prefilled over several steps.
@@ -218,4 +228,85 @@ fn static_policy_produces_the_same_text() {
     let a: Vec<String> = a.into_iter().map(|rx| collect(rx).0).collect();
     let b: Vec<String> = b.into_iter().map(|rx| collect(rx).0).collect();
     assert_eq!(a, b);
+}
+
+/// Temperature-only sampling runs on the device with noise keyed by (seed, position): a seeded
+/// request produces the same text alone and surrounded by other requests.
+#[test]
+fn seeded_temperature_sampling_ignores_batch_neighbours() {
+    let (h, tok) = start(8);
+    let params = |seed| SamplingParams {
+        temperature: 0.9,
+        seed: Some(seed),
+        ..SamplingParams::greedy(24)
+    };
+    let alone = collect(submit(&h, &tok, "neighbours", params(5))).0;
+    let other_seed = collect(submit(&h, &tok, "neighbours", params(6))).0;
+    assert_ne!(
+        other_seed, alone,
+        "a different seed should give different text"
+    );
+    let rxs: Vec<_> = (0..4)
+        .map(|i| match i {
+            1 => submit(&h, &tok, "neighbours", params(5)),
+            _ => submit(&h, &tok, "noise", params(99 + i)),
+        })
+        .collect();
+    let batched: Vec<String> = rxs.into_iter().map(|rx| collect(rx).0).collect();
+    assert_eq!(batched[1], alone);
+}
+
+#[test]
+fn ignore_eos_generates_exactly_max_tokens() {
+    // Every token is EOS, so normally generation stops at once.
+    let tok = Arc::new(engine::testing::byte_tokenizer_with_eos((0..258).collect()));
+    let h = engine::spawn(tiny_model(256), tok.clone(), config(4, 4096)).unwrap();
+    let (_, fin) = collect(submit(&h, &tok, "eos", SamplingParams::greedy(10)));
+    assert_eq!((fin.reason, fin.completion_tokens), (FinishReason::Stop, 0));
+    let params = SamplingParams {
+        ignore_eos: true,
+        ..SamplingParams::greedy(10)
+    };
+    let (_, fin) = collect(submit(&h, &tok, "eos", params));
+    assert_eq!(
+        (fin.reason, fin.completion_tokens),
+        (FinishReason::Length, 10)
+    );
+}
+
+/// Reused prefix blocks must give exactly the output of computing them fresh: a repeated
+/// prompt and prompts sharing a long prefix, with caching on and off.
+#[test]
+fn prefix_caching_changes_nothing_but_speed() {
+    let shared = "a long shared system prompt that several requests start with, ".repeat(2);
+    let prompts: Vec<String> = ["first question", "second question", "first question"]
+        .iter()
+        .map(|q| format!("{shared}{q}"))
+        .collect();
+    let run = |caching: bool| {
+        let (h, tok) = start_with(EngineConfig {
+            prefix_caching: caching,
+            ..config(4, 4096)
+        });
+        // One at a time, so later requests can reuse blocks earlier ones computed.
+        let texts: Vec<String> = prompts
+            .iter()
+            .map(|p| collect(submit(&h, &tok, p, SamplingParams::greedy(12))).0)
+            .collect();
+        (
+            texts,
+            h.stats()
+                .cached_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    };
+    let (with, hits) = run(true);
+    let (without, no_hits) = run(false);
+    assert_eq!(with, without);
+    assert_eq!(no_hits, 0);
+    let prefix_tokens = byte_tokenizer().encode(&shared).unwrap().len() as u64;
+    assert!(
+        hits >= prefix_tokens,
+        "expected the shared prefix to be reused, got {hits} cached tokens"
+    );
 }

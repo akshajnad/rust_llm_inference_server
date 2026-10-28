@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use candle_core::Tensor;
 use kvcache::SeqId;
+use model::sampling::{RowSampling, sample_rows};
 use model::{AttentionImpl, Llama, PagedBatch, PagedKvCache, PagedSeq};
 use tokio::sync::mpsc;
 
@@ -38,6 +39,8 @@ pub struct EngineConfig {
     pub policy: Policy,
     /// Decode attention; `Kernel` falls back to `Gather` off Metal.
     pub attention: AttentionImpl,
+    /// Reuse cached KV blocks for shared prompt prefixes (and cheap recompute after preemption).
+    pub prefix_caching: bool,
 }
 
 impl Default for EngineConfig {
@@ -50,6 +53,7 @@ impl Default for EngineConfig {
             block_size: 16,
             policy: Policy::Continuous,
             attention: AttentionImpl::Kernel,
+            prefix_caching: true,
         }
     }
 }
@@ -132,6 +136,9 @@ pub struct EngineStats {
     pub preemptions: AtomicU64,
     /// KV block utilization in parts per million.
     pub kv_usage_ppm: AtomicU64,
+    /// Prompt tokens admitted, and how many came from the prefix cache.
+    pub admitted_tokens: AtomicU64,
+    pub cached_tokens: AtomicU64,
     pub alive: AtomicBool,
 }
 
@@ -226,6 +233,7 @@ pub fn spawn(
         block_size: cfg.block_size,
         watermark_blocks: (num_blocks / 100).max(1),
         policy: cfg.policy,
+        prefix_caching: cfg.prefix_caching,
     };
     let mut cache = PagedKvCache::new(
         model.config(),
@@ -274,6 +282,7 @@ struct Sequence {
     detok: Detokenizer,
     stop: StopMatcher,
     max_tokens: usize,
+    ignore_eos: bool,
     events: mpsc::UnboundedSender<Event>,
     arrived: Instant,
     first_token_at: Option<Instant>,
@@ -300,6 +309,7 @@ impl Sequence {
             detok: Detokenizer::new(&req.prompt),
             stop: StopMatcher::new(req.params.stop.clone()),
             max_tokens: req.params.max_tokens,
+            ignore_eos: req.params.ignore_eos,
             sampler: Sampler::new(req.params),
             prompt_len: req.prompt.len(),
             tokens: req.prompt,
@@ -330,7 +340,7 @@ impl Sequence {
         }
         self.first_token_at.get_or_insert(now);
         self.last_token_at = Some(now);
-        if tokenizer.is_eos(token) {
+        if tokenizer.is_eos(token) && !self.ignore_eos {
             return self.finish(FinishReason::Stop, tokenizer);
         }
         self.tokens.push(token);
@@ -403,45 +413,52 @@ struct Engine {
 impl Engine {
     fn run(&mut self, mut rx: mpsc::Receiver<Request>) {
         tracing::info!(policy = ?self.sched.config().policy, "engine started");
-        loop {
-            if !self.sched.has_work() {
-                self.publish_stats();
-                match rx.blocking_recv() {
-                    Some(req) => self.add(req),
-                    None => break,
-                }
-            }
-            while let Ok(req) = rx.try_recv() {
-                self.add(req);
-            }
-            self.drop_cancelled();
-            if !self.sched.has_work() {
-                continue;
-            }
-            let step = self.sched.schedule();
-            if step.seqs.is_empty() {
-                // Admission guarantees any queued sequence fits an idle pool, so this means a
-                // scheduler bug; fail loudly rather than spin.
-                tracing::error!("scheduler made no progress");
-                self.fail_all("scheduler made no progress");
-                continue;
-            }
-            if let Err(e) = self.step(&step) {
-                // Only this step's sequences may have half-written caches; the rest are intact.
-                tracing::error!("engine step failed: {e:#}");
-                let ids: Vec<SeqId> = step.seqs.iter().map(|q| q.id).collect();
-                self.fail(&ids, &format!("{e:#}"));
-            }
-            self.publish_stats();
-        }
+        // Each iteration drains its own autorelease pool: Metal hands back autoreleased
+        // encoders and strings, and a long-lived plain thread otherwise keeps them all until it
+        // exits (~25 KB per request, found by the soak test).
+        while model::autorelease_pool(|| self.iterate(&mut rx)) {}
         tracing::info!("engine stopped");
+    }
+
+    /// One engine iteration; returns false once every handle is gone and no work is left.
+    fn iterate(&mut self, rx: &mut mpsc::Receiver<Request>) -> bool {
+        if !self.sched.has_work() {
+            self.publish_stats();
+            match rx.blocking_recv() {
+                Some(req) => self.add(req),
+                None => return false,
+            }
+        }
+        while let Ok(req) = rx.try_recv() {
+            self.add(req);
+        }
+        self.drop_cancelled();
+        if !self.sched.has_work() {
+            return true;
+        }
+        let step = self.sched.schedule();
+        if step.seqs.is_empty() {
+            // Admission guarantees any queued sequence fits an idle pool, so this means a
+            // scheduler bug; fail loudly rather than spin.
+            tracing::error!("scheduler made no progress");
+            self.fail_all("scheduler made no progress");
+            return true;
+        }
+        if let Err(e) = self.step(&step) {
+            // Only this step's sequences may have half-written caches; the rest are intact.
+            tracing::error!("engine step failed: {e:#}");
+            let ids: Vec<SeqId> = step.seqs.iter().map(|q| q.id).collect();
+            self.fail(&ids, &format!("{e:#}"));
+        }
+        self.publish_stats();
+        true
     }
 
     fn add(&mut self, req: Request) {
         if let Some(seq) = Sequence::new(req, self.max_seq_len) {
             let id = self.next_id;
             self.next_id += 1;
-            self.sched.add(id, seq.tokens.len());
+            self.sched.add(id, seq.tokens.clone());
             self.seqs.insert(id, seq);
         }
     }
@@ -479,6 +496,13 @@ impl Engine {
         metrics::gauge!(m::WAITING).set(self.sched.num_waiting() as f64);
         metrics::gauge!(m::KV_UTILIZATION).set(self.sched.kv_utilization());
         metrics::counter!(m::PREEMPTIONS).absolute(self.sched.num_preemptions());
+        let (admitted, cached) = self.sched.prefix_cache_stats();
+        metrics::counter!(m::ADMITTED_TOKENS).absolute(admitted);
+        metrics::counter!(m::PREFIX_CACHE_HIT_TOKENS).absolute(cached);
+        self.stats
+            .admitted_tokens
+            .store(admitted, Ordering::Relaxed);
+        self.stats.cached_tokens.store(cached, Ordering::Relaxed);
         let s = &self.stats;
         s.running.store(self.sched.num_running(), Ordering::Relaxed);
         s.waiting.store(self.sched.num_waiting(), Ordering::Relaxed);
@@ -520,39 +544,48 @@ impl Engine {
 
         // Rows that produce a token this step (not mid-prefill), and whether each can take the
         // GPU argmax: greedy without repetition penalty needs nothing else from the logits.
+        // Rows that produce a token this step (not mid-prefill). Greedy and temperature-only
+        // rows are picked on the device in one kernel; only rows with top-k, top-p or a
+        // repetition penalty bring their logits back to the host.
         let mut sampled = Vec::new();
+        let mut device_rows = vec![RowSampling::Greedy; step.seqs.len()];
         for (row, q) in step.seqs.iter().enumerate() {
             self.sched.advance(q.id, q.end);
             if self.sched.is_caught_up(q.id) {
-                let p = self.seqs[&q.id].sampler.params();
-                sampled.push((row, q.id, p.is_greedy() && p.repetition_penalty == 1.0));
+                let seq = &self.seqs[&q.id];
+                let mode = seq.sampler.device_mode(seq.tokens.len());
+                if let Some(m) = mode {
+                    device_rows[row] = m;
+                }
+                sampled.push((row, q.id, mode.is_some()));
             }
         }
         // Reading results back waits for the GPU, so `forward_us` covers the whole pass.
-        let argmax = match sampled.iter().any(|s| s.2) {
-            true => logits.argmax(1)?.to_vec1::<u32>()?,
+        let device_tokens = match sampled.iter().any(|s| s.2) {
+            true => sample_rows(&logits, &device_rows)?,
             false => Vec::new(),
         };
-        let full_rows: Vec<usize> = sampled.iter().filter(|s| !s.2).map(|s| s.0).collect();
-        let mut full = match full_rows.is_empty() {
+        let host_rows: Vec<u32> = sampled
+            .iter()
+            .filter(|s| !s.2)
+            .map(|s| s.0 as u32)
+            .collect();
+        let mut host_logits = match host_rows.is_empty() {
             true => Vec::new(),
             false => {
-                let idx = Tensor::new(
-                    full_rows.iter().map(|&r| r as u32).collect::<Vec<_>>(),
-                    logits.device(),
-                )?;
+                let idx = Tensor::new(host_rows, logits.device())?;
                 logits.index_select(&idx, 0)?.to_vec2::<f32>()?
             }
         }
         .into_iter();
         let sample_started = Instant::now();
 
-        for (row, id, fast) in sampled {
+        for (row, id, on_device) in sampled {
             let seq = self.seqs.get_mut(&id).expect("scheduled sequence exists");
-            let token = match fast {
-                true => argmax[row],
+            let token = match on_device {
+                true => device_tokens[row],
                 false => {
-                    let mut logits = full.next().expect("one row per slow sampler");
+                    let mut logits = host_logits.next().expect("one row per host sampler");
                     seq.sampler.sample(&mut logits, &[&seq.tokens])
                 }
             };
@@ -561,7 +594,7 @@ impl Engine {
                 self.sched.remove(id);
                 self.seqs.remove(&id);
             } else {
-                self.sched.append_token(id);
+                self.sched.append_token(id, token);
             }
         }
         tracing::debug!(

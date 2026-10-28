@@ -11,3 +11,4 @@
 /fuzz/corpus
 /fuzz/artifacts
 /fuzz/Cargo.lock
+/results/**/*.log

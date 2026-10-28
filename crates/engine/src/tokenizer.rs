@@ -42,6 +42,10 @@ impl Tokenizer {
         Ok(enc.get_ids().to_vec())
     }
 
+    pub fn into_inner(self) -> tokenizers::Tokenizer {
+        self.inner
+    }
+
     pub fn is_eos(&self, id: u32) -> bool {
         self.eos_ids.contains(&id)
     }

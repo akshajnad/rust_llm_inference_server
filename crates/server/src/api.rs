@@ -60,6 +60,9 @@ pub struct SamplingFields {
     pub stop: Option<Stop>,
     pub seed: Option<u64>,
     pub repetition_penalty: Option<f32>,
+    /// vLLM/llama.cpp extension: generate exactly `max_tokens`, ignoring EOS.
+    #[serde(default)]
+    pub ignore_eos: bool,
     #[serde(default)]
     pub stream: bool,
     pub stream_options: Option<StreamOptions>,
@@ -158,6 +161,7 @@ impl SamplingFields {
             seed: self.seed,
             max_tokens,
             stop,
+            ignore_eos: self.ignore_eos,
         })
     }
 }

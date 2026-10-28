@@ -1,5 +1,6 @@
 use std::hash::{BuildHasher, Hasher};
 
+use model::sampling::{RowSampling, row_key};
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};
 
@@ -17,6 +18,8 @@ pub struct SamplingParams {
     pub seed: Option<u64>,
     pub max_tokens: usize,
     pub stop: Vec<String>,
+    /// Keep generating through EOS until `max_tokens` (benchmarks need exact output lengths).
+    pub ignore_eos: bool,
 }
 
 impl Default for SamplingParams {
@@ -29,6 +32,7 @@ impl Default for SamplingParams {
             seed: None,
             max_tokens: 16,
             stop: Vec::new(),
+            ignore_eos: false,
         }
     }
 }
@@ -44,6 +48,13 @@ impl SamplingParams {
     pub fn is_greedy(&self) -> bool {
         self.temperature < 1e-5
     }
+
+    /// Greedy or temperature-only: the device sampler can pick the token without the logits
+    /// leaving the GPU. Top-k, top-p and repetition penalty take the host path.
+    pub fn is_device_sampleable(&self) -> bool {
+        self.repetition_penalty == 1.0
+            && (self.is_greedy() || (self.top_k == 0 && self.top_p >= 1.0))
+    }
 }
 
 /// Picks the next token from last-position logits.
@@ -58,6 +69,8 @@ impl SamplingParams {
 #[derive(Debug, Clone)]
 pub struct Sampler {
     params: SamplingParams,
+    /// Resolved seed (the request's, or a random one).
+    seed: u64,
     rng: ChaCha8Rng,
     idx: Vec<u32>,
     weights: Vec<f64>,
@@ -71,6 +84,7 @@ impl Sampler {
         let seed = params.seed.unwrap_or_else(random_u64);
         Self {
             params,
+            seed,
             rng: ChaCha8Rng::seed_from_u64(seed),
             idx: Vec::new(),
             weights: Vec::new(),
@@ -83,6 +97,19 @@ impl Sampler {
 
     pub fn params(&self) -> &SamplingParams {
         &self.params
+    }
+
+    /// How the device sampler should pick the token at `position`, if it can.
+    pub fn device_mode(&self, position: usize) -> Option<RowSampling> {
+        let p = &self.params;
+        match () {
+            _ if !p.is_device_sampleable() => None,
+            _ if p.is_greedy() => Some(RowSampling::Greedy),
+            _ => Some(RowSampling::Temperature {
+                temperature: p.temperature,
+                key: row_key(self.seed, position as u32),
+            }),
+        }
     }
 
     /// `history` holds the token slices the repetition penalty looks at (prompt and output).

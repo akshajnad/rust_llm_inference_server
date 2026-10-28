@@ -38,13 +38,16 @@ are compute-bound in candle's quantized matmul, so their advantage over f16 shri
 - **Footprint**: macOS `phys_footprint` (`footprint` tool, and `/metrics`'
   `rlis_process_memory_footprint_*`), which counts Metal allocations that RSS misses.
 
-## Memory under a full KV pool (known issue)
+## Memory under a full KV pool (fixed in M5)
 
-Stress load: 64 concurrent requests of ~300 prompt + 400 sampled tokens, about 38k tokens
-against a 32k-token pool, with 14–17 preemptions. Q8_0 peaks at **3.58 GB** (3.33 GiB), 2% over
-the 3.5 GB target. `footprint` attributes the excess to "Owned physical footprint (unmapped)
-(graphics)": GPU memory candle has freed but the Metal driver still counts against the process
-(550–650 MB under load, ~110 MB idle). candle 0.11 releases every unused pooled buffer at each GPU
-sync, so each step reallocates its activations. Lowering `--max-batched-tokens` to 1024 or 512
-did not change it. Options to investigate in M5: retaining the buffer pool across steps (a candle
-patch), or f16 activations around the quantized matmuls.
+Stress load: 64 concurrent requests of ~300 prompt + 400 sampled tokens (about 38k tokens
+against a 32k-token pool, 14–17 preemptions). At M4, Q8_0 peaked at 3.58 GB, 2% over the
+3.5 GB target. The excess was ~650 MB of "Owned physical footprint (unmapped) (graphics)":
+temperature sampling read every sampled row's 128k logits back through a fresh 33 MB staging
+buffer per step, and the Metal driver kept the freed staging memory charged to the process.
+(Retaining candle's buffer pool was tried first and changed nothing.)
+
+M5 samples greedy and temperature-only rows on the GPU (Gumbel-max with per-request,
+batch-independent noise), so only token ids come back. Same load, same seeds: peak **3.26 GB**,
+and ~100 MB unmapped at idle. The story is written up in
+`docs/blog-the-memory-that-wasnt-in-the-pool.md`.

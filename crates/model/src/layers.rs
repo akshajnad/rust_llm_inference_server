@@ -4,13 +4,62 @@ use candle_core::quantized::{QMatMul, QTensor};
 use candle_core::{Module, Result, Tensor};
 use candle_nn::VarBuilder;
 
+use crate::profile::span;
+
+/// Largest row counts sent through the GEMV kernel and through per-row matrix-vector products
+/// (see `QuantLinear::forward`), from interleaved measurements of all three paths on an M4 Pro.
+#[cfg(feature = "metal")]
+const GEMV_MAX_ROWS: usize = 5;
+const MV_MAX_ROWS: usize = 4;
+
 /// A bias-free linear layer.
 #[derive(Debug, Clone)]
 pub enum Linear {
     /// Weight of shape `(out, in)`, as stored in HF checkpoints.
     Dense(Tensor),
     /// GGUF block-quantized weight; takes and returns f32 activations.
-    Quantized(QMatMul),
+    Quantized(QuantLinear),
+}
+
+#[derive(Debug, Clone)]
+pub struct QuantLinear {
+    pub mm: QMatMul,
+    /// Q8_0 weights on Metal also get the small-batch GEMV kernel.
+    #[cfg(feature = "metal")]
+    pub gemv: Option<crate::gemv::Q8Weight>,
+}
+
+impl QuantLinear {
+    pub fn new(mm: QMatMul) -> Self {
+        Self {
+            mm,
+            #[cfg(feature = "metal")]
+            gemv: None,
+        }
+    }
+
+    /// `x` is `(rows, in)`, contiguous from offset 0.
+    ///
+    /// candle's batched quantized matmul costs about the same for 2 rows as for 32, ~4x a
+    /// single-row matrix-vector product, so small decode batches take other paths: the Q8_0
+    /// GEMV kernel (weights read once for all rows), or candle's matrix-vector kernel once per
+    /// row (shaped `(rows, 1, in)`) for other quantization types.
+    fn forward(&self, x: &Tensor, rows: usize, in_dim: usize) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if let Some(w) = &self.gemv
+            && (2..=GEMV_MAX_ROWS).contains(&rows)
+            && !crate::gemv::disabled()
+        {
+            return crate::gemv::gemv(w, x);
+        }
+        if (2..=MV_MAX_ROWS).contains(&rows) {
+            return self
+                .mm
+                .forward(&x.reshape((rows, 1, in_dim))?)?
+                .reshape((rows, ()));
+        }
+        self.mm.forward(x)
+    }
 }
 
 impl Linear {
@@ -41,7 +90,7 @@ impl Module for Linear {
                     true => x,
                     false => x.force_contiguous()?,
                 };
-                q.forward(&x)?
+                q.forward(&x, rows, in_dim)?
             }
         };
         let mut out = lead;
@@ -102,8 +151,12 @@ impl Mlp {
 
 impl Module for Mlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = candle_nn::ops::silu(&self.gate.forward(x)?)?;
-        self.down.forward(&(gate * self.up.forward(x)?)?)
+        let dev = x.device();
+        let (gate, up) = span(dev, "mlp gate+up proj", || {
+            Ok((self.gate.forward(x)?, self.up.forward(x)?))
+        })?;
+        let h = span(dev, "mlp silu*up", || candle_nn::ops::silu(&gate)? * up)?;
+        span(dev, "mlp down proj", || self.down.forward(&h))
     }
 }
 
@@ -135,10 +188,10 @@ mod tests {
     /// same result as the same rows copied out.
     fn quantized_matmul_honors_views(dev: &Device) -> Result<()> {
         let w = Tensor::randn(0f32, 1.0, (96, 64), dev)?;
-        let q = Linear::Quantized(QMatMul::from_qtensor(QTensor::quantize(
+        let q = Linear::Quantized(QuantLinear::new(QMatMul::from_qtensor(QTensor::quantize(
             &w,
             GgmlDType::Q8_0,
-        )?)?);
+        )?)?));
         let x = Tensor::randn(0f32, 1.0, (40, 64), dev)?;
         let view = x.narrow(0, 13, 20)?;
         let got = q.forward(&view)?;

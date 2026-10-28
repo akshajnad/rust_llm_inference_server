@@ -121,6 +121,9 @@ struct EngineArgs {
     scheduler: SchedulerArg,
     #[arg(long, value_enum, default_value_t = AttentionArg::V2)]
     attention: AttentionArg,
+    /// Disable automatic prefix caching.
+    #[arg(long)]
+    no_prefix_caching: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -155,6 +158,7 @@ impl EngineArgs {
                 AttentionArg::V1 => AttentionImpl::Gather,
                 AttentionArg::V2 => AttentionImpl::Kernel,
             },
+            prefix_caching: !self.no_prefix_caching,
         }
     }
 }
@@ -230,6 +234,7 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
         seed: args.seed,
         max_tokens: args.max_tokens,
         stop: Vec::new(),
+        ignore_eos: false,
     };
     let (req, mut rx) = Request::new(prompt, params);
     engine.submit(req)?;
@@ -302,7 +307,8 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         tokenizer.clone(),
         args.engine.config(args.queue_size),
     )?;
-    let metrics = Some(server::install_prometheus()?);
+    let prometheus = server::install_prometheus()?;
+    let metrics = Some(prometheus.clone());
     let state = AppState {
         metrics,
         engine,
@@ -315,6 +321,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         .enable_all()
         .build()?
         .block_on(async move {
+            server::spawn_metrics_upkeep(prometheus);
             let addr = format!("{}:{}", args.host, args.port);
             let listener = tokio::net::TcpListener::bind(&addr)
                 .await

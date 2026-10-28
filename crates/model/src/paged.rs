@@ -8,7 +8,7 @@
 
 use candle_core::{DType, Device, Result, Tensor};
 
-use crate::attention::{Segment, attend_segments, gqa_attention};
+use crate::attention::{Segment, attend_segments, segment_attention};
 use crate::config::LlamaConfig;
 use crate::kv::KvBatch;
 
@@ -345,7 +345,7 @@ impl KvBatch for PagedBatch<'_> {
                     let k_all = self.cache.gather(kc, self.slots(i)?)?;
                     let v_all = self.cache.gather(vc, self.slots(i)?)?;
                     let qs = q.narrow(2, seg.offset, seg.len)?;
-                    let o = gqa_attention(&qs, &k_all, &v_all, seg.mask.as_ref())?;
+                    let o = segment_attention(&qs, &k_all, &v_all, seg)?;
                     parts.push(o.squeeze(0)?.transpose(0, 1)?);
                 }
                 Tensor::cat(&parts, 0)?.index_select(reorder, 0)?

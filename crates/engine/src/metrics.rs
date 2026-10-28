@@ -8,6 +8,10 @@ pub const REQUEST_DECODE_TPS: &str = "rlis_request_decode_tokens_per_second";
 pub const GENERATED_TOKENS: &str = "rlis_generated_tokens_total";
 pub const REQUESTS_FINISHED: &str = "rlis_requests_finished_total";
 pub const PREEMPTIONS: &str = "rlis_preemptions_total";
+/// Tokens of admitted sequences (prompt, or prompt plus output when readmitted after
+/// preemption), and how many of those were served from the prefix cache.
+pub const ADMITTED_TOKENS: &str = "rlis_admitted_tokens_total";
+pub const PREFIX_CACHE_HIT_TOKENS: &str = "rlis_prefix_cache_hit_tokens_total";
 pub const RUNNING: &str = "rlis_running_sequences";
 pub const WAITING: &str = "rlis_waiting_sequences";
 pub const KV_UTILIZATION: &str = "rlis_kv_cache_utilization_ratio";

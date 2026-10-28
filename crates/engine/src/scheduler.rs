@@ -14,10 +14,15 @@
 //!   ones, and only while the whole known sequence fits with `watermark_blocks` to spare for
 //!   decode growth. The head of the line is never skipped, so nothing starves.
 //! - `Policy::Static` admits only when nothing is running (the static-batching baseline).
+//! - With `prefix_caching`, every block is registered once all its tokens are computed, and an
+//!   admitted sequence starts from the longest cached chain of its leading blocks. That also
+//!   makes recompute after preemption cheap: the victim's blocks stay cached until reclaimed.
 
 use std::collections::VecDeque;
 
-use kvcache::{BlockCopy, BlockId, BlockManager, OutOfBlocks, SeqId};
+use kvcache::{
+    BlockCopy, BlockId, BlockManager, OutOfBlocks, SeqId, block_hashes, next_block_hash,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
@@ -34,6 +39,7 @@ pub struct SchedulerConfig {
     /// Free blocks kept in reserve when admitting, so running sequences can grow.
     pub watermark_blocks: usize,
     pub policy: Policy,
+    pub prefix_caching: bool,
 }
 
 impl SchedulerConfig {
@@ -47,8 +53,18 @@ impl SchedulerConfig {
 struct SeqState {
     id: SeqId,
     arrival: u64,
-    num_tokens: usize,
+    /// Prompt plus generated tokens; `tokens.len()` is the sequence length.
+    tokens: Vec<u32>,
     num_computed: usize,
+    /// Leading blocks registered in the prefix cache, and the hash chain through them.
+    registered: usize,
+    chain: u64,
+}
+
+impl SeqState {
+    fn num_tokens(&self) -> usize {
+        self.tokens.len()
+    }
 }
 
 /// Compute tokens `start..end` of sequence `id` this step.
@@ -84,6 +100,8 @@ pub struct Scheduler {
     running: Vec<SeqState>,
     next_arrival: u64,
     num_preemptions: u64,
+    admitted_tokens: u64,
+    cached_tokens: u64,
 }
 
 impl Scheduler {
@@ -100,6 +118,8 @@ impl Scheduler {
             running: Vec::new(),
             next_arrival: 0,
             num_preemptions: 0,
+            admitted_tokens: 0,
+            cached_tokens: 0,
         }
     }
 
@@ -107,14 +127,16 @@ impl Scheduler {
         &self.cfg
     }
 
-    /// Queues a new sequence with `num_tokens` prompt tokens.
-    pub fn add(&mut self, id: SeqId, num_tokens: usize) {
-        assert!(num_tokens > 0, "empty sequence");
+    /// Queues a new sequence with its prompt tokens.
+    pub fn add(&mut self, id: SeqId, prompt: Vec<u32>) {
+        assert!(!prompt.is_empty(), "empty sequence");
         self.waiting.push_back(SeqState {
             id,
             arrival: self.next_arrival,
-            num_tokens,
+            tokens: prompt,
             num_computed: 0,
+            registered: 0,
+            chain: 0,
         });
         self.next_arrival += 1;
     }
@@ -137,7 +159,7 @@ impl Scheduler {
         let mut i = 0;
         while i < self.running.len() && *budget > 0 {
             let s = &self.running[i];
-            let want = (s.num_tokens - s.num_computed).min(*budget);
+            let want = (s.num_tokens() - s.num_computed).min(*budget);
             if want == 0 {
                 i += 1;
                 continue;
@@ -163,8 +185,11 @@ impl Scheduler {
     }
 
     fn preempt(&mut self, mut s: SeqState, out: &mut Schedule) {
+        // Registered blocks stay cached (evictable) and are likely adopted again on readmission.
         self.blocks.free(s.id);
         s.num_computed = 0;
+        s.registered = 0;
+        s.chain = 0;
         out.preempted.push(s.id);
         self.num_preemptions += 1;
         let at = self.preempted.partition_point(|p| p.arrival < s.arrival);
@@ -180,18 +205,34 @@ impl Scheduler {
                 &mut self.preempted
             };
             let Some(head) = queue.front() else { break };
-            let need = self.blocks.blocks_for(head.num_tokens);
-            if need + self.cfg.watermark_blocks > self.blocks.num_free_blocks() {
+            // Cached leading blocks, never the one holding the last token: its logits are
+            // needed, so at least one token is always computed.
+            let hashes = match self.cfg.prefix_caching {
+                true => block_hashes(&head.tokens[..head.num_tokens() - 1], self.cfg.block_size),
+                false => Vec::new(),
+            };
+            let (matched, matched_evictable) = self.blocks.prefix_match(&hashes);
+            let need = self.blocks.blocks_for(head.num_tokens()) - matched;
+            let available = self.blocks.num_free_blocks() - matched_evictable;
+            if need + self.cfg.watermark_blocks > available {
                 break;
             }
-            let s = queue.pop_front().expect("checked front");
+            let mut s = queue.pop_front().expect("checked front");
+            if matched > 0 {
+                self.blocks.adopt_prefix(s.id, &hashes[..matched]);
+                s.num_computed = matched * self.cfg.block_size;
+                s.registered = matched;
+                s.chain = hashes[matched - 1];
+            }
+            self.admitted_tokens += s.num_tokens() as u64;
+            self.cached_tokens += s.num_computed as u64;
             // Reserve the whole known sequence now, so later admissions can't overcommit.
             out.copies.extend(
                 self.blocks
-                    .reserve(s.id, s.num_tokens)
+                    .reserve(s.id, s.num_tokens())
                     .expect("checked free blocks"),
             );
-            let want = (s.num_tokens - s.num_computed).min(*budget);
+            let want = (s.num_tokens() - s.num_computed).min(*budget);
             if want > 0 {
                 out.seqs.push(ScheduledSeq {
                     id: s.id,
@@ -205,26 +246,43 @@ impl Scheduler {
         }
     }
 
-    /// The executor computed tokens up to `end` for `id`.
+    /// The executor computed tokens up to `end` for `id`; newly completed blocks enter the
+    /// prefix cache.
     pub fn advance(&mut self, id: SeqId, end: usize) {
-        if let Some(s) = self.running.iter_mut().find(|s| s.id == id) {
-            debug_assert!(end <= s.num_tokens);
-            s.num_computed = end;
+        let bs = self.cfg.block_size;
+        let Some(s) = self.running.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        debug_assert!(end <= s.num_tokens());
+        s.num_computed = end;
+        if !self.cfg.prefix_caching {
+            return;
+        }
+        while (s.registered + 1) * bs <= end {
+            let i = s.registered;
+            s.chain = next_block_hash(s.chain, &s.tokens[i * bs..(i + 1) * bs]);
+            self.blocks.register_block(id, i, s.chain);
+            s.registered += 1;
         }
     }
 
-    /// A token was sampled for `id`; its K/V get computed next step.
-    pub fn append_token(&mut self, id: SeqId) {
+    /// `token` was sampled for `id`; its K/V get computed next step.
+    pub fn append_token(&mut self, id: SeqId, token: u32) {
         if let Some(s) = self.running.iter_mut().find(|s| s.id == id) {
-            s.num_tokens += 1;
+            s.tokens.push(token);
         }
+    }
+
+    /// Admitted tokens so far, and how many of them came from the prefix cache.
+    pub fn prefix_cache_stats(&self) -> (u64, u64) {
+        (self.admitted_tokens, self.cached_tokens)
     }
 
     /// Whether `id` has every token computed, i.e. its last step produced the next token.
     pub fn is_caught_up(&self, id: SeqId) -> bool {
         self.running
             .iter()
-            .any(|s| s.id == id && s.num_computed == s.num_tokens)
+            .any(|s| s.id == id && s.num_computed == s.num_tokens())
     }
 
     /// Removes `id` wherever it is (finished or cancelled) and frees its blocks.
@@ -291,6 +349,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// `n` prompt tokens unique to sequence `id`.
+    fn toks(id: SeqId, n: usize) -> Vec<u32> {
+        (0..n as u32).map(|i| id as u32 * 100_000 + i).collect()
+    }
+
     fn cfg(num_blocks: usize, policy: Policy) -> SchedulerConfig {
         SchedulerConfig {
             max_num_seqs: 8,
@@ -299,6 +362,7 @@ mod tests {
             block_size: 4,
             watermark_blocks: 1,
             policy,
+            prefix_caching: false,
         }
     }
 
@@ -310,8 +374,21 @@ mod tests {
         prompts: &[usize],
         outputs: &[usize],
     ) -> (Vec<SeqId>, usize) {
+        let prompts: Vec<Vec<u32>> = prompts
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| toks(i as SeqId, p))
+            .collect();
+        simulate_prompts(sched, prompts, outputs)
+    }
+
+    fn simulate_prompts(
+        sched: &mut Scheduler,
+        prompts: Vec<Vec<u32>>,
+        outputs: &[usize],
+    ) -> (Vec<SeqId>, usize) {
         let mut produced: HashMap<SeqId, usize> = HashMap::new();
-        for (i, &p) in prompts.iter().enumerate() {
+        for (i, p) in prompts.into_iter().enumerate() {
             sched.add(i as SeqId, p);
         }
         let mut finished = Vec::new();
@@ -338,7 +415,7 @@ mod tests {
                         sched.remove(s.id);
                         finished.push(s.id);
                     } else {
-                        sched.append_token(s.id);
+                        sched.append_token(s.id, 7);
                     }
                 }
             }
@@ -377,14 +454,14 @@ mod tests {
             watermark_blocks: 0,
             ..cfg(3, Policy::Continuous)
         });
-        s.add(0, 4);
-        s.add(1, 4);
-        s.add(2, 4);
+        s.add(0, toks(0, 4));
+        s.add(1, toks(1, 4));
+        s.add(2, toks(2, 4));
         let step = s.schedule();
         assert_eq!(step.seqs.len(), 3, "all three prompts fit exactly");
         for q in &step.seqs {
             s.advance(q.id, q.end);
-            s.append_token(q.id);
+            s.append_token(q.id, 7);
         }
         // Each needs a 2nd block for its 5th token; none are free, so 2 then 1 are evicted.
         let step = s.schedule();
@@ -406,14 +483,14 @@ mod tests {
             ..cfg(3, Policy::Continuous)
         });
         for id in 0..3 {
-            s.add(id, 4);
+            s.add(id, toks(id, 4));
         }
         for q in s.schedule().seqs {
             s.advance(q.id, q.end);
-            s.append_token(q.id);
+            s.append_token(q.id, 7);
         }
         assert_eq!(s.schedule().preempted, [2, 1]);
-        s.add(9, 1);
+        s.add(9, toks(9, 1));
         s.remove(0);
         let step = s.schedule();
         let ids: Vec<_> = step.seqs.iter().map(|q| q.id).collect();
@@ -439,7 +516,7 @@ mod tests {
             max_batched_tokens: 16,
             ..cfg(64, Policy::Continuous)
         });
-        s.add(0, 40);
+        s.add(0, toks(0, 40));
         let chunks: Vec<_> = (0..3)
             .map(|_| {
                 let q = s.schedule().seqs[0];
@@ -457,11 +534,11 @@ mod tests {
             max_batched_tokens: 16,
             ..cfg(64, Policy::Continuous)
         });
-        s.add(0, 4);
+        s.add(0, toks(0, 4));
         let q = s.schedule().seqs[0];
         s.advance(q.id, q.end);
-        s.append_token(0);
-        s.add(1, 100);
+        s.append_token(0, 7);
+        s.add(1, toks(1, 100));
         let step = s.schedule();
         assert_eq!(
             step.seqs[0],
@@ -486,11 +563,11 @@ mod tests {
     #[test]
     fn static_policy_waits_for_the_batch_to_drain() {
         let mut s = Scheduler::new(cfg(64, Policy::Static));
-        s.add(0, 4);
+        s.add(0, toks(0, 4));
         let q = s.schedule().seqs[0];
         s.advance(q.id, q.end);
-        s.append_token(0);
-        s.add(1, 4);
+        s.append_token(0, 7);
+        s.add(1, toks(1, 4));
         let ids: Vec<_> = s.schedule().seqs.iter().map(|q| q.id).collect();
         assert_eq!(ids, [0], "no admission while a batch runs");
         s.remove(0);
@@ -541,6 +618,91 @@ mod tests {
             let (finished, _) = simulate(&mut s, &prompts, &outputs);
             assert_eq!(finished.len(), n, "trial {trial}");
             assert_eq!(s.num_free_blocks(), blocks, "trial {trial} leaked blocks");
+        }
+    }
+
+    #[test]
+    fn shared_prefix_is_adopted_not_recomputed() {
+        let mut s = Scheduler::new(SchedulerConfig {
+            prefix_caching: true,
+            ..cfg(64, Policy::Continuous)
+        });
+        let prompt: Vec<u32> = (0..40).collect();
+        s.add(0, prompt.clone());
+        let q = s.schedule().seqs[0];
+        assert_eq!((q.start, q.end), (0, 40));
+        s.advance(0, 40);
+        s.remove(0);
+        // Same 40-token prompt: blocks 0..9 (36 tokens) come from the cache; the block with
+        // the last token is computed so its logits exist.
+        s.add(1, prompt.clone());
+        let q = s.schedule().seqs[0];
+        assert_eq!((q.start, q.end), (36, 40));
+        // A different suffix after a shared 20-token prefix reuses the 5 full shared blocks.
+        let mut other = prompt[..20].to_vec();
+        other.extend(900..915);
+        s.add(2, other);
+        let q = s.schedule().seqs.into_iter().find(|q| q.id == 2).unwrap();
+        assert_eq!((q.start, q.end), (20, 35));
+        assert_eq!(s.prefix_cache_stats(), (40 + 40 + 35, 36 + 20));
+        s.check();
+    }
+
+    #[test]
+    fn cached_blocks_make_recompute_after_preemption_cheap() {
+        let mut s = Scheduler::new(SchedulerConfig {
+            prefix_caching: true,
+            watermark_blocks: 0,
+            ..cfg(3, Policy::Continuous)
+        });
+        for id in 0..3 {
+            s.add(id, toks(id, 4));
+        }
+        for q in s.schedule().seqs {
+            s.advance(q.id, q.end);
+            s.append_token(q.id, 7);
+        }
+        assert_eq!(s.schedule().preempted, [2, 1]);
+        s.remove(0);
+        // Seq 1's first block (its full 4-token prompt) is still cached: only the sampled
+        // token needs recomputing.
+        let q = s.schedule().seqs[0];
+        assert_eq!((q.id, q.start, q.end), (1, 4, 5));
+    }
+
+    #[test]
+    fn random_workloads_with_prefix_caching_finish() {
+        for blocks in [12usize, 24, 48] {
+            let mut s = Scheduler::new(SchedulerConfig {
+                prefix_caching: true,
+                ..cfg(blocks, Policy::Continuous)
+            });
+            // Half the prompts share a 16-token prefix, under memory pressure at 12 blocks.
+            let shared: Vec<u32> = (0..16).collect();
+            let prompts: Vec<Vec<u32>> = (0..8u32)
+                .map(|i| match i % 2 {
+                    0 => shared
+                        .iter()
+                        .copied()
+                        .chain(1000 * i..1000 * i + 1 + i)
+                        .collect(),
+                    _ => toks(i as SeqId, 9 + i as usize),
+                })
+                .collect();
+            let (finished, _) = simulate_prompts(&mut s, prompts, &[9, 4, 12, 3, 8, 6, 2, 11]);
+            assert_eq!(finished.len(), 8);
+            // Sequences admitted in the same step can't share blocks nobody has computed yet;
+            // only ones admitted after the shared prefix was computed hit the cache.
+            let (_, cached) = s.prefix_cache_stats();
+            assert!(
+                cached >= 16,
+                "a later shared-prefix prompt should hit the cache, got {cached}"
+            );
+            assert_eq!(
+                s.num_free_blocks(),
+                blocks,
+                "every block is free or reclaimable"
+            );
         }
     }
 }

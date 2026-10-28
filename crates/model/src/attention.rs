@@ -4,6 +4,7 @@ use candle_nn::VarBuilder;
 use crate::config::LlamaConfig;
 use crate::kv::KvBatch;
 use crate::layers::Linear;
+use crate::profile::span;
 use crate::rope::RopeBatch;
 
 #[derive(Debug, Clone)]
@@ -64,14 +65,29 @@ impl Attention {
         let (b, total, _) = x.dims3()?;
         let split =
             |t: Tensor, heads: usize| t.reshape((b, total, heads, self.head_dim))?.transpose(1, 2);
-        let q = rope.apply(&split(self.q_proj.forward(x)?, self.n_heads)?)?;
-        let k = rope.apply(&split(self.k_proj.forward(x)?, self.n_kv_heads)?)?;
-        let v = split(self.v_proj.forward(x)?, self.n_kv_heads)?;
-        let out = kv.attend(layer, &q, &k, &v, segments)?;
-        let out = out
-            .transpose(1, 2)?
-            .reshape((b, total, self.n_heads * self.head_dim))?;
-        self.o_proj.forward(&out)
+        let dev = x.device();
+        let (q, k, v) = span(dev, "qkv proj", || {
+            Ok((
+                self.q_proj.forward(x)?,
+                self.k_proj.forward(x)?,
+                self.v_proj.forward(x)?,
+            ))
+        })?;
+        let (q, k) = span(dev, "qk split + rope", || {
+            Ok((
+                rope.apply(&split(q, self.n_heads)?)?,
+                rope.apply(&split(k, self.n_kv_heads)?)?,
+            ))
+        })?;
+        let v = split(v, self.n_kv_heads)?;
+        let out = span(dev, "kv write + attention", || {
+            kv.attend(layer, &q, &k, &v, segments)
+        })?;
+        let out = span(dev, "attn out transpose", || {
+            out.transpose(1, 2)?
+                .reshape((b, total, self.n_heads * self.head_dim))
+        })?;
+        span(dev, "o proj", || self.o_proj.forward(&out))
     }
 }
 
@@ -96,11 +112,38 @@ pub fn attend_segments(
     for (i, seg) in segments.iter().enumerate() {
         let (k, v) = kv_for(i, seg)?;
         let q = q.narrow(2, seg.offset, seg.len)?;
-        outs.push(gqa_attention(&q, &k, &v, seg.mask.as_ref())?);
+        outs.push(segment_attention(&q, &k, &v, seg)?);
     }
     match outs.len() {
         1 => Ok(outs.pop().expect("one segment")),
         _ => Tensor::cat(&outs, 2),
+    }
+}
+
+/// Whether causal prefill can use the fused attention kernel (MLX's `sdpa`, Metal only), which
+/// never materializes the score matrix. Elsewhere prefill uses tiled `gqa_attention`.
+pub fn fused_prefill(dev: &candle_core::Device, head_dim: usize) -> bool {
+    dev.is_metal() && matches!(head_dim, 32 | 64 | 72 | 80 | 96 | 128 | 256)
+}
+
+/// Attention for one sequence's new tokens against all its keys/values. A multi-token segment
+/// without a mask is causal prefill for the fused kernel, whose causal mask is aligned to the
+/// end of the keys (queries are the last `seq` positions), as chunked prefill needs.
+pub fn segment_attention(q: &Tensor, k: &Tensor, v: &Tensor, seg: &Segment) -> Result<Tensor> {
+    match (&seg.mask, seg.len) {
+        (None, len) if len > 1 => {
+            let scale = 1.0 / (q.dim(D::Minus1)? as f32).sqrt();
+            candle_nn::ops::sdpa(
+                &q.contiguous()?,
+                &k.contiguous()?,
+                &v.contiguous()?,
+                None,
+                true,
+                scale,
+                1.0,
+            )
+        }
+        (mask, _) => gqa_attention(q, k, v, mask.as_ref()),
     }
 }
 

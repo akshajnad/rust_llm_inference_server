@@ -42,6 +42,11 @@ pub fn byte_tokenizer() -> Tokenizer {
     Tokenizer::new(inner, Vec::new())
 }
 
+/// `byte_tokenizer` with the given ids treated as end-of-sequence.
+pub fn byte_tokenizer_with_eos(eos: Vec<u32>) -> Tokenizer {
+    Tokenizer::new(byte_tokenizer().into_inner(), eos)
+}
+
 /// GPT-2's reversible byte-to-printable-char mapping used by byte-level BPE.
 fn byte_to_unicode() -> Vec<char> {
     let printable =

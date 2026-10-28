@@ -7,8 +7,15 @@
 //! Blocks are reference counted so sequences can share a prefix (`fork`). A shared block is
 //! immutable: writing into a partially filled shared block first copies it (copy-on-write),
 //! and the copy is returned for the executor to perform before the next forward pass.
+//!
+//! Automatic prefix caching: a full block can be registered under the hash of its tokens and
+//! of every token before it (`block_hashes`). Registered blocks outlive their sequences: at
+//! refcount zero they become *evictable* instead of free, and a later sequence with the same
+//! prefix adopts them instead of recomputing. Evictable blocks are reclaimed least recently
+//! used first, only once the free list is empty.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 pub type BlockId = u32;
 pub type SeqId = u64;
@@ -24,12 +31,41 @@ pub struct BlockCopy {
     pub dst: BlockId,
 }
 
-/// Free list plus reference counts over a fixed pool.
+/// Hashes of each full block of `tokens`, each covering every token up to the block's end.
+pub fn block_hashes(tokens: &[u32], block_size: usize) -> Vec<u64> {
+    let mut prev = 0u64;
+    tokens
+        .chunks_exact(block_size)
+        .map(|block| {
+            prev = next_block_hash(prev, block);
+            prev
+        })
+        .collect()
+}
+
+/// Chains one more block onto the hash of everything before it (0 for the first block).
+pub fn next_block_hash(prev: u64, block: &[u32]) -> u64 {
+    // DefaultHasher::new() uses fixed keys, so hashes are stable within a process.
+    let mut h = DefaultHasher::new();
+    prev.hash(&mut h);
+    block.hash(&mut h);
+    h.finish()
+}
+
+/// Free list, reference counts and the prefix cache over a fixed pool.
 #[derive(Debug, Clone)]
 pub struct BlockAllocator {
     refcounts: Vec<u32>,
     /// LIFO so recently freed (likely still cache-warm) blocks are reused first.
     free: Vec<BlockId>,
+    /// Content hash of registered blocks.
+    hash_of: Vec<Option<u64>>,
+    /// Registered blocks by hash.
+    cached: HashMap<u64, BlockId>,
+    /// Unreferenced registered blocks by last use, oldest first.
+    evictable: BTreeMap<u64, BlockId>,
+    evict_tick: Vec<Option<u64>>,
+    tick: u64,
 }
 
 impl BlockAllocator {
@@ -37,15 +73,47 @@ impl BlockAllocator {
         Self {
             refcounts: vec![0; num_blocks],
             free: (0..num_blocks as BlockId).rev().collect(),
+            hash_of: vec![None; num_blocks],
+            cached: HashMap::new(),
+            evictable: BTreeMap::new(),
+            evict_tick: vec![None; num_blocks],
+            tick: 0,
         }
+    }
+
+    /// Unreferenced registered blocks (reclaimable).
+    pub fn num_evictable(&self) -> usize {
+        self.evictable.len()
+    }
+
+    pub fn lookup(&self, hash: u64) -> Option<BlockId> {
+        self.cached.get(&hash).copied()
+    }
+
+    /// Records that `b` holds the tokens hashed by `hash`. If another block already holds
+    /// them, `b` stays unregistered (and is freed normally).
+    pub fn register(&mut self, b: BlockId, hash: u64) {
+        if self.hash_of[b as usize].is_none() && !self.cached.contains_key(&hash) {
+            self.hash_of[b as usize] = Some(hash);
+            self.cached.insert(hash, b);
+        }
+    }
+
+    /// Takes a reference to a registered block, reviving it if it was evictable.
+    pub fn acquire(&mut self, b: BlockId) {
+        if let Some(t) = self.evict_tick[b as usize].take() {
+            self.evictable.remove(&t);
+        }
+        self.refcounts[b as usize] += 1;
     }
 
     pub fn num_blocks(&self) -> usize {
         self.refcounts.len()
     }
 
+    /// Blocks available to allocate: free plus evictable.
     pub fn num_free(&self) -> usize {
-        self.free.len()
+        self.free.len() + self.evictable.len()
     }
 
     pub fn refcount(&self, b: BlockId) -> u32 {
@@ -53,7 +121,19 @@ impl BlockAllocator {
     }
 
     pub fn allocate(&mut self) -> Option<BlockId> {
-        let b = self.free.pop()?;
+        let b = match self.free.pop() {
+            Some(b) => b,
+            None => {
+                // Reclaim the least recently used cached block.
+                let (_, b) = self.evictable.pop_first()?;
+                self.evict_tick[b as usize] = None;
+                let h = self.hash_of[b as usize]
+                    .take()
+                    .expect("evictable blocks are registered");
+                self.cached.remove(&h);
+                b
+            }
+        };
         debug_assert_eq!(
             self.refcounts[b as usize], 0,
             "free block {b} had references"
@@ -67,13 +147,20 @@ impl BlockAllocator {
         self.refcounts[b as usize] += 1;
     }
 
-    /// Drops one reference; the block returns to the free list at zero.
+    /// Drops one reference. At zero a registered block becomes evictable (still cached), any
+    /// other block returns to the free list.
     pub fn decref(&mut self, b: BlockId) {
         let rc = &mut self.refcounts[b as usize];
         assert!(*rc > 0, "double free of block {b}");
         *rc -= 1;
         if *rc == 0 {
-            self.free.push(b);
+            if self.hash_of[b as usize].is_some() {
+                self.tick += 1;
+                self.evictable.insert(self.tick, b);
+                self.evict_tick[b as usize] = Some(self.tick);
+            } else {
+                self.free.push(b);
+            }
         }
     }
 }
@@ -116,11 +203,62 @@ impl BlockManager {
         self.alloc.num_free()
     }
 
-    /// Fraction of blocks in use, 0.0 to 1.0.
+    /// Fraction of blocks referenced by a sequence, 0.0 to 1.0 (cached-but-unused blocks are
+    /// reclaimable, so they don't count).
     pub fn utilization(&self) -> f64 {
         match self.num_blocks() {
             0 => 0.0,
             n => (n - self.num_free_blocks()) as f64 / n as f64,
+        }
+    }
+
+    /// Blocks held only by the prefix cache.
+    pub fn num_cached_blocks(&self) -> usize {
+        self.alloc.num_evictable()
+    }
+
+    /// How many leading `hashes` are cached, and how many of those are currently evictable
+    /// (adopting them takes them out of the available count).
+    pub fn prefix_match(&self, hashes: &[u64]) -> (usize, usize) {
+        let mut evictable = 0;
+        let n = hashes
+            .iter()
+            .map_while(|&h| self.alloc.lookup(h))
+            .inspect(|&b| evictable += usize::from(self.alloc.refcount(b) == 0))
+            .count();
+        (n, evictable)
+    }
+
+    /// Starts `seq` with the cached blocks for the leading `hashes`; returns how many blocks
+    /// (each full) it adopted.
+    pub fn adopt_prefix(&mut self, seq: SeqId, hashes: &[u64]) -> usize {
+        assert!(
+            !self.tables.contains_key(&seq),
+            "adopt into existing sequence {seq}"
+        );
+        let blocks: Vec<BlockId> = hashes.iter().map_while(|&h| self.alloc.lookup(h)).collect();
+        if blocks.is_empty() {
+            return 0;
+        }
+        for &b in &blocks {
+            self.alloc.acquire(b);
+        }
+        let n = blocks.len();
+        self.tables.insert(
+            seq,
+            BlockTable {
+                blocks,
+                num_tokens: n * self.block_size,
+            },
+        );
+        self.debug_check();
+        n
+    }
+
+    /// Registers `seq`'s block `index` (now full and computed) in the prefix cache.
+    pub fn register_block(&mut self, seq: SeqId, index: usize, hash: u64) {
+        if let Some(&b) = self.tables.get(&seq).and_then(|t| t.blocks.get(index)) {
+            self.alloc.register(b, hash);
         }
     }
 
@@ -248,6 +386,32 @@ impl BlockManager {
             if std::mem::replace(&mut in_free[b as usize], true) {
                 return Err(format!("block {b} is on the free list twice"));
             }
+            if self.alloc.hash_of[b as usize].is_some() {
+                return Err(format!("free block {b} is still registered"));
+            }
+        }
+        for (&t, &b) in &self.alloc.evictable {
+            if std::mem::replace(&mut in_free[b as usize], true) {
+                return Err(format!(
+                    "block {b} is both free and evictable, or evictable twice"
+                ));
+            }
+            if self.alloc.evict_tick[b as usize] != Some(t)
+                || self.alloc.hash_of[b as usize].is_none()
+            {
+                return Err(format!("evictable block {b} has stale bookkeeping"));
+            }
+        }
+        for (&h, &b) in &self.alloc.cached {
+            if self.alloc.hash_of[b as usize] != Some(h) {
+                return Err(format!(
+                    "cache maps {h:x} to block {b}, which holds {:?}",
+                    self.alloc.hash_of[b as usize]
+                ));
+            }
+        }
+        if self.alloc.hash_of.iter().flatten().count() != self.alloc.cached.len() {
+            return Err("registered blocks and cache entries disagree".into());
         }
         for b in 0..n {
             let rc = self.alloc.refcounts[b];
@@ -259,7 +423,7 @@ impl BlockManager {
             }
             if (rc == 0) != in_free[b] {
                 return Err(format!(
-                    "block {b}: refcount {rc}, on free list: {}",
+                    "block {b}: refcount {rc}, free or evictable: {}",
                     in_free[b]
                 ));
             }
@@ -332,11 +496,60 @@ mod tests {
         assert_eq!(m.blocks_needed(1, 9), 1);
     }
 
+    #[test]
+    fn freed_registered_blocks_stay_cached_until_needed() {
+        let mut m = BlockManager::new(4, 2);
+        let tokens = [1, 2, 3, 4, 5];
+        let hashes = block_hashes(&tokens, 2);
+        assert_eq!(hashes.len(), 2);
+        m.reserve(1, 5).unwrap();
+        m.register_block(1, 0, hashes[0]);
+        m.register_block(1, 1, hashes[1]);
+        m.free(1);
+        assert_eq!((m.num_free_blocks(), m.num_cached_blocks()), (4, 2));
+        // Same prefix: both blocks come back without allocating.
+        assert_eq!(m.prefix_match(&hashes), (2, 2));
+        assert_eq!(m.adopt_prefix(2, &hashes), 2);
+        assert_eq!((m.num_free_blocks(), m.num_cached_blocks()), (2, 0));
+        m.free(2);
+        // A different sequence that needs every block evicts the cache, oldest first.
+        m.reserve(3, 8).unwrap();
+        assert_eq!(m.num_cached_blocks(), 0);
+        assert_eq!(m.prefix_match(&hashes), (0, 0));
+    }
+
+    #[test]
+    fn prefix_hashes_cover_everything_before() {
+        let a = block_hashes(&[1, 2, 3, 4], 2);
+        let b = block_hashes(&[9, 9, 3, 4], 2);
+        assert_ne!(a[1], b[1], "same block, different prefix");
+        assert_eq!(block_hashes(&[1, 2, 3], 2), a[..1]);
+    }
+
     #[derive(Debug, Clone)]
     enum Op {
-        Reserve { seq: SeqId, extra: usize },
-        Fork { parent: SeqId, child: SeqId },
-        Free { seq: SeqId },
+        Reserve {
+            seq: SeqId,
+            extra: usize,
+        },
+        Fork {
+            parent: SeqId,
+            child: SeqId,
+        },
+        Free {
+            seq: SeqId,
+        },
+        /// Register every full block of `seq` under hashes derived from `salt`.
+        Register {
+            seq: SeqId,
+            salt: u64,
+        },
+        /// Start `seq` from cached blocks of `salt`'s hash chain.
+        Adopt {
+            seq: SeqId,
+            salt: u64,
+            blocks: usize,
+        },
     }
 
     fn op() -> impl Strategy<Value = Op> {
@@ -344,6 +557,8 @@ mod tests {
             4 => (0..6u64, 1..20usize).prop_map(|(seq, extra)| Op::Reserve { seq, extra }),
             1 => (0..6u64, 0..6u64).prop_map(|(parent, child)| Op::Fork { parent, child }),
             2 => (0..6u64).prop_map(|seq| Op::Free { seq }),
+            2 => (0..6u64, 0..3u64).prop_map(|(seq, salt)| Op::Register { seq, salt }),
+            2 => (0..6u64, 0..3u64, 1..4usize).prop_map(|(seq, salt, blocks)| Op::Adopt { seq, salt, blocks }),
         ]
     }
 
@@ -381,6 +596,20 @@ mod tests {
                         }
                     }
                     Op::Free { seq } => m.free(seq),
+                    Op::Register { seq, salt } => {
+                        if let Some(t) = m.table(seq).cloned() {
+                            for i in 0..t.num_tokens / bs {
+                                m.register_block(seq, i, salt * 100 + i as u64);
+                            }
+                        }
+                    }
+                    Op::Adopt { seq, salt, blocks } => {
+                        if !m.contains(seq) {
+                            let hashes: Vec<u64> = (0..blocks as u64).map(|i| salt * 100 + i).collect();
+                            let (want, _) = m.prefix_match(&hashes);
+                            prop_assert_eq!(m.adopt_prefix(seq, &hashes), want);
+                        }
+                    }
                 }
                 prop_assert_eq!(m.check_invariants(), Ok(()));
             }

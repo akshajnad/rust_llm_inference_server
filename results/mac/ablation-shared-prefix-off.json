@@ -1,0 +1,128 @@
+{
+  "provenance": {
+    "label": "shared system prompt, prefix caching off",
+    "engine": "rlis",
+    "model": "Llama-3.2-1B-Instruct",
+    "quantization": "Q8_0",
+    "gpu": "Apple M4 Pro (20 GPU cores)",
+    "gpu_driver": "Metal 4 (macOS 26.6.2)",
+    "os": "Darwin 25.6.0 arm64",
+    "commit": "f48b2ae-dirty",
+    "timestamp": "2026-10-27T23:08:30Z"
+  },
+  "prompts": "bench/prompts.json",
+  "prompt_count": 256,
+  "levels": [
+    {
+      "mode": "concurrency",
+      "value": 4.0,
+      "requests": 16,
+      "errors": 0,
+      "first_error": null,
+      "duration_s": 14.49269225,
+      "output_tokens": 2787,
+      "throughput_tok_s": 192.30381435857785,
+      "request_throughput": 1.1040046751837982,
+      "ttft_ms": {
+        "p50": 172.73825000000002,
+        "p90": 735.631666,
+        "p99": 735.647375,
+        "mean": 285.32319287499996
+      },
+      "itl_ms": {
+        "p50": 16.505459000000002,
+        "p90": 17.186334000000002,
+        "p99": 142.06329200000002,
+        "mean": 18.53254720028866
+      },
+      "tpot_ms": {
+        "p50": 18.351567499999998,
+        "p90": 20.704875,
+        "p99": 22.703705508474577,
+        "mean": 18.273589022679463
+      },
+      "e2e_ms": {
+        "p50": 2729.341875,
+        "p90": 7461.706625,
+        "p99": 9597.548084,
+        "mean": 3494.928711125
+      },
+      "footprint_peak_bytes": 3031435088,
+      "footprint_mean_bytes": 2646186467
+    },
+    {
+      "mode": "concurrency",
+      "value": 16.0,
+      "requests": 64,
+      "errors": 0,
+      "first_error": null,
+      "duration_s": 33.837079458,
+      "output_tokens": 10337,
+      "throughput_tok_s": 305.4932684964941,
+      "request_throughput": 1.891416192684108,
+      "ttft_ms": {
+        "p50": 325.66979200000003,
+        "p90": 2016.524167,
+        "p99": 2654.748,
+        "mean": 627.668029984375
+      },
+      "itl_ms": {
+        "p50": 25.950457999999998,
+        "p90": 27.953708000000002,
+        "p99": 372.13233299999996,
+        "mean": 40.93779275313912
+      },
+      "tpot_ms": {
+        "p50": 44.36242977358491,
+        "p90": 49.993672155038766,
+        "p99": 136.69839085714287,
+        "mean": 44.092218925493384
+      },
+      "e2e_ms": {
+        "p50": 5749.1020419999995,
+        "p90": 13780.673084,
+        "p99": 24395.877541,
+        "mean": 7198.823419875001
+      },
+      "footprint_peak_bytes": 3061122920,
+      "footprint_mean_bytes": 2717618998
+    },
+    {
+      "mode": "concurrency",
+      "value": 32.0,
+      "requests": 128,
+      "errors": 0,
+      "first_error": null,
+      "duration_s": 48.226891958,
+      "output_tokens": 20124,
+      "throughput_tok_s": 417.27756409278163,
+      "request_throughput": 2.654120860856492,
+      "ttft_ms": {
+        "p50": 409.642834,
+        "p90": 3605.5955,
+        "p99": 5536.264458,
+        "mean": 1009.6675358437494
+      },
+      "itl_ms": {
+        "p50": 32.280167,
+        "p90": 174.319625,
+        "p99": 505.54616699999997,
+        "mean": 64.73864219123823
+      },
+      "tpot_ms": {
+        "p50": 67.31444642857143,
+        "p90": 84.59132051153846,
+        "p99": 129.60772396875,
+        "mean": 68.12202327066896
+      },
+      "e2e_ms": {
+        "p50": 9905.614459,
+        "p90": 19505.12975,
+        "p99": 33440.878583,
+        "mean": 11123.057295656254
+      },
+      "footprint_peak_bytes": 3088009088,
+      "footprint_mean_bytes": 2785802985
+    }
+  ]
+}

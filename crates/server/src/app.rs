@@ -50,6 +50,8 @@ async fn health(State(st): State<AppState>) -> Response {
         "queued": st.engine.queue_depth(),
         "preemptions": st.engine.stats().preemptions.load(Ordering::Relaxed),
         "kv_cache_utilization": st.engine.kv_utilization(),
+        "prefix_cache_hit_tokens": st.engine.stats().cached_tokens.load(Ordering::Relaxed),
+        "admitted_tokens": st.engine.stats().admitted_tokens.load(Ordering::Relaxed),
     });
     let status = if st.engine.is_alive() {
         axum::http::StatusCode::OK

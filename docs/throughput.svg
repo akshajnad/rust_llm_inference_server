@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 460" font-family="system-ui, -apple-system, sans-serif" font-size="12">
+<rect width="760" height="460" fill="white"/>
+<text x="78" y="26" font-size="16" font-weight="600" fill="#0f172a">Output throughput vs concurrency (Llama 3.2 1B Q8_0, M4 Pro)</text>
+<line x1="78" x2="736" y1="402.0" y2="402.0" stroke="#e2e8f0"/><text x="70" y="406.0" text-anchor="end" fill="#475569">0</text>
+<line x1="78" x2="736" y1="343.0" y2="343.0" stroke="#e2e8f0"/><text x="70" y="347.0" text-anchor="end" fill="#475569">100</text>
+<line x1="78" x2="736" y1="284.0" y2="284.0" stroke="#e2e8f0"/><text x="70" y="288.0" text-anchor="end" fill="#475569">200</text>
+<line x1="78" x2="736" y1="225.0" y2="225.0" stroke="#e2e8f0"/><text x="70" y="229.0" text-anchor="end" fill="#475569">300</text>
+<line x1="78" x2="736" y1="166.0" y2="166.0" stroke="#e2e8f0"/><text x="70" y="170.0" text-anchor="end" fill="#475569">400</text>
+<line x1="78" x2="736" y1="107.0" y2="107.0" stroke="#e2e8f0"/><text x="70" y="111.0" text-anchor="end" fill="#475569">500</text>
+<line x1="78" x2="736" y1="48.0" y2="48.0" stroke="#e2e8f0"/><text x="70" y="52.0" text-anchor="end" fill="#475569">600</text>
+<line x1="78.0" x2="78.0" y1="48" y2="402" stroke="#f1f5f9"/><text x="78.0" y="420" text-anchor="middle" fill="#475569">1</text>
+<line x1="187.7" x2="187.7" y1="48" y2="402" stroke="#f1f5f9"/><text x="187.7" y="420" text-anchor="middle" fill="#475569">2</text>
+<line x1="297.3" x2="297.3" y1="48" y2="402" stroke="#f1f5f9"/><text x="297.3" y="420" text-anchor="middle" fill="#475569">4</text>
+<line x1="407.0" x2="407.0" y1="48" y2="402" stroke="#f1f5f9"/><text x="407.0" y="420" text-anchor="middle" fill="#475569">8</text>
+<line x1="516.7" x2="516.7" y1="48" y2="402" stroke="#f1f5f9"/><text x="516.7" y="420" text-anchor="middle" fill="#475569">16</text>
+<line x1="626.3" x2="626.3" y1="48" y2="402" stroke="#f1f5f9"/><text x="626.3" y="420" text-anchor="middle" fill="#475569">32</text>
+<line x1="736.0" x2="736.0" y1="48" y2="402" stroke="#f1f5f9"/><text x="736.0" y="420" text-anchor="middle" fill="#475569">64</text>
+<line x1="78" x2="736" y1="402" y2="402" stroke="#94a3b8"/>
+<text x="407" y="446" text-anchor="middle" fill="#334155">concurrent requests</text>
+<text transform="translate(18,225) rotate(-90)" text-anchor="middle" fill="#334155">output throughput (tok/s)</text>
+<polyline fill="none" stroke="#2563eb" stroke-width="2.2" points="78.0,330.9 297.3,275.9 516.7,189.1 626.3,93.0 736.0,72.1"/>
+<circle cx="78.0" cy="330.9" r="3.6" fill="#2563eb"/>
+<circle cx="297.3" cy="275.9" r="3.6" fill="#2563eb"/>
+<circle cx="516.7" cy="189.1" r="3.6" fill="#2563eb"/>
+<circle cx="626.3" cy="93.0" r="3.6" fill="#2563eb"/>
+<circle cx="736.0" cy="72.1" r="3.6" fill="#2563eb"/>
+<rect x="92" y="56" width="14" height="3" fill="#2563eb"/><text x="112" y="60" fill="#0f172a">rlis (Q8_0)</text>
+<polyline fill="none" stroke="#ea580c" stroke-width="2.2" points="78.0,317.3 297.3,173.3 516.7,124.8 626.3,97.7 736.0,126.3"/>
+<circle cx="78.0" cy="317.3" r="3.6" fill="#ea580c"/>
+<circle cx="297.3" cy="173.3" r="3.6" fill="#ea580c"/>
+<circle cx="516.7" cy="124.8" r="3.6" fill="#ea580c"/>
+<circle cx="626.3" cy="97.7" r="3.6" fill="#ea580c"/>
+<circle cx="736.0" cy="126.3" r="3.6" fill="#ea580c"/>
+<rect x="92" y="74" width="14" height="3" fill="#ea580c"/><text x="112" y="78" fill="#0f172a">llama.cpp (Q8_0)</text>
+</svg>
