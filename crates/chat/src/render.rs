@@ -1,23 +1,25 @@
-//! Formats a streamed reply for the terminal as it arrives: word wrapping under a hanging
-//! indent, plus the Markdown a small model actually writes (headings, bullets, **bold**,
+//! Formats a streamed reply for the terminal as it arrives: word wrapping beside the
+//! transcript's gutter, under a hanging indent, plus the Markdown a small model actually writes (headings, bullets, **bold**,
 //! `code` and fenced blocks).
 
 use std::mem;
 
-use crossterm::style::{Attribute, Color, ContentStyle};
+use crossterm::style::{Attribute, Color, ContentStyle, Stylize};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::ACCENT;
 
-/// Column where reply text starts, after the `⏺ ` bullet.
-pub const INDENT: usize = 2;
-const CODE: Color = Color::AnsiValue(153);
+/// Column where transcript text starts, after a speaker's label and bar (` rlis │ `).
+pub const INDENT: usize = 8;
+const CODE: Color = Color::AnsiValue(179);
 
 pub struct Renderer {
     /// Text never reaches the last column, so the cursor never sits in the terminal's
     /// pending-wrap state.
     width: usize,
     col: usize,
+    /// Starts every line after the first, which the caller labels.
+    gutter: String,
     /// Where wrapped lines continue: under the text of a list item, else at `INDENT`.
     hang: usize,
     out: String,
@@ -43,6 +45,7 @@ impl Renderer {
         Self {
             width: term_width.saturating_sub(1).max(INDENT + 16),
             col: INDENT,
+            gutter: format!("{}{} ", " ".repeat(INDENT - 2), "│".with(ACCENT)),
             hang: INDENT,
             out: String::new(),
             word: String::new(),
@@ -153,7 +156,7 @@ impl Renderer {
                 self.spaces = 0;
                 return;
             }
-            if word == "*" || word == "-" || word == "+" {
+            if word == "*" || word == "-" || word == "+" || word == "•" {
                 word = "•".to_string();
                 list_item = true;
             }
@@ -179,7 +182,7 @@ impl Renderer {
             self.emit(&s, st);
         }
         if list_item {
-            self.hang = (self.col + 1).min(self.width / 2);
+            self.hang = (self.col + 1).min(INDENT + (self.width - INDENT) / 2);
         }
     }
 
@@ -243,8 +246,10 @@ impl Renderer {
         }
         if self.newlines > 0 {
             // At most one blank line between paragraphs.
-            self.out.push_str(&"\r\n".repeat(self.newlines.min(2)));
-            self.out.push_str(&" ".repeat(INDENT));
+            for _ in 0..self.newlines.min(2) {
+                self.out.push_str("\r\n");
+                self.out.push_str(&self.gutter);
+            }
             self.col = INDENT;
             self.hang = INDENT;
             self.newlines = 0;
@@ -253,7 +258,8 @@ impl Renderer {
 
     fn break_line(&mut self) {
         self.out.push_str("\r\n");
-        self.out.push_str(&" ".repeat(self.hang));
+        self.out.push_str(&self.gutter);
+        self.out.push_str(&" ".repeat(self.hang - INDENT));
         self.col = self.hang;
     }
 }
@@ -293,14 +299,18 @@ mod tests {
     }
 
     #[test]
-    fn wraps_words_under_the_indent() {
+    fn wraps_words_beside_the_gutter() {
         let lines = plain(
             &["The sky", " is blue because", " of Rayleigh scattering."],
-            22,
+            28,
         );
         assert_eq!(
             lines,
-            ["The sky is blue", "  because of Rayleigh", "  scattering."]
+            [
+                "The sky is blue",
+                "      │ because of Rayleigh",
+                "      │ scattering."
+            ]
         );
     }
 
@@ -308,17 +318,17 @@ mod tests {
     fn hangs_list_items_under_their_text() {
         let lines = plain(
             &["Steps:\n- one two three four\n12. five six seven\nend"],
-            18,
+            24,
         );
         assert_eq!(
             lines,
             [
                 "Steps:",
-                "  • one two three",
-                "    four",
-                "  12. five six",
-                "      seven",
-                "  end"
+                "      │ • one two three",
+                "      │   four",
+                "      │ 12. five six",
+                "      │     seven",
+                "      │ end"
             ]
         );
     }
@@ -336,12 +346,12 @@ mod tests {
             lines,
             [
                 "Why",
-                "",
-                "  How",
-                "  It is really blue.",
-                "  • one",
-                "  let x = 1;",
-                "  Done"
+                "      │ ",
+                "      │ How",
+                "      │ It is really blue.",
+                "      │ • one",
+                "      │ let x = 1;",
+                "      │ Done"
             ]
         );
     }

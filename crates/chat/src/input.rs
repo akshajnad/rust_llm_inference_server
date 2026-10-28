@@ -1,5 +1,6 @@
-//! The prompt box: a multi-line editor drawn inline under the transcript and redrawn in place on
-//! every keystroke, with history and slash-command completion.
+//! The prompt: a rule carrying the session's settings, a multi-line editor under it, and a hint
+//! line or slash-command menu below, drawn inline under the transcript and redrawn in place on
+//! every keystroke.
 
 use std::io::Write;
 use std::mem;
@@ -8,14 +9,32 @@ use anyhow::Result;
 use crossterm::cursor::{MoveToColumn, MoveUp};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::queue;
-use crossterm::style::Stylize;
+use crossterm::style::{Color, Stylize};
 use crossterm::terminal::{self, Clear, ClearType};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::ACCENT;
+use crate::{ACCENT, USER};
 
-const PLACEHOLDER: &str = "Try \"how does a paged KV cache work?\"";
-const HINT: &str = "enter to send · \\ then enter for a new line · /help for commands";
+/// A slash command: its name, its argument (empty if none) and what it does.
+pub type Command = (&'static str, &'static str, &'static str);
+
+const PLACEHOLDER: &str = "Ask anything, or type / for commands";
+const KEYS: &[(&str, &str)] = &[
+    ("enter", "send"),
+    ("\\ enter", "new line"),
+    ("/", "commands"),
+    ("↑", "history"),
+    ("ctrl-c ×2", "quit"),
+];
+const MENU_KEYS: &[(&str, &str)] = &[
+    ("↑↓", "choose"),
+    ("tab", "complete"),
+    ("enter", "run"),
+    ("esc", "cancel"),
+];
+/// " › " before the first line of text.
+const PROMPT_W: usize = 3;
+const KEY: Color = Color::AnsiValue(250);
 
 pub enum Input {
     Line(String),
@@ -29,7 +48,11 @@ enum Action {
 }
 
 pub struct Editor {
-    commands: &'static [(&'static str, &'static str)],
+    commands: &'static [Command],
+    /// Shown in the rule above the text.
+    status: String,
+    /// The highlighted entry of the command menu.
+    selected: usize,
     history: Vec<String>,
     buf: Vec<char>,
     cursor: usize,
@@ -42,9 +65,11 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(commands: &'static [(&'static str, &'static str)]) -> Self {
+    pub fn new(commands: &'static [Command]) -> Self {
         Self {
             commands,
+            status: String::new(),
+            selected: 0,
             history: Vec::new(),
             buf: Vec::new(),
             cursor: 0,
@@ -55,9 +80,11 @@ impl Editor {
         }
     }
 
-    /// Draws the box at the cursor and edits until the user sends a line or quits; the box is
-    /// erased before returning.
-    pub fn read(&mut self, out: &mut impl Write) -> Result<Input> {
+    /// Draws the prompt at the cursor, with `status` in its rule, and edits until the user sends
+    /// a line or quits; the prompt is erased before returning.
+    pub fn read(&mut self, out: &mut impl Write, status: &str) -> Result<Input> {
+        self.status = status.to_string();
+        self.selected = 0;
         self.buf.clear();
         self.cursor = 0;
         self.browsing = None;
@@ -65,6 +92,7 @@ impl Editor {
         self.cursor_row = 0;
         loop {
             self.draw(out)?;
+            let before = self.buf.clone();
             let action = match event::read()? {
                 Event::Key(k) if k.kind != KeyEventKind::Release => self.key(k),
                 Event::Paste(s) => {
@@ -73,6 +101,9 @@ impl Editor {
                 }
                 _ => Action::Edit,
             };
+            if self.buf != before {
+                self.selected = 0;
+            }
             match action {
                 Action::Edit => {}
                 Action::Submit => {
@@ -172,9 +203,8 @@ impl Editor {
         if text.trim().is_empty() {
             return Action::Edit;
         }
-        if is_command_prefix(&text)
-            && !self.commands.iter().any(|(c, _)| *c == text)
-            && let Some((c, _)) = self.matches(&text).first()
+        if !self.commands.iter().any(|(c, _, _)| *c == text)
+            && let Some((c, _, _)) = self.menu().get(self.selected)
         {
             self.set(c.chars().collect());
         }
@@ -182,19 +212,35 @@ impl Editor {
     }
 
     fn complete(&mut self) {
-        let text = self.text();
-        if is_command_prefix(&text)
-            && let Some((c, _)) = self.matches(&text).first()
-        {
+        if let Some((c, _, _)) = self.menu().get(self.selected) {
             self.set(format!("{c} ").chars().collect());
         }
     }
 
-    fn matches(&self, prefix: &str) -> Vec<&(&'static str, &'static str)> {
+    /// The commands matching a partly typed one; empty unless the text is a command prefix.
+    fn menu(&self) -> Vec<&'static Command> {
+        let text = self.text();
+        if !is_command_prefix(&text) {
+            return Vec::new();
+        }
         self.commands
             .iter()
-            .filter(|(c, _)| c.starts_with(prefix))
+            .filter(|(c, _, _)| c.starts_with(&text))
             .collect()
+    }
+
+    /// Moves the menu highlight, wrapping around; false if no menu is open.
+    fn step_menu(&mut self, forward: bool) -> bool {
+        let n = self.menu().len();
+        if n == 0 || self.browsing.is_some() {
+            return false;
+        }
+        self.selected = if forward {
+            (self.selected + 1) % n
+        } else {
+            (self.selected + n - 1) % n
+        };
+        true
     }
 
     fn insert(&mut self, s: &str) {
@@ -235,8 +281,12 @@ impl Editor {
             .map_or(self.buf.len(), |p| i + p)
     }
 
-    /// Up moves within a multi-line message, and through history from its first line.
+    /// Up moves through the command menu when it is open, within a multi-line message, and
+    /// through history from its first line.
     fn up(&mut self) {
+        if self.step_menu(false) {
+            return;
+        }
         let start = self.line_start(self.cursor);
         if start == 0 {
             let i = match self.browsing {
@@ -258,6 +308,9 @@ impl Editor {
     }
 
     fn down(&mut self) {
+        if self.step_menu(true) {
+            return;
+        }
         let end = self.line_end(self.cursor);
         if end == self.buf.len() {
             let Some(i) = self.browsing else { return };
@@ -306,35 +359,23 @@ impl Editor {
 
     fn draw(&mut self, out: &mut impl Write) -> Result<()> {
         let width = terminal::size().map_or(80, |(w, _)| w as usize).max(24);
-        // "│ > " before the text and " │" after it.
-        let text_w = width - 6;
+        // The last column stays empty so the cursor never wraps early.
+        let text_w = width - PROMPT_W - 1;
         let (rows, (row, col)) = layout(&self.buf, self.cursor, text_w);
-        let mut lines = vec![
-            format!("╭{}╮", "─".repeat(width - 2))
-                .dark_grey()
-                .to_string(),
-        ];
+        let mut lines = vec![self.rule(width)];
         for (i, r) in rows.iter().enumerate() {
-            let prefix = if i == 0 { "> " } else { "  " };
-            let (content, w) = if self.buf.is_empty() {
-                let p = truncate(PLACEHOLDER, text_w);
-                let w = p.width();
-                (p.dark_grey().to_string(), w)
+            let prefix = if i == 0 {
+                format!(" {} ", "›".with(USER).bold())
             } else {
-                (r.clone(), r.width())
+                " ".repeat(PROMPT_W)
             };
-            lines.push(format!(
-                "{} {prefix}{content}{} {}",
-                "│".dark_grey(),
-                " ".repeat(text_w.saturating_sub(w)),
-                "│".dark_grey()
-            ));
+            let content = if self.buf.is_empty() {
+                truncate(PLACEHOLDER, text_w).dark_grey().to_string()
+            } else {
+                r.clone()
+            };
+            lines.push(format!("{prefix}{content}"));
         }
-        lines.push(
-            format!("╰{}╯", "─".repeat(width - 2))
-                .dark_grey()
-                .to_string(),
-        );
         lines.extend(self.hints(width));
 
         self.erase(out)?;
@@ -344,44 +385,84 @@ impl Editor {
         if up > 0 {
             queue!(out, MoveUp(up as u16))?;
         }
-        queue!(out, MoveToColumn((4 + col) as u16))?;
+        queue!(out, MoveToColumn((PROMPT_W + col) as u16))?;
         self.cursor_row = target;
         out.flush()?;
         Ok(())
     }
 
-    fn hints(&self, width: usize) -> Vec<String> {
-        let text = self.text();
-        if is_command_prefix(&text) {
-            let matches = self.matches(&text);
-            if !matches.is_empty() {
-                return matches
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (c, d))| {
-                        let name = format!("{c:<10}");
-                        let d = truncate(d, width.saturating_sub(15));
-                        if i == 0 {
-                            format!("  {}  {d}", name.with(ACCENT))
-                        } else {
-                            format!("  {}  {}", name.dark_grey(), d.dark_grey())
-                        }
-                    })
-                    .collect();
-            }
-        }
-        let hint = if self.exit_armed {
-            "Press Ctrl-C again to exit"
-        } else {
-            HINT
-        };
-        vec![format!(
-            "  {}",
-            truncate(hint, width.saturating_sub(3)).dark_grey()
-        )]
+    /// A horizontal rule with the status near its right end.
+    fn rule(&self, width: usize) -> String {
+        let parts: Vec<&str> = self.status.split(" · ").collect();
+        let status = fit(&parts, width.saturating_sub(10));
+        let left = (width - 1).saturating_sub(status.width() + 5);
+        format!(
+            "{} {} {}",
+            "─".repeat(left).dark_grey(),
+            status.dark_grey(),
+            "───".dark_grey()
+        )
     }
 
-    /// Moves to the top of the drawn box and clears it.
+    fn hints(&self, width: usize) -> Vec<String> {
+        let menu = self.menu();
+        if !menu.is_empty() {
+            let label = |(c, a, _): &Command| {
+                if a.is_empty() {
+                    c.to_string()
+                } else {
+                    format!("{c} {a}")
+                }
+            };
+            let label_w = menu.iter().map(|c| label(c).width()).max().unwrap_or(0);
+            let mut lines: Vec<String> = menu
+                .iter()
+                .enumerate()
+                .map(|(i, &cmd)| {
+                    let (c, a, d) = cmd;
+                    let pad = " ".repeat(label_w - label(cmd).width() + 2);
+                    let d = truncate(d, width.saturating_sub(label_w + 6));
+                    let a = if a.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {a}")
+                    };
+                    if i == self.selected {
+                        format!(
+                            " {} {}{}{pad}{d}",
+                            "▸".with(ACCENT),
+                            c.with(ACCENT).bold(),
+                            a.with(ACCENT)
+                        )
+                    } else {
+                        format!("   {c}{}{pad}{}", a.dark_grey(), d.dark_grey())
+                    }
+                })
+                .collect();
+            lines.push(keys(MENU_KEYS, width));
+            return lines;
+        }
+        let text = self.text();
+        if let Some((name, rest)) = text.split_once(char::is_whitespace)
+            && rest.trim().is_empty()
+            && let Some((c, a, d)) = self.commands.iter().find(|(c, _, _)| *c == name)
+            && !a.is_empty()
+        {
+            let d = truncate(d, width.saturating_sub(c.width() + a.width() + 8));
+            return vec![format!(
+                "   {} {}  {}",
+                c.with(ACCENT),
+                a.with(ACCENT),
+                d.dark_grey()
+            )];
+        }
+        if self.exit_armed {
+            return vec![format!("   {}", "press ctrl-c again to quit".yellow())];
+        }
+        vec![keys(KEYS, width)]
+    }
+
+    /// Moves to the top of the drawn prompt and clears it.
     fn erase(&mut self, out: &mut impl Write) -> Result<()> {
         if self.cursor_row > 0 {
             queue!(out, MoveUp(self.cursor_row as u16))?;
@@ -397,6 +478,44 @@ fn is_command_prefix(text: &str) -> bool {
     text.starts_with('/') && !text.contains(char::is_whitespace)
 }
 
+/// Key-and-action pairs on one line, dropping those that do not fit.
+fn keys(pairs: &[(&str, &str)], width: usize) -> String {
+    let mut line = "  ".to_string();
+    let mut w = 2;
+    for (i, (k, d)) in pairs.iter().enumerate() {
+        let sep = if i == 0 { " " } else { " · " };
+        let add = sep.width() + k.width() + 1 + d.width();
+        if w + add >= width {
+            break;
+        }
+        line.push_str(&format!(
+            "{}{} {}",
+            sep.dark_grey(),
+            k.with(KEY),
+            d.dark_grey()
+        ));
+        w += add;
+    }
+    line
+}
+
+/// Joins `parts` with ` · `, leaving off trailing ones that would not fit in `width` columns.
+pub fn fit(parts: &[impl AsRef<str>], width: usize) -> String {
+    let mut line = String::new();
+    for (i, p) in parts.iter().enumerate() {
+        let next = if i == 0 {
+            p.as_ref().to_string()
+        } else {
+            format!("{line} · {}", p.as_ref())
+        };
+        if next.width() > width {
+            break;
+        }
+        line = next;
+    }
+    line
+}
+
 fn truncate(s: &str, width: usize) -> String {
     let mut w = 0;
     s.chars()
@@ -409,7 +528,7 @@ fn truncate(s: &str, width: usize) -> String {
 
 /// Wraps the buffer into rows at most `width` columns wide; returns them with the cursor's
 /// (row, column).
-fn layout(buf: &[char], cursor: usize, width: usize) -> (Vec<String>, (usize, usize)) {
+pub fn layout(buf: &[char], cursor: usize, width: usize) -> (Vec<String>, (usize, usize)) {
     let mut rows = vec![String::new()];
     let mut col = 0;
     let mut at = (0, 0);
@@ -483,11 +602,30 @@ mod tests {
     }
 
     #[test]
+    fn fits_whole_parts() {
+        assert_eq!(
+            fit(&["model", "temp 0.6", "new chat"], 16),
+            "model · temp 0.6"
+        );
+        assert_eq!(fit(&["model", "temp 0.6"], 3), "");
+    }
+
+    #[test]
     fn completes_commands_on_enter() {
-        let mut e = Editor::new(&[("/clear", ""), ("/help", "")]);
+        let mut e = Editor::new(&[("/clear", "", ""), ("/help", "", "")]);
         e.set(chars("/cl"));
         assert!(matches!(e.enter(), Action::Submit));
         assert_eq!(e.text(), "/clear");
+        // Arrows move through the menu, wrapping around.
+        e.set(chars("/"));
+        e.down();
+        assert!(matches!(e.enter(), Action::Submit));
+        assert_eq!(e.text(), "/help");
+        e.set(chars("/"));
+        e.selected = 0;
+        e.up();
+        e.complete();
+        assert_eq!(e.text(), "/help ");
         e.set(chars("line\\"));
         assert!(matches!(e.enter(), Action::Edit));
         assert_eq!(e.text(), "line\n");

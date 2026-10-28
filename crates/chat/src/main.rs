@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -34,34 +34,26 @@ use serde_json::{Value, json};
 use unicode_width::UnicodeWidthStr;
 
 use api::Update;
-use input::{Editor, Input};
-use render::Renderer;
+use input::{Command as SlashCommand, Editor, Input};
+use render::{INDENT, Renderer};
 
-pub const ACCENT: Color = Color::AnsiValue(209);
-const ECHO: Color = Color::AnsiValue(246);
+/// The model's color: its label, the bar beside its replies, headings and the status meter.
+pub const ACCENT: Color = Color::AnsiValue(43);
+/// The user's color: their label and bar, and the prompt marker.
+pub const USER: Color = Color::AnsiValue(141);
 
-const COMMANDS: &[(&str, &str)] = &[
-    ("/clear", "Start a new conversation"),
-    ("/retry", "Regenerate the last reply"),
+const COMMANDS: &[SlashCommand] = &[
+    ("/clear", "", "start a new conversation"),
+    ("/retry", "", "regenerate the last reply"),
     (
         "/system",
-        "Show or set the system prompt (/system none removes it)",
+        "<prompt|none>",
+        "show, set or remove the system prompt",
     ),
-    ("/temp", "Show or set the sampling temperature"),
-    ("/help", "Show commands and keys"),
-    ("/exit", "Quit"),
+    ("/temp", "<0-2>", "show or set the sampling temperature"),
+    ("/help", "", "commands, keys and settings"),
+    ("/exit", "", "quit"),
 ];
-const VERBS: &[&str] = &[
-    "Thinking",
-    "Pondering",
-    "Decoding",
-    "Mulling",
-    "Brewing",
-    "Percolating",
-    "Sampling",
-    "Ruminating",
-];
-const SPINNER: &[&str] = &["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
 
 #[derive(Parser)]
 #[command(
@@ -263,19 +255,15 @@ fn ensure_server(args: &Args) -> Result<Option<Server>> {
             );
         }
         print!(
-            "\r{} {} {}",
-            spinner_glyph(start).with(ACCENT),
-            "Starting rlis server…".with(ACCENT),
-            format!("({}s · loading the model)", start.elapsed().as_secs()).dark_grey()
+            "\r{} {}  {}",
+            meter(start),
+            "starting rlis server".with(ACCENT),
+            format!("{}s · loading the model", start.elapsed().as_secs()).dark_grey()
         );
         out.flush()?;
         thread::sleep(Duration::from_millis(120));
     }
-    print!(
-        "\r\x1b[2K{} {}",
-        spinner_glyph(start).with(ACCENT),
-        "Warming up…".with(ACCENT)
-    );
+    print!("\r\x1b[2K{} {}", meter(start), "warming up".with(ACCENT));
     out.flush()?;
     // The first request after startup compiles GPU pipelines (seconds); pay for it here
     // rather than on the first message.
@@ -287,8 +275,39 @@ fn ensure_server(args: &Args) -> Result<Option<Server>> {
     Ok(Some(server))
 }
 
-fn spinner_glyph(start: Instant) -> &'static str {
-    SPINNER[(start.elapsed().as_millis() / 120) as usize % SPINNER.len()]
+/// A five-cell bar with one lit cell sweeping back and forth.
+fn meter(start: Instant) -> String {
+    const CELLS: usize = 5;
+    let step = (start.elapsed().as_millis() / 90) as usize % (2 * CELLS - 2);
+    let lit = if step < CELLS {
+        step
+    } else {
+        2 * CELLS - 2 - step
+    };
+    (0..CELLS)
+        .map(|i| {
+            if i == lit {
+                "▰".with(ACCENT).to_string()
+            } else {
+                "▱".dark_grey().to_string()
+            }
+        })
+        .collect()
+}
+
+/// A speaker's label, right-aligned, and the bar beside their text: `render::INDENT` wide.
+fn gutter(label: &str, color: Color) -> String {
+    format!(
+        "{} {} ",
+        format!("{label:>w$}", w = INDENT - 3).with(color).bold(),
+        "│".with(color)
+    )
+}
+
+/// Decode speed: tokens after the first over the time since it arrived.
+fn rate(tokens: u64, decode: Duration) -> Option<f64> {
+    let secs = decode.as_secs_f64();
+    (tokens > 1 && secs > 0.0).then(|| (tokens - 1) as f64 / secs)
 }
 
 fn term_width() -> usize {
@@ -324,7 +343,8 @@ impl Chat {
     fn run(&mut self) -> Result<()> {
         self.banner()?;
         loop {
-            let line = match self.editor.read(&mut self.out)? {
+            let status = self.status();
+            let line = match self.editor.read(&mut self.out, &status)? {
                 Input::Line(line) => line,
                 Input::Exit => return Ok(()),
             };
@@ -394,8 +414,9 @@ impl Chat {
         serde_json::to_vec(&body).expect("JSON values serialize")
     }
 
-    /// Streams a reply below the cursor with a live status line under it. Esc or Ctrl-C
-    /// interrupts by closing the connection, which also stops generation on the server.
+    /// Streams a reply below the cursor with a live status line under it: the phase (prefill
+    /// until the first token, then decoding) and speed. Esc or Ctrl-C interrupts by closing the
+    /// connection, which also stops generation on the server.
     fn generate(&mut self) -> Result<Outcome> {
         let (tx, rx) = mpsc::channel();
         let (url, body) = (self.url.clone(), self.body());
@@ -403,10 +424,7 @@ impl Chat {
 
         let width = term_width();
         let mut r = Renderer::new(width);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let verb = VERBS[nanos as usize % VERBS.len()];
+        let label = gutter("rlis", ACCENT);
         let start = Instant::now();
         let mut first_token = None;
         let mut text = String::new();
@@ -453,7 +471,7 @@ impl Chat {
             let s = r.take();
             if !s.is_empty() {
                 if !writing {
-                    write!(self.out, "{} ", "⏺".white())?;
+                    write!(self.out, "{label}")?;
                     writing = true;
                 }
                 self.out.write_all(s.as_bytes())?;
@@ -461,12 +479,12 @@ impl Chat {
             if let Some(e) = ended {
                 break e;
             }
-            let status = status_line(start, verb, pieces, width);
+            let status = status_line(start, first_token, pieces, width - INDENT);
             if writing {
-                write!(self.out, "\r\n{status}")?;
+                write!(self.out, "\r\n{}{status}", gutter("", ACCENT))?;
                 queue!(self.out, MoveUp(1), MoveToColumn(r.col() as u16))?;
             } else {
-                write!(self.out, "{status}")?;
+                write!(self.out, "{label}{status}")?;
                 queue!(self.out, MoveToColumn(0))?;
             }
             self.out.flush()?;
@@ -474,7 +492,7 @@ impl Chat {
 
         let tail = r.finish();
         if !tail.is_empty() && !writing {
-            write!(self.out, "{} ", "⏺".white())?;
+            write!(self.out, "{label}")?;
             writing = true;
         }
         self.out.write_all(tail.as_bytes())?;
@@ -491,27 +509,35 @@ impl Chat {
             });
         }
         if interrupted {
-            self.print(format!("  {}  {}", "⎿".dark_grey(), "Interrupted".red()))?;
+            if !writing {
+                self.print(label.trim_end())?;
+            }
+            let detail = if pieces > 0 {
+                format!(" · {pieces} tokens")
+            } else {
+                String::new()
+            };
+            self.footer(format!("{}{}", "interrupted".yellow(), detail.dark_grey()))?;
         } else if let Some(e) = error {
             if text.is_empty() {
                 return Ok(Outcome::Failed(e));
             }
-            self.error(&e)?;
+            self.footer(e.replace('\n', " ").red())?;
         } else {
             let elapsed = start.elapsed();
             let n = usage.unwrap_or(pieces);
             let mut parts = vec![format!("{n} tokens")];
             if let Some(ttft) = first_token {
-                let decode = elapsed.saturating_sub(ttft).as_secs_f64();
-                if n > 1 && decode > 0.0 {
-                    parts.push(format!("{:.0} tok/s", (n - 1) as f64 / decode));
+                if let Some(tps) = rate(n, elapsed.saturating_sub(ttft)) {
+                    parts.push(format!("{tps:.0} tok/s"));
                 }
                 parts.push(format!("{:.2}s to first token", ttft.as_secs_f64()));
             }
             if finish.as_deref() == Some("length") {
                 parts.push("stopped at the length limit".to_string());
             }
-            self.note(&parts.join(" · "))?;
+            let stats = input::fit(&parts, term_width().saturating_sub(INDENT + 2));
+            self.footer(stats.dark_grey())?;
         }
         Ok(Outcome::Reply(text))
     }
@@ -568,83 +594,136 @@ impl Chat {
     }
 
     fn banner(&mut self) -> Result<()> {
-        let width = term_width().clamp(24, 72);
-        let tip = "/help for commands · esc to interrupt a reply";
-        let rows = [
-            (
-                format!("{} {}", "✻".with(ACCENT), "Welcome to rlis chat".bold()),
-                2 + "Welcome to rlis chat".len(),
-            ),
-            (String::new(), 0),
-            (
-                format!("  {}  {}", "model ".dark_grey(), self.model),
-                10 + self.model.width(),
-            ),
-            (
-                format!("  {}  {}", "server".dark_grey(), self.url),
-                10 + self.url.width(),
-            ),
-            (String::new(), 0),
-            (format!("  {}", tip.dark_grey()), 2 + tip.width()),
+        let width = term_width();
+        // " rlis " and the spaces around it.
+        let room = width.saturating_sub(11 + self.model.width());
+        let url = if self.url.width() < room {
+            self.url.clone()
+        } else {
+            String::new()
+        };
+        self.print("")?;
+        self.print(format!(
+            "  {}  {}  {}",
+            " rlis ".black().on(ACCENT).bold(),
+            self.model.as_str().bold(),
+            url.dark_grey()
+        ))?;
+        let tips = [
+            "local inference chat",
+            "type / for commands",
+            "esc stops a reply",
         ];
-        self.print(format!("╭{}╮", "─".repeat(width - 2)).with(ACCENT))?;
-        for (row, w) in rows {
-            self.print(format!(
-                "{} {row}{} {}",
-                "│".with(ACCENT),
-                " ".repeat((width - 4).saturating_sub(w)),
-                "│".with(ACCENT)
-            ))?;
-        }
-        self.print(format!("╰{}╯", "─".repeat(width - 2)).with(ACCENT))?;
+        let tips = input::fit(&tips, width.saturating_sub(3));
+        self.print(format!("  {}", tips.dark_grey()))?;
         self.print("")
     }
 
+    /// The settings shown in the prompt's rule.
+    fn status(&self) -> String {
+        let mut parts = vec![self.model.clone(), format!("temp {}", self.temperature)];
+        if self.system.is_some() {
+            parts.push("system prompt".to_string());
+        }
+        parts.push(match self.messages.len() {
+            0 => "new chat".to_string(),
+            1 => "1 message".to_string(),
+            n => format!("{n} messages"),
+        });
+        parts.join(" · ")
+    }
+
     fn help(&mut self) -> Result<()> {
-        self.print(format!("  {}", "Commands".bold()))?;
-        for (c, d) in COMMANDS {
-            self.print(format!("    {}  {d}", format!("{c:<10}").with(ACCENT)))?;
+        let pad = " ".repeat(INDENT);
+        self.print(format!("{pad}{}", "commands".with(ACCENT).bold()))?;
+        let label = |c: &str, a: &str| {
+            if a.is_empty() {
+                c.to_string()
+            } else {
+                format!("{c} {a}")
+            }
+        };
+        let w = COMMANDS
+            .iter()
+            .map(|(c, a, _)| label(c, a).width())
+            .max()
+            .unwrap_or(0);
+        for (c, a, d) in COMMANDS {
+            let gap = " ".repeat(w - label(c, a).width() + 3);
+            let a = if a.is_empty() {
+                String::new()
+            } else {
+                format!(" {a}")
+            };
+            self.print(format!(
+                "{pad}  {}{}{gap}{d}",
+                c.with(ACCENT),
+                a.dark_grey()
+            ))?;
         }
         self.print("")?;
-        self.print(format!("  {}", "Keys".bold()))?;
+        self.print(format!("{pad}{}", "keys".with(ACCENT).bold()))?;
         let keys = [
             ("enter", "send"),
             (
                 "\\ then enter",
                 "new line (shift+enter and option+enter work in some terminals)",
             ),
-            ("esc", "interrupt a reply, or clear the input"),
-            ("↑ ↓", "previous messages"),
+            ("esc", "stop a reply, or clear the input"),
+            ("↑ ↓", "previous messages, or move through the / menu"),
             ("tab", "complete a command"),
             ("ctrl-c twice", "quit (or ctrl-d on an empty line)"),
         ];
         for (k, d) in keys {
-            self.print(format!("    {}  {d}", format!("{k:<14}").with(ACCENT)))?;
+            self.print(format!("{pad}  {}  {d}", format!("{k:<14}").with(ACCENT)))?;
         }
         self.print("")?;
         self.note(&format!(
-            "Temperature {} · top-p {} · {} messages in context",
+            "temperature {} · top-p {} · {} messages in context",
             self.temperature,
             self.top_p,
             self.messages.len()
         ))
     }
 
+    /// The user's message beside their label, wrapped to the terminal.
     fn echo(&mut self, line: &str) -> Result<()> {
-        for (i, l) in line.split('\n').enumerate() {
-            let prefix = if i == 0 { "> " } else { "  " };
-            self.print(format!("{prefix}{l}").with(ECHO))?;
+        let width = term_width().max(INDENT + 16) - INDENT - 1;
+        let chars: Vec<char> = line.chars().collect();
+        let (rows, _) = input::layout(&chars, 0, width);
+        for (i, row) in rows.iter().enumerate() {
+            let label = if i == 0 { "you" } else { "" };
+            self.print(format!("{}{row}", gutter(label, USER)))?;
         }
-        self.print("")
+        Ok(())
+    }
+
+    /// Closes a reply under its bar.
+    fn footer(&mut self, s: impl Display) -> Result<()> {
+        self.print(format!(
+            "{}{} {s}",
+            " ".repeat(INDENT - 2),
+            "╰─".with(ACCENT)
+        ))
     }
 
     fn note(&mut self, s: &str) -> Result<()> {
-        self.print(format!("  {}  {}", "⎿".dark_grey(), s.dark_grey()))
+        self.print(format!(
+            "{}{} {}",
+            " ".repeat(INDENT - 2),
+            "◦".dark_grey(),
+            s.dark_grey()
+        ))
     }
 
     fn error(&mut self, s: &str) -> Result<()> {
-        let s = s.replace('\n', "\r\n     ");
-        self.print(format!("  {}  {}", "⎿".dark_grey(), s.red()))
+        let s = s.replace('\n', &format!("\r\n{}", " ".repeat(INDENT)));
+        self.print(format!(
+            "{}{} {}",
+            " ".repeat(INDENT - 2),
+            "✗".red(),
+            s.red()
+        ))
     }
 
     /// Writes a line; raw mode needs the explicit carriage return.
@@ -655,22 +734,32 @@ impl Chat {
     }
 }
 
-fn status_line(start: Instant, verb: &str, pieces: u64, width: usize) -> String {
-    let mut detail = format!("({}s", start.elapsed().as_secs());
-    if pieces > 0 {
-        detail.push_str(&format!(" · ↓ {pieces} tokens"));
-    }
-    detail.push_str(" · esc to interrupt)");
-    let head = format!("{verb}…");
-    let detail = if 2 + head.width() + 1 + detail.width() < width {
-        detail
+/// The phase, a meter and the numbers so far, fitted to `width` columns.
+fn status_line(start: Instant, first_token: Option<Duration>, pieces: u64, width: usize) -> String {
+    let elapsed = start.elapsed();
+    let phase = if first_token.is_some() {
+        "decoding"
     } else {
-        String::new()
+        "prefill"
     };
+    let mut parts = vec![format!("{:.1}s", elapsed.as_secs_f64())];
+    if let Some(ttft) = first_token {
+        parts.push(format!("{pieces} tokens"));
+        if let Some(tps) = rate(pieces, elapsed.saturating_sub(ttft)) {
+            parts.push(format!("{tps:.0} tok/s"));
+        }
+    }
+    parts.push("esc to stop".to_string());
+    let mut detail = parts.join(" · ");
+    // The meter, a space, the phase and two spaces come first.
+    while !parts.is_empty() && 8 + phase.width() + detail.width() >= width {
+        parts.pop();
+        detail = parts.join(" · ");
+    }
     format!(
-        "{} {} {}",
-        spinner_glyph(start).with(ACCENT),
-        head.with(ACCENT),
+        "{} {}  {}",
+        meter(start),
+        phase.with(ACCENT),
         detail.dark_grey()
     )
 }

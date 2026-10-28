@@ -21,8 +21,10 @@ downloaded or built.
 `make chat` opens a chat in the terminal. `make install` puts it on your PATH as `rlis` (a link
 in `~/.cargo/bin` to this build), so from any directory `rlis` opens the chat and `rlis serve`,
 `rlis generate` and `rlis perplexity` run the server binary. `make uninstall` removes the link.
-Replies stream in with Markdown styling (headings, bold, code, lists) and a status
-line, and each one ends with its token count, decode speed and time to first token. If no
+Replies stream in with Markdown styling (headings, bold, code, lists) under a live status
+line (prefill, then decoding with tokens and tok/s so far), and each one ends with its token
+count, decode speed and time to first token. Typing `/` opens a command menu; the rule above
+the prompt shows the model, temperature and conversation length. If no
 server answers at `--url` (default `http://127.0.0.1:8000`), it starts `rlis serve` in the
 background, warms it up so the first reply is fast, and stops it on exit; an already running
 server is used as is. The conversation is kept across turns, and the oldest exchanges are
@@ -41,7 +43,7 @@ dropped when it outgrows the 2,048-token context.
 | enter | send |
 | `\` then enter | new line (shift+enter and option+enter also work in terminals that send them) |
 | esc | interrupt a reply (generation stops on the server too), or clear the input |
-| ↑ ↓ | previous messages |
+| ↑ ↓ | previous messages, or move through the `/` menu |
 | tab | complete a command |
 | ctrl-c twice, or ctrl-d on an empty line | quit |
 
