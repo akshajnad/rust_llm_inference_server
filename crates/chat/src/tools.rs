@@ -5,7 +5,9 @@
 //! - `READ path` lines read files (or list a directory);
 //! - the file's path alone on a line and then a fenced `<<<<<<< SEARCH` / `=======` /
 //!   `>>>>>>> REPLACE` block edits it (aider's format, which Qwen2.5-Coder was tuned on);
-//! - the path and then a fenced block of anything else writes the whole file.
+//! - the path and then a fenced block of anything else writes the whole file. Models also
+//!   write `READ path` and then a fenced block, echoing their own reads: that creates the file
+//!   if it doesn't exist, and reads it (ignoring the block, which is made up) if it does.
 //!
 //! `Reply` reads a reply as it streams in: it hides these requests from the transcript (their
 //! results get cards of their own) and says when a request is complete and the model has gone
@@ -27,6 +29,20 @@ const MAX_PROMPT_FILES: usize = 200;
 /// Directories skipped when listing a directory that is not in a git repository.
 const SKIP_DIRS: &[&str] = &["target", "node_modules", "__pycache__", "venv"];
 
+/// File names without an extension (besides `*file`: `Makefile`, `Dockerfile`, ...) that a
+/// path line may name.
+const EXTENSIONLESS: &[&str] = &[
+    "LICENSE",
+    "README",
+    "CHANGELOG",
+    "NOTICE",
+    "AUTHORS",
+    "CODEOWNERS",
+    "VERSION",
+    "BUILD",
+    "WORKSPACE",
+];
+
 const SEARCH: &str = "<<<<<<< SEARCH";
 const DIVIDER: &str = "=======";
 const REPLACE: &str = ">>>>>>> REPLACE";
@@ -44,6 +60,9 @@ pub enum Request {
     },
     /// The whole file.
     Write { path: String, content: String },
+    /// `READ path` and a fenced block: a new file with this content, or a read of an existing
+    /// one.
+    ReadOrCreate { path: String, content: String },
     /// A request that couldn't be read, with what was wrong, for the model to try again.
     Invalid(String),
 }
@@ -55,7 +74,9 @@ impl Request {
             Request::Read { path, from: 1 } => format!("read {path}"),
             Request::Read { path, from } => format!("read {path}:{from}"),
             Request::Edit { path, .. } => format!("edit {path}"),
-            Request::Write { path, .. } => format!("write {path}"),
+            Request::Write { path, .. } | Request::ReadOrCreate { path, .. } => {
+                format!("write {path}")
+            }
             Request::Invalid(_) => "request".into(),
         }
     }
@@ -75,6 +96,8 @@ struct Block {
     /// Fences opened inside it, as in a Markdown file with code blocks.
     depth: usize,
     lines: Vec<String>,
+    /// Opened by a `READ` line rather than a path alone.
+    after_read: bool,
 }
 
 /// One reply, read as it streams in.
@@ -150,13 +173,8 @@ impl Reply {
             }
         }
         // Lines held to see what follows them: nothing does.
-        for line in std::mem::take(&mut self.held) {
-            if self.last.is_none() {
-                out += &line;
-                out.push('\n');
-                self.text += &line;
-                self.text.push('\n');
-            }
+        if !self.cut && self.block.is_none() {
+            self.decide(&mut out, true);
         }
         out
     }
@@ -191,13 +209,27 @@ impl Reply {
             return;
         }
         self.held.push(line);
-        self.decide(out);
+        self.decide(out, false);
     }
 
-    /// Shows, hides or keeps holding the held lines.
-    fn decide(&mut self, out: &mut String) {
+    /// Shows, hides or keeps holding the held lines; at the `end` of the reply, nothing is
+    /// held any longer.
+    fn decide(&mut self, out: &mut String, end: bool) {
         while let Some(first) = self.held.first() {
             if let Some(read) = read_line(first) {
+                let second = self.held.get(1);
+                if second.is_none() && !end {
+                    return;
+                }
+                if let (Request::Read { path, .. }, Some(fence)) =
+                    (&read, second.and_then(|l| fence_open(l)))
+                {
+                    if self.last == Some(Kind::Read) {
+                        return self.stop();
+                    }
+                    let path = path.clone();
+                    return self.open_block(path, Some(fence), true);
+                }
                 if self.last == Some(Kind::Change) {
                     return self.stop();
                 }
@@ -214,28 +246,16 @@ impl Reply {
                 continue;
             }
             if let Some(path) = path_line(first) {
-                let Some(second) = self.held.get(1) else {
-                    return;
-                };
-                let fence = fence_open(second);
-                if fence.is_some() || second.trim() == SEARCH {
-                    if self.last == Some(Kind::Read) {
-                        return self.stop();
+                match self.held.get(1) {
+                    None if !end => return,
+                    Some(second) if fence_open(second).is_some() || second.trim() == SEARCH => {
+                        if self.last == Some(Kind::Read) {
+                            return self.stop();
+                        }
+                        let fence = fence_open(second);
+                        return self.open_block(path, fence, false);
                     }
-                    // The path and the fence open the block; a bare SEARCH line is its first.
-                    self.keep(if fence.is_some() { 2 } else { 1 });
-                    self.block = Some(Block {
-                        path,
-                        fence,
-                        depth: 0,
-                        lines: Vec::new(),
-                    });
-                    for line in std::mem::take(&mut self.held) {
-                        self.text += &line;
-                        self.text.push('\n');
-                        self.feed(line);
-                    }
-                    return;
+                    _ => {}
                 }
             }
             // Ordinary text; after a request, the model imagining what came of it.
@@ -245,6 +265,24 @@ impl Reply {
             *out += first;
             out.push('\n');
             self.keep(1);
+        }
+    }
+
+    /// Opens a block at the held lines: the path (or `READ` line) and the fence open it; a bare
+    /// SEARCH line is its first.
+    fn open_block(&mut self, path: String, fence: Option<String>, after_read: bool) {
+        self.keep(if fence.is_some() { 2 } else { 1 });
+        self.block = Some(Block {
+            path,
+            fence,
+            depth: 0,
+            lines: Vec::new(),
+            after_read,
+        });
+        for line in std::mem::take(&mut self.held) {
+            self.text += &line;
+            self.text.push('\n');
+            self.feed(line);
         }
     }
 
@@ -307,9 +345,15 @@ impl Reply {
                 if !content.is_empty() {
                     content.push('\n');
                 }
-                Request::Write {
-                    path: b.path,
-                    content,
+                match b.after_read {
+                    true => Request::ReadOrCreate {
+                        path: b.path,
+                        content,
+                    },
+                    false => Request::Write {
+                        path: b.path,
+                        content,
+                    },
                 }
             }
         };
@@ -375,17 +419,19 @@ fn read_line(line: &str) -> Option<Request> {
 }
 
 /// A line that is just a file path, as written before a block: maybe in backticks or bold,
-/// maybe with a colon after it.
+/// maybe with a colon after it. A bare word counts only as a file name that usually has no
+/// extension (`Makefile`, `LICENSE`), so a line like `Example:` before a code block isn't one.
 fn path_line(line: &str) -> Option<String> {
     let t = line
         .trim()
         .trim_end_matches(':')
         .trim_matches(|c| c == '`' || c == '*');
     let t = t.trim_end_matches(':');
+    let bare_name = t.ends_with("file") || EXTENSIONLESS.contains(&t);
     let plausible = !t.is_empty()
         && t.len() < 200
         && !t.contains(char::is_whitespace)
-        && (t.contains('.') || t.contains('/'))
+        && (t.contains('.') || t.contains('/') || bare_name)
         && !t.starts_with(['#', '<', '>', '=', '-', '+'])
         && !t.ends_with('.');
     plausible.then(|| t.to_string())
@@ -490,7 +536,8 @@ impl Workspace {
 To read files, reply with one READ line per file and nothing else:
 READ path/to/file.py
 Their contents come back in the next message. A long file comes in parts: READ \
-path/to/file.py:200 reads from line 200. READ a directory to list its files.
+path/to/file.py:200 reads from line 200. READ a directory to list its files; READ . lists \
+the whole project.
 
 To change part of a file, write the file's path alone on a line, then a fenced \
 SEARCH/REPLACE block: lines copied exactly from the file, indentation included, and the lines \
@@ -507,7 +554,8 @@ path/to/file.py
 
 To create a file, write its path alone on a line, then its whole content in a fenced block.
 
-Read a file before you change it. You are told whether each change was applied. When the task \
+Change only what the user asks for, and nothing when they only ask a question. Read a file \
+before you change it. You are told whether each change was applied. When the task \
 is done, reply with a short summary of what you changed.
 
 An example of a whole task:
@@ -539,6 +587,17 @@ def test_greet():
 User: Applied the change to app/greet.py.
 Created tests/test_greet.py.
 You: greet() now says hello instead of hi, and tests/test_greet.py tests it.
+
+Another example:
+
+User: What does app/greet.py do?
+You: READ app/greet.py
+User: Contents of app/greet.py:
+```
+def greet(name):
+    return \"hi \" + name
+```
+You: It defines greet(name), which returns \"hi \" followed by the name.
 
 Files in the project:
 {listing}",
@@ -577,19 +636,34 @@ Files in the project:
                 let output = format!("Contents of {path}:\n```\n{body}```");
                 Ok(Action::Done { output, summary })
             }
+            Request::ReadOrCreate { path, content } => {
+                let abs = self.resolve(path)?;
+                if !abs.exists() {
+                    let path = path.clone();
+                    let content = content.clone();
+                    return self.run(&Request::Write { path, content });
+                }
+                // The model echoing a file it just wrote, or making up one it wants to read.
+                if self.seen.contains(&abs) && self.read(path)? == recipe_tabs(path, content) {
+                    return Ok(unchanged(path));
+                }
+                let path = path.clone();
+                self.run(&Request::Read { path, from: 1 })
+            }
             Request::Write { path, content } => {
                 let abs = self.resolve(path)?;
                 ensure!(!abs.is_dir(), "{path} is a directory");
                 self.ensure_seen(&abs, path)?;
                 let old = abs.exists().then(|| self.read(path)).transpose()?;
-                if old.as_ref() == Some(content) {
+                let new = recipe_tabs(path, content);
+                if old.as_ref() == Some(&new) {
                     return Ok(unchanged(path));
                 }
                 Ok(Action::Change(Change {
                     path: path.clone(),
                     abs,
                     old,
-                    new: content.clone(),
+                    new,
                 }))
             }
             Request::Edit { path, pairs } => {
@@ -601,6 +675,7 @@ Files in the project:
                          whole content in a fenced block"
                     );
                     let new: String = pairs.iter().map(|(_, r)| r.as_str()).collect();
+                    let new = recipe_tabs(path, &new);
                     return Ok(Action::Change(Change {
                         path: path.clone(),
                         abs,
@@ -631,6 +706,7 @@ Files in the project:
                         ),
                     };
                 }
+                let text = recipe_tabs(path, &text);
                 if text == old {
                     return Ok(unchanged(path));
                 }
@@ -708,6 +784,24 @@ Files in the project:
         files.sort();
         files
     }
+}
+
+/// A makefile's indented lines start with a tab, as make requires; models indent recipes with
+/// spaces. Other files are left as they are.
+fn recipe_tabs(path: &str, text: &str) -> String {
+    let name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !matches!(name.as_str(), "Makefile" | "makefile" | "GNUmakefile") && !name.ends_with(".mk") {
+        return text.to_string();
+    }
+    text.split_inclusive('\n')
+        .map(|l| match l.strip_prefix(' ') {
+            Some(_) if !l.trim().is_empty() => format!("\t{}", l.trim_start_matches(' ')),
+            _ => l.to_string(),
+        })
+        .collect()
 }
 
 fn unchanged(path: &str) -> Action {
@@ -917,7 +1011,7 @@ mod tests {
 
     #[test]
     fn reads_and_cuts_after_them() {
-        let text = "Let me look.\nREAD stats.py\nREAD `src/`\n```python\ndef median(xs):\n";
+        let text = "Let me look.\nREAD stats.py\nREAD `src/`\nstats.py says:\ndef median(xs):\n";
         for n in [1, 3, 100] {
             let (shown, r) = stream(text, n);
             assert_eq!(shown, "Let me look.\n");
@@ -937,6 +1031,29 @@ mod tests {
                 ]
             );
         }
+        // A READ line followed by a fenced block: a file to create (or, if it exists, to read).
+        let text = "READ Makefile\n```make\ntest:\n    python3 -m unittest\n```\n\nREAD NOTES.md\n```\n- notes\n```\nDone.\n";
+        for n in [1, 5, 1000] {
+            let (shown, r) = stream(text, n);
+            assert_eq!(shown, "");
+            assert!(r.cut());
+            assert_eq!(
+                Reply::parse(r.text()),
+                [
+                    Request::ReadOrCreate {
+                        path: "Makefile".into(),
+                        content: "test:\n    python3 -m unittest\n".into()
+                    },
+                    Request::ReadOrCreate {
+                        path: "NOTES.md".into(),
+                        content: "- notes\n".into()
+                    }
+                ]
+            );
+        }
+        // Reads, then made-up contents for one of them: the reads alone.
+        let (_, r) = stream("READ a.py\nREAD b.py\n```python\nx = 1\n```\n", 3);
+        assert_eq!(r.text(), "READ a.py\n");
         assert_eq!(
             Reply::parse("READ a.rs:120"),
             [Request::Read {
@@ -979,6 +1096,8 @@ mod tests {
         let (shown, r) = stream(text, 2);
         assert_eq!(shown, format!("{text}\n"));
         assert!(!r.cut() && Reply::parse(r.text()).is_empty());
+        // A word before a code block is no file name unless it's one without an extension.
+        assert!(Reply::parse("Example:\n```python\nx = 1\n```\n").is_empty());
         // Words stream as they arrive; only a line's first word waits.
         let mut r = Reply::default();
         assert_eq!(r.push("The median"), "The median");
@@ -993,6 +1112,17 @@ mod tests {
         assert!(matches!(&r.requests[..], [Request::Invalid(_)]));
         let bad = Reply::parse("a.py\n```\n<<<<<<< SEARCH\nx\n```\n");
         assert!(matches!(&bad[..], [Request::Invalid(_)]));
+    }
+
+    #[test]
+    fn makefile_recipes_get_tabs() {
+        let make = "test:\n    python3 -m unittest\n\tmake lint\n\nX = 1\n";
+        assert_eq!(
+            recipe_tabs("sub/Makefile", make),
+            "test:\n\tpython3 -m unittest\n\tmake lint\n\nX = 1\n"
+        );
+        assert_eq!(recipe_tabs("rules.mk", "a:\n  b\n"), "a:\n\tb\n");
+        assert_eq!(recipe_tabs("main.py", "if x:\n    y\n"), "if x:\n    y\n");
     }
 
     #[test]
@@ -1065,6 +1195,82 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("sub/b.py"))?, "y = 1\n");
         assert!(matches!(ws.run(&write)?, Action::Unchanged { .. }));
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// The directory `rlis code` runs in, read and written at its top level, in a git
+    /// repository and outside one.
+    #[test]
+    fn reads_and_writes_its_own_directory() -> Result<()> {
+        for git in [false, true] {
+            let dir =
+                std::env::temp_dir().join(format!("rlis-code-dir-{}-{git}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(dir.join("src"))?;
+            fs::write(dir.join("main.py"), "print(1)\n")?;
+            fs::write(dir.join("src/lib.py"), "x = 1\n")?;
+            if git {
+                let ok = Command::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(&dir)
+                    .status()?
+                    .success();
+                assert!(ok);
+            }
+            let mut ws = Workspace::new(dir.clone());
+            for root in [".", "./", "", &dir.display().to_string()] {
+                let Action::Done { output, .. } = ws.run(&Request::Read {
+                    path: root.into(),
+                    from: 1,
+                })?
+                else {
+                    panic!("a listing")
+                };
+                assert!(
+                    output.contains("main.py") && output.contains("src/lib.py"),
+                    "{git} {root:?}: {output}"
+                );
+            }
+            assert!(ws.system_prompt(None).contains("src/lib.py"));
+
+            // Files at the top level, with and without an extension, from the model's reply.
+            let reply =
+                "notes.md\n```markdown\n# Notes\n```\n\nMakefile\n```make\nall:\n\techo hi\n```\n";
+            let requests = Reply::parse(reply);
+            assert_eq!(requests.len(), 2, "{requests:?}");
+            for r in &requests {
+                let Action::Change(change) = ws.run(r)? else {
+                    panic!("a new file: {r:?}")
+                };
+                ws.apply(&change)?;
+            }
+            assert_eq!(fs::read_to_string(dir.join("notes.md"))?, "# Notes\n");
+            // `READ` and a block: reads a file that exists, creates one that doesn't.
+            let echo = Request::ReadOrCreate {
+                path: "main.py".into(),
+                content: "made up\n".into(),
+            };
+            assert!(matches!(ws.run(&echo)?, Action::Done { .. }));
+            let echo = Request::ReadOrCreate {
+                path: "main.py".into(),
+                content: "print(1)\n".into(),
+            };
+            assert!(matches!(ws.run(&echo)?, Action::Unchanged { .. }));
+            let create = Request::ReadOrCreate {
+                path: "lib/new.py".into(),
+                content: "y = 2\n".into(),
+            };
+            let Action::Change(change) = ws.run(&create)? else {
+                panic!("a new file")
+            };
+            ws.apply(&change)?;
+            assert_eq!(fs::read_to_string(dir.join("lib/new.py"))?, "y = 2\n");
+            assert_eq!(
+                fs::read_to_string(dir.join("Makefile"))?,
+                "all:\n\techo hi\n"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
         Ok(())
     }
 

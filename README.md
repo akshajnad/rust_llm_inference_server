@@ -64,13 +64,14 @@ cd path/to/project && rlis code
 
 The terminal chat as a coding agent for the current directory: the model reads, creates and
 edits its files to do what you ask, and keeps going (reading, then editing) until it replies
-with a summary. It asks in plain text, in formats a 3B model writes reliably: `READ path` lines,
-and a file's path followed by a fenced `SEARCH`/`REPLACE` block (an edit) or by the whole file
-(a write). Generation stops as soon as a request is complete, so the model never makes up a
+with a summary. It asks in plain text, in formats a 3B model writes reliably: `READ path` lines
+(`READ .` lists the directory), and a file's path followed by a fenced `SEARCH`/`REPLACE` block
+(an edit) or by the whole file (a write; makefile recipes get the tabs make needs). Generation stops as soon as a request is complete, so the model never makes up a
 file's contents, and the requests show as cards instead of raw text: reads at once, changes as
 a diff that waits for `y` (apply), `n` (decline; the model hears so and goes on), `a` (apply
 this and every later change) or esc (decline and stop). It may only change files it has read
-in the conversation (or new ones), and no path outside the directory. The system prompt lists
+in the conversation (or new ones), and no path outside the directory. Each tool result restates
+your request, which keeps a small model on it instead of making up edits nobody asked for. The system prompt lists
 the project's files (what git doesn't ignore). With no server running it starts one with the
 Qwen 3B model and a 16,384-token context. `--yes` applies changes without asking; the chat's
 other options and commands work too (`/clear` starts over).

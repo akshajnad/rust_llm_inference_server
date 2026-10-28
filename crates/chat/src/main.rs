@@ -545,6 +545,20 @@ impl Chat {
                 stopped = flow == Flow::Stop;
                 progress |= flow == Flow::Next;
             }
+            // Small models lose the request behind the file contents they read, and make up
+            // work instead (edits nobody asked for), so each result restates it.
+            let request = self
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "user" && !m.tool)
+                .map_or("", |m| m.content.as_str());
+            results.push(format!(
+                "(The user's request: {} Do what it says next, or if it is done, reply with a \
+                 short summary. Write each file you create or rewrite as its path alone on a \
+                 line, then its content in a fenced block.)",
+                request.trim()
+            ));
             self.messages.push(Message {
                 role: "user",
                 content: results.join("\n\n"),
@@ -1003,7 +1017,13 @@ impl Chat {
             .expect("tools run for the agent")
             .ws
             .run(request);
-        let title = request.title();
+        let title = match (request, &action) {
+            // An existing file "written" after a READ line was only read.
+            (tools::Request::ReadOrCreate { path, .. }, Ok(tools::Action::Done { .. })) => {
+                format!("read {path}")
+            }
+            _ => request.title(),
+        };
         let change = match action {
             Err(e) => {
                 self.edge(['┌', '┐'], &title, ACCENT, "", BORDER)?;
