@@ -1,29 +1,29 @@
 | configuration | prompt | N | wall (s) | cost ratio | mean TTFT (s) | output tok/s | peak footprint | peak KV blocks (tokens) |
 |---|---|---|---|---|---|---|---|---|
-| rlis: N requests, no sharing (a) | 2k | 1 | 8.39 | 1.00× | 0.90 | 61 | 4.45 GB | 160 (2560) |
-| rlis: N requests, no sharing (a) | 2k | 2 | 10.33 | 1.23× | 1.32 | 99 | 4.47 GB | 320 (5120) |
-| rlis: N requests, no sharing (a) | 2k | 4 | 15.82 | 1.89× | 3.53 | 129 | 4.48 GB | 640 (10240) |
-| rlis: N requests, no sharing (a) | 2k | 8 | 26.10 | 3.11× | 5.70 | 157 | 4.48 GB | 1281 (20496) |
-| rlis: N requests, no sharing (a) | 8k | 1 | 22.83 | 1.00× | 4.45 | 22 | 4.53 GB | 545 (8720) |
-| rlis: N requests, no sharing (a) | 8k | 2 | 28.49 | 1.25× | 6.99 | 36 | 4.53 GB | 1089 (17424) |
-| rlis: N requests, no sharing (a) | 8k | 4 | 40.53 | 1.78× | 11.40 | 51 | 4.54 GB | 2176 (34816) |
-| rlis: N requests, no sharing (a) | 8k | 8 | 79.11 | 3.47× | 34.49 | 52 | 4.54 GB | 4348 (69568) |
-| rlis: n=N, forked from one prefill (b) | 2k | 1 | 8.91 | 1.00× | 1.13 | 57 | 4.50 GB | 160 (2560) |
-| rlis: n=N, forked from one prefill (b) | 2k | 2 | 10.24 | 1.15× | 1.06 | 100 | 4.50 GB | 192 (3072) |
-| rlis: n=N, forked from one prefill (b) | 2k | 4 | 13.91 | 1.56× | 1.07 | 147 | 4.50 GB | 256 (4096) |
-| rlis: n=N, forked from one prefill (b) | 2k | 8 | 20.65 | 2.32× | 1.11 | 198 | 4.50 GB | 384 (6144) |
-| rlis: n=N, forked from one prefill (b) | 8k | 1 | 23.36 | 1.00× | 5.01 | 22 | 4.53 GB | 544 (8704) |
-| rlis: n=N, forked from one prefill (b) | 8k | 2 | 23.40 | 1.00× | 3.87 | 44 | 4.53 GB | 577 (9232) |
-| rlis: n=N, forked from one prefill (b) | 8k | 4 | 27.67 | 1.18× | 4.30 | 74 | 4.53 GB | 643 (10288) |
-| rlis: n=N, forked from one prefill (b) | 8k | 8 | 42.69 | 1.83× | 4.56 | 96 | 4.53 GB | 775 (12400) |
-| rlis: N requests, prefix caching (a') | 2k | 1 | 8.28 | 1.00× | 0.86 | 62 | 4.45 GB | 160 (2560) |
-| rlis: N requests, prefix caching (a') | 2k | 2 | 9.49 | 1.15× | 0.89 | 108 | 4.45 GB | 193 (3088) |
-| rlis: N requests, prefix caching (a') | 2k | 4 | 12.39 | 1.50× | 0.90 | 165 | 4.45 GB | 259 (4144) |
-| rlis: N requests, prefix caching (a') | 2k | 8 | 17.98 | 2.17× | 1.01 | 228 | 4.48 GB | 518 (8288) |
-| rlis: N requests, prefix caching (a') | 8k | 1 | 22.65 | 1.00× | 4.51 | 23 | 4.52 GB | 544 (8704) |
-| rlis: N requests, prefix caching (a') | 8k | 2 | 23.81 | 1.05× | 4.49 | 43 | 4.52 GB | 577 (9232) |
-| rlis: N requests, prefix caching (a') | 8k | 4 | 27.18 | 1.20× | 4.77 | 75 | 4.52 GB | 643 (10288) |
-| rlis: N requests, prefix caching (a') | 8k | 8 | 43.20 | 1.91× | 5.29 | 95 | 4.52 GB | 902 (14432) |
+| rlis: N requests, no sharing (a) | 2k | 1 | 4.96 | 1.00× | 1.00 | 103 | 4.45 GB | 160 (2560) |
+| rlis: N requests, no sharing (a) | 2k | 2 | 8.22 | 1.66× | 2.36 | 125 | 4.45 GB | 321 (5136) |
+| rlis: N requests, no sharing (a) | 2k | 4 | 15.06 | 3.04× | 3.78 | 136 | 4.48 GB | 640 (10240) |
+| rlis: N requests, no sharing (a) | 2k | 8 | 23.56 | 4.75× | 6.00 | 174 | 4.48 GB | 1281 (20496) |
+| rlis: N requests, no sharing (a) | 8k | 1 | 10.54 | 1.00× | 4.92 | 49 | 4.52 GB | 544 (8704) |
+| rlis: N requests, no sharing (a) | 8k | 2 | 19.42 | 1.84× | 8.40 | 53 | 4.52 GB | 1088 (17408) |
+| rlis: N requests, no sharing (a) | 8k | 4 | 36.52 | 3.46× | 13.95 | 56 | 4.53 GB | 2176 (34816) |
+| rlis: N requests, no sharing (a) | 8k | 8 | 66.21 | 6.28× | 24.61 | 62 | 4.59 GB | 4348 (69568) |
+| rlis: n=N, forked from one prefill (b) | 2k | 1 | 4.90 | 1.00× | 0.96 | 104 | 4.49 GB | 160 (2560) |
+| rlis: n=N, forked from one prefill (b) | 2k | 2 | 7.05 | 1.44× | 1.07 | 145 | 4.49 GB | 192 (3072) |
+| rlis: n=N, forked from one prefill (b) | 2k | 4 | 11.45 | 2.34× | 1.07 | 179 | 4.49 GB | 256 (4096) |
+| rlis: n=N, forked from one prefill (b) | 2k | 8 | 15.41 | 3.15× | 1.00 | 266 | 4.49 GB | 384 (6144) |
+| rlis: n=N, forked from one prefill (b) | 8k | 1 | 10.07 | 1.00× | 4.60 | 51 | 4.52 GB | 544 (8704) |
+| rlis: n=N, forked from one prefill (b) | 8k | 2 | 13.35 | 1.33× | 4.96 | 77 | 4.52 GB | 576 (9216) |
+| rlis: n=N, forked from one prefill (b) | 8k | 4 | 19.31 | 1.92× | 4.81 | 106 | 4.52 GB | 643 (10288) |
+| rlis: n=N, forked from one prefill (b) | 8k | 8 | 27.40 | 2.72× | 4.64 | 149 | 4.52 GB | 768 (12288) |
+| rlis: N requests, prefix caching (a') | 2k | 1 | 4.88 | 1.00× | 0.90 | 105 | 4.46 GB | 160 (2560) |
+| rlis: N requests, prefix caching (a') | 2k | 2 | 7.03 | 1.44× | 1.06 | 146 | 4.47 GB | 320 (5120) |
+| rlis: N requests, prefix caching (a') | 2k | 4 | 11.21 | 2.30× | 1.09 | 183 | 4.45 GB | 259 (4144) |
+| rlis: N requests, prefix caching (a') | 2k | 8 | 14.96 | 3.07× | 1.15 | 274 | 4.45 GB | 391 (6256) |
+| rlis: N requests, prefix caching (a') | 8k | 1 | 9.92 | 1.00× | 4.32 | 52 | 4.52 GB | 544 (8704) |
+| rlis: N requests, prefix caching (a') | 8k | 2 | 12.94 | 1.30× | 4.62 | 79 | 4.52 GB | 577 (9232) |
+| rlis: N requests, prefix caching (a') | 8k | 4 | 20.15 | 2.03× | 5.72 | 102 | 4.53 GB | 770 (12320) |
+| rlis: N requests, prefix caching (a') | 8k | 8 | 26.52 | 2.67× | 4.46 | 154 | 4.53 GB | 775 (12400) |
 | llama.cpp: N requests, prompt cache (c) | 2k | 1 | 4.16 | 1.00× | 0.77 | 123 | 4.07 GB | n/a |
 | llama.cpp: N requests, prompt cache (c) | 2k | 2 | 5.95 | 1.43× | 1.61 | 172 | 4.07 GB | n/a |
 | llama.cpp: N requests, prompt cache (c) | 2k | 4 | 8.66 | 2.08× | 2.54 | 236 | 4.07 GB | n/a |

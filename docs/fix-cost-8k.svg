@@ -14,23 +14,23 @@
 <line x1="78" x2="736" y1="402" y2="402" stroke="#94a3b8"/>
 <text x="407" y="446" text-anchor="middle" fill="#334155">completions of one prompt (N)</text>
 <text transform="translate(18,225) rotate(-90)" text-anchor="middle" fill="#334155">cost ratio: wall time(N) / wall time(1)</text>
-<polyline fill="none" stroke="#2563eb" stroke-width="2.2" points="78.0,366.6 297.3,357.8 516.7,339.2 736.0,279.3"/>
+<polyline fill="none" stroke="#2563eb" stroke-width="2.2" points="78.0,366.6 297.3,336.8 516.7,279.4 736.0,179.7"/>
 <circle cx="78.0" cy="366.6" r="3.6" fill="#2563eb"/>
-<circle cx="297.3" cy="357.8" r="3.6" fill="#2563eb"/>
-<circle cx="516.7" cy="339.2" r="3.6" fill="#2563eb"/>
-<circle cx="736.0" cy="279.3" r="3.6" fill="#2563eb"/>
+<circle cx="297.3" cy="336.8" r="3.6" fill="#2563eb"/>
+<circle cx="516.7" cy="279.4" r="3.6" fill="#2563eb"/>
+<circle cx="736.0" cy="179.7" r="3.6" fill="#2563eb"/>
 <rect x="92" y="56" width="14" height="3" fill="#2563eb"/><text x="112" y="60" fill="#0f172a">rlis: N requests, no sharing (a)</text>
-<polyline fill="none" stroke="#ea580c" stroke-width="2.2" points="78.0,366.6 297.3,366.5 516.7,360.1 736.0,337.3"/>
+<polyline fill="none" stroke="#ea580c" stroke-width="2.2" points="78.0,366.6 297.3,355.1 516.7,334.2 736.0,305.7"/>
 <circle cx="78.0" cy="366.6" r="3.6" fill="#ea580c"/>
-<circle cx="297.3" cy="366.5" r="3.6" fill="#ea580c"/>
-<circle cx="516.7" cy="360.1" r="3.6" fill="#ea580c"/>
-<circle cx="736.0" cy="337.3" r="3.6" fill="#ea580c"/>
+<circle cx="297.3" cy="355.1" r="3.6" fill="#ea580c"/>
+<circle cx="516.7" cy="334.2" r="3.6" fill="#ea580c"/>
+<circle cx="736.0" cy="305.7" r="3.6" fill="#ea580c"/>
 <rect x="92" y="74" width="14" height="3" fill="#ea580c"/><text x="112" y="78" fill="#0f172a">rlis: n=N, forked from one prefill (b)</text>
-<polyline fill="none" stroke="#16a34a" stroke-width="2.2" points="78.0,366.6 297.3,364.8 516.7,359.5 736.0,334.5"/>
+<polyline fill="none" stroke="#16a34a" stroke-width="2.2" points="78.0,366.6 297.3,355.8 516.7,330.1 736.0,307.4"/>
 <circle cx="78.0" cy="366.6" r="3.6" fill="#16a34a"/>
-<circle cx="297.3" cy="364.8" r="3.6" fill="#16a34a"/>
-<circle cx="516.7" cy="359.5" r="3.6" fill="#16a34a"/>
-<circle cx="736.0" cy="334.5" r="3.6" fill="#16a34a"/>
+<circle cx="297.3" cy="355.8" r="3.6" fill="#16a34a"/>
+<circle cx="516.7" cy="330.1" r="3.6" fill="#16a34a"/>
+<circle cx="736.0" cy="307.4" r="3.6" fill="#16a34a"/>
 <rect x="92" y="92" width="14" height="3" fill="#16a34a"/><text x="112" y="96" fill="#0f172a">rlis: N requests, prefix caching (a')</text>
 <polyline fill="none" stroke="#9333ea" stroke-width="2.2" points="78.0,366.6 297.3,342.5 516.7,302.4 736.0,221.2"/>
 <circle cx="78.0" cy="366.6" r="3.6" fill="#9333ea"/>

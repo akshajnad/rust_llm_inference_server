@@ -83,11 +83,16 @@ impl PagedKvCache {
         self.attention
     }
 
-    fn kernel_op(&self, layer: usize) -> crate::paged_attention::PagedAttention {
+    fn kernel_op(
+        &self,
+        layer: usize,
+        max_context: usize,
+    ) -> crate::paged_attention::PagedAttention {
         crate::paged_attention::PagedAttention {
             k_cache: self.k[layer].clone(),
             v_cache: self.v[layer].clone(),
             block_size: self.block_size,
+            max_context,
             #[cfg(feature = "metal")]
             pipelines: self.pipelines.clone(),
         }
@@ -169,6 +174,8 @@ struct DecodePlan {
     tables: Tensor,
     /// `(D,)` context length including the new token.
     ctx_lens: Tensor,
+    /// The longest of `ctx_lens`.
+    max_context: usize,
     /// Token rows of the decode queries; `None` when every token is a decode.
     token_rows: Option<Tensor>,
     /// Maps segment-order token rows to `[decodes..., prefills...]` rows; `None` when all decode.
@@ -229,6 +236,7 @@ impl DecodePlan {
         };
         Ok(Some(Self {
             tables: Tensor::from_vec(tables, (dec.len(), max_blocks), dev)?,
+            max_context: ctx.iter().copied().max().unwrap_or(1) as usize,
             ctx_lens: Tensor::new(ctx, dev)?,
             seqs: dec,
             token_rows,
@@ -334,8 +342,11 @@ impl KvBatch for PagedBatch<'_> {
             None => q_rows.contiguous()?,
             Some(rows) => q_rows.contiguous()?.index_select(rows, 0)?,
         };
-        let out_dec =
-            q_dec.apply_op3_no_bwd(&plan.tables, &plan.ctx_lens, &self.cache.kernel_op(layer))?;
+        let out_dec = q_dec.apply_op3_no_bwd(
+            &plan.tables,
+            &plan.ctx_lens,
+            &self.cache.kernel_op(layer, plan.max_context),
+        )?;
         let out_rows = match &plan.reorder {
             None => out_dec,
             Some(reorder) => {

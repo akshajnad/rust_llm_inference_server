@@ -1,6 +1,8 @@
 //! Attention v2: decode attention that reads K/V through block tables in one kernel per layer
 //! for the whole batch, instead of gathering each sequence's cache and running attention per
-//! sequence (v1). Metal only; `cpu_fwd` is a straightforward reference used by tests.
+//! sequence (v1). Long contexts with few sequences are split into partitions that run in
+//! parallel and are merged by a second kernel (see `split_plan`). Metal only; `cpu_fwd` is a
+//! straightforward reference used by tests.
 
 use candle_core::{CpuStorage, CustomOp3, DType, Layout, Result, Shape, Tensor};
 
@@ -16,12 +18,31 @@ pub fn supported(n_heads: usize, n_kv: usize, head_dim: usize) -> bool {
         && head_dim <= MAX_HEAD_DIM
 }
 
+/// Threadgroups a decode step should have before splitting contexts stops paying off: about
+/// a dozen per GPU core on a 20-core M4 Pro.
+const TARGET_THREADGROUPS: usize = 256;
+/// Fewest positions per partition: below this the merge costs more than the parallelism wins.
+const MIN_PARTITION: usize = 256;
+
+/// How many partitions to split each context into and how many positions each covers, for
+/// `pairs` (kv head, sequence) pairs and a longest context of `max_context`. One partition
+/// means the single-pass kernel.
+pub fn split_plan(pairs: usize, max_context: usize) -> (usize, usize) {
+    let splits = TARGET_THREADGROUPS
+        .div_ceil(pairs.max(1))
+        .min(max_context.div_ceil(MIN_PARTITION))
+        .max(1);
+    (splits, max_context.div_ceil(splits).max(1))
+}
+
 /// `q (D, n_heads, d)`, `block_tables (D, max_blocks) u32`, `ctx_lens (D) u32` ->
 /// `(D, n_heads, d)`. The caches are `(slots, n_kv, d)` and already hold this step's K/V.
 pub struct PagedAttention {
     pub k_cache: Tensor,
     pub v_cache: Tensor,
     pub block_size: usize,
+    /// The largest entry of `ctx_lens`, known on the host so the split needs no readback.
+    pub max_context: usize,
     #[cfg(feature = "metal")]
     pub pipelines: std::sync::Arc<metal_impl::Pipelines>,
 }
@@ -131,12 +152,19 @@ pub mod metal_impl {
     const SOURCE: &str = include_str!("paged_attention.metal");
     const THREADS: usize = 8 * 32;
 
+    /// Kernels for one dtype.
+    struct Kernels {
+        decode: ComputePipeline,
+        split: ComputePipeline,
+        reduce: ComputePipeline,
+    }
+
     /// Compiled lazily on first use; MSL is compiled at runtime, no offline toolchain needed.
     #[derive(Default)]
-    pub struct Pipelines(OnceLock<(ComputePipeline, ComputePipeline)>);
+    pub struct Pipelines(OnceLock<(Kernels, Kernels)>);
 
     impl Pipelines {
-        fn get(&self, device: &candle_core::MetalDevice, dtype: DType) -> Result<&ComputePipeline> {
+        fn get(&self, device: &candle_core::MetalDevice, dtype: DType) -> Result<&Kernels> {
             if self.0.get().is_none() {
                 let dev = device.metal_device();
                 let lib = dev
@@ -149,10 +177,14 @@ pub mod metal_impl {
                     dev.new_compute_pipeline_state_with_function(&f)
                         .map_err(candle_core::Error::wrap)
                 };
-                let _ = self.0.set((
-                    make("paged_attention_decode_f32")?,
-                    make("paged_attention_decode_f16")?,
-                ));
+                let kernels = |ty: &str| -> Result<Kernels> {
+                    Ok(Kernels {
+                        decode: make(&format!("paged_attention_decode_{ty}"))?,
+                        split: make(&format!("paged_attention_decode_split_{ty}"))?,
+                        reduce: make(&format!("paged_attention_reduce_{ty}"))?,
+                    })
+                };
+                let _ = self.0.set((kernels("f32")?, kernels("f16")?));
             }
             let (f32p, f16p) = self.0.get().expect("initialized above");
             match dtype {
@@ -179,7 +211,8 @@ pub mod metal_impl {
         }
         let device = q.device();
         let dtype = q.dtype();
-        let pipeline = op.pipelines.get(device, dtype)?;
+        let kernels = op.pipelines.get(device, dtype)?;
+        let (splits, part) = super::split_plan(n_kv * nd, op.max_context);
         let (ks, kl) = op.k_cache.storage_and_layout();
         let (vs, vl) = op.v_cache.storage_and_layout();
         let (Storage::Metal(ks), Storage::Metal(vs)) = (&*ks, &*vs) else {
@@ -192,36 +225,75 @@ pub mod metal_impl {
             .with_label("paged_attention")
             .build()?;
 
-        let guard = device.command_encoder()?;
-        let provider = &guard;
-        let holder = provider.encoder();
-        let enc = holder.as_ref();
-        enc.set_compute_pipeline_state(pipeline);
-        enc.set_input_buffer(0, Some(q.buffer()), lq.start_offset() * elem);
-        enc.set_input_buffer(1, Some(ks.buffer()), kl.start_offset() * elem);
-        enc.set_input_buffer(2, Some(vs.buffer()), vl.start_offset() * elem);
-        enc.set_input_buffer(3, Some(tables.buffer()), lt.start_offset() * 4);
-        enc.set_input_buffer(4, Some(lens.buffer()), ll.start_offset() * 4);
-        enc.set_output_buffer(5, Some(&out), 0);
         let u = |x: usize| x as u32;
-        enc.set_bytes(6, &u(n_heads));
-        enc.set_bytes(7, &u(n_kv));
-        enc.set_bytes(8, &u(hd));
-        enc.set_bytes(9, &u(op.block_size));
-        enc.set_bytes(10, &u(max_blocks));
-        enc.set_bytes(11, &(1.0f32 / (hd as f32).sqrt()));
-        enc.dispatch_thread_groups(
-            MTLSize {
-                width: n_kv,
-                height: nd,
-                depth: 1,
-            },
-            MTLSize {
-                width: THREADS,
-                height: 1,
-                depth: 1,
-            },
-        );
+        let size = |width, height, depth| MTLSize {
+            width,
+            height,
+            depth,
+        };
+        // Partition states, f32: (m, l) pairs and unnormalized outputs.
+        let partials = (splits > 1)
+            .then(|| -> Result<_> {
+                let rows = nd * n_heads * splits;
+                Ok((
+                    device
+                        .new_buffer_builder()
+                        .with_size_for(rows * 2, DType::F32)
+                        .with_label("paged_attention_ml")
+                        .build()?,
+                    device
+                        .new_buffer_builder()
+                        .with_size_for(rows * hd, DType::F32)
+                        .with_label("paged_attention_acc")
+                        .build()?,
+                ))
+            })
+            .transpose()?;
+        {
+            let guard = device.command_encoder()?;
+            let provider = &guard;
+            let holder = provider.encoder();
+            let enc = holder.as_ref();
+            enc.set_compute_pipeline_state(match partials {
+                None => &kernels.decode,
+                Some(_) => &kernels.split,
+            });
+            enc.set_input_buffer(0, Some(q.buffer()), lq.start_offset() * elem);
+            enc.set_input_buffer(1, Some(ks.buffer()), kl.start_offset() * elem);
+            enc.set_input_buffer(2, Some(vs.buffer()), vl.start_offset() * elem);
+            enc.set_input_buffer(3, Some(tables.buffer()), lt.start_offset() * 4);
+            enc.set_input_buffer(4, Some(lens.buffer()), ll.start_offset() * 4);
+            enc.set_bytes(6, &u(n_heads));
+            enc.set_bytes(7, &u(n_kv));
+            enc.set_bytes(8, &u(hd));
+            enc.set_bytes(9, &u(op.block_size));
+            enc.set_bytes(10, &u(max_blocks));
+            enc.set_bytes(11, &(1.0f32 / (hd as f32).sqrt()));
+            match &partials {
+                None => enc.set_output_buffer(5, Some(&out), 0),
+                Some((ml, acc)) => {
+                    enc.set_output_buffer(5, Some(ml), 0);
+                    enc.set_output_buffer(12, Some(acc), 0);
+                    enc.set_bytes(13, &u(part));
+                    enc.set_bytes(14, &u(splits));
+                }
+            }
+            enc.dispatch_thread_groups(size(n_kv, nd, splits), size(THREADS, 1, 1));
+        }
+        if let Some((ml, acc)) = &partials {
+            let guard = device.command_encoder()?;
+            let provider = &guard;
+            let holder = provider.encoder();
+            let enc = holder.as_ref();
+            enc.set_compute_pipeline_state(&kernels.reduce);
+            enc.set_input_buffer(0, Some(ml), 0);
+            enc.set_input_buffer(1, Some(acc), 0);
+            enc.set_output_buffer(2, Some(&out), 0);
+            enc.set_bytes(3, &u(n_heads));
+            enc.set_bytes(4, &u(hd));
+            enc.set_bytes(5, &u(splits));
+            enc.dispatch_thread_groups(size(n_heads, nd, 1), size(hd, 1, 1));
+        }
         Ok((
             MetalStorage::new(out, device.clone(), nd * n_heads * hd, dtype),
             Shape::from((nd, n_heads, hd)),
@@ -299,6 +371,7 @@ mod tests {
             k_cache: c.k.clone(),
             v_cache: c.v.clone(),
             block_size: c.block_size,
+            max_context: c.lens.iter().copied().max().unwrap_or(1),
             #[cfg(feature = "metal")]
             pipelines: Default::default(),
         };
@@ -344,6 +417,17 @@ mod tests {
     }
 
     #[test]
+    fn long_contexts_with_few_sequences_are_split() {
+        // Llama 3.2 1B: 8 kv heads. One 8k sequence: 32 partitions of 256 positions.
+        assert_eq!(split_plan(8, 8192), (32, 256));
+        // Eight of them already fill the GPU better: 4 partitions.
+        assert_eq!(split_plan(64, 8192), (4, 2048));
+        // Short contexts and big batches stay single-pass.
+        assert_eq!(split_plan(8, 200), (1, 200));
+        assert_eq!(split_plan(512, 8192).0, 1);
+    }
+
+    #[test]
     fn rejects_unsupported_layouts() {
         assert!(supported(32, 8, 64));
         assert!(supported(24, 8, 128));
@@ -373,6 +457,43 @@ mod tests {
                 let got = run_op(&on_metal, &metal)?.to_device(&Device::Cpu)?;
                 let d = max_diff(&got, &want)?;
                 assert!(d < tol, "{n_heads}/{n_kv}x{hd} {dtype:?}: max diff {d}");
+            }
+        }
+        Ok(())
+    }
+
+    /// The split-context kernels against the CPU reference: few sequences with long contexts
+    /// (so the context is partitioned), next to ones shorter than a partition (so some
+    /// partitions are empty), for both head layouts and dtypes.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_split_kernel_matches_cpu_reference() -> Result<()> {
+        let metal = Device::new_metal(0)?;
+        for lens in [vec![8192], vec![1, 5, 300, 4000, 9000]] {
+            let max = *lens.iter().max().unwrap();
+            assert!(
+                split_plan(8 * lens.len(), max).0 > 1,
+                "{lens:?} should split"
+            );
+            for (n_heads, n_kv, hd) in [(32, 8, 64), (24, 8, 128)] {
+                for (dtype, tol) in [(DType::F32, 1e-4), (DType::F16, 2e-2)] {
+                    let c = case(&Device::Cpu, dtype, n_heads, n_kv, hd, &lens)?;
+                    let want = run_op(&c, &Device::Cpu)?;
+                    let on_metal = Case {
+                        k: c.k.to_device(&metal)?,
+                        v: c.v.to_device(&metal)?,
+                        q: c.q.to_device(&metal)?,
+                        tables: c.tables.clone(),
+                        lens: c.lens.clone(),
+                        block_size: c.block_size,
+                    };
+                    let got = run_op(&on_metal, &metal)?.to_device(&Device::Cpu)?;
+                    let d = max_diff(&got, &want)?;
+                    assert!(
+                        d < tol,
+                        "{lens:?} {n_heads}/{n_kv}x{hd} {dtype:?}: max diff {d}"
+                    );
+                }
             }
         }
         Ok(())

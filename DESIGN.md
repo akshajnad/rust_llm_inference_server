@@ -87,10 +87,15 @@ every block returned.
 - **v1 (gather).** Gather each sequence's blocks into contiguous K/V, then standard attention.
   Simple and obviously correct; it stays as the fallback and the reference.
 - **v2 decode kernel** (`paged_attention.metal`). One kernel per layer for every decoding
-  sequence, reading K/V straight through the block tables. One threadgroup per (KV head,
-  sequence) serves all query heads of the GQA group, so each K/V row is loaded once; 8
-  simdgroups split the context with an online softmax and merge at the end. It matches a CPU
-  reference on 37 sequences with contexts up to 700 tokens for both Llama 3.2 head layouts.
+  sequence, reading K/V straight through the block tables. A threadgroup serves all query
+  heads of a GQA group, so each K/V row is loaded once. Its 8 simdgroups take blocks of 32
+  positions: each lane scores one position against every head, the online softmax is updated
+  once per block, and lanes then accumulate their slice of V. Long contexts with few sequences
+  are split into partitions that run as separate threadgroups and are merged by a second
+  kernel (flash-decoding). Without the split, one sequence was only 8 threadgroups on a
+  20-core GPU, and an 8k-context decode step took 34 ms instead of 10. It matches a CPU
+  reference for both Llama 3.2 head layouts, on 37 sequences up to 700 tokens and on split
+  contexts up to 9,000.
 - **Fused prefill.** Multi-token segments use MLX's fused attention (`candle_nn::ops::sdpa`)
   with a bottom-right-aligned causal mask, which is exactly chunked-prefill semantics. The
   first version materialized f32 score matrices and spent 313 ms of a 1024-token prefill in

@@ -2,11 +2,10 @@
 <rect width="760" height="460" fill="white"/>
 <text x="78" y="26" font-size="16" font-weight="600" fill="#0f172a">Wall time for N completions, 8k-token prompt, 512 tokens each (M4 Pro)</text>
 <line x1="78" x2="736" y1="402.0" y2="402.0" stroke="#e2e8f0"/><text x="70" y="406.0" text-anchor="end" fill="#475569">0</text>
-<line x1="78" x2="736" y1="331.2" y2="331.2" stroke="#e2e8f0"/><text x="70" y="335.2" text-anchor="end" fill="#475569">20</text>
-<line x1="78" x2="736" y1="260.4" y2="260.4" stroke="#e2e8f0"/><text x="70" y="264.4" text-anchor="end" fill="#475569">40</text>
-<line x1="78" x2="736" y1="189.6" y2="189.6" stroke="#e2e8f0"/><text x="70" y="193.6" text-anchor="end" fill="#475569">60</text>
-<line x1="78" x2="736" y1="118.8" y2="118.8" stroke="#e2e8f0"/><text x="70" y="122.8" text-anchor="end" fill="#475569">80</text>
-<line x1="78" x2="736" y1="48.0" y2="48.0" stroke="#e2e8f0"/><text x="70" y="52.0" text-anchor="end" fill="#475569">100</text>
+<line x1="78" x2="736" y1="313.5" y2="313.5" stroke="#e2e8f0"/><text x="70" y="317.5" text-anchor="end" fill="#475569">20</text>
+<line x1="78" x2="736" y1="225.0" y2="225.0" stroke="#e2e8f0"/><text x="70" y="229.0" text-anchor="end" fill="#475569">40</text>
+<line x1="78" x2="736" y1="136.5" y2="136.5" stroke="#e2e8f0"/><text x="70" y="140.5" text-anchor="end" fill="#475569">60</text>
+<line x1="78" x2="736" y1="48.0" y2="48.0" stroke="#e2e8f0"/><text x="70" y="52.0" text-anchor="end" fill="#475569">80</text>
 <line x1="78.0" x2="78.0" y1="48" y2="402" stroke="#f1f5f9"/><text x="78.0" y="420" text-anchor="middle" fill="#475569">1</text>
 <line x1="297.3" x2="297.3" y1="48" y2="402" stroke="#f1f5f9"/><text x="297.3" y="420" text-anchor="middle" fill="#475569">2</text>
 <line x1="516.7" x2="516.7" y1="48" y2="402" stroke="#f1f5f9"/><text x="516.7" y="420" text-anchor="middle" fill="#475569">4</text>
@@ -14,34 +13,34 @@
 <line x1="78" x2="736" y1="402" y2="402" stroke="#94a3b8"/>
 <text x="407" y="446" text-anchor="middle" fill="#334155">completions of one prompt (N)</text>
 <text transform="translate(18,225) rotate(-90)" text-anchor="middle" fill="#334155">wall time for all N completions (s)</text>
-<polyline fill="none" stroke="#2563eb" stroke-width="2.2" points="78.0,321.2 297.3,301.2 516.7,258.5 736.0,121.9"/>
-<circle cx="78.0" cy="321.2" r="3.6" fill="#2563eb"/>
-<circle cx="297.3" cy="301.2" r="3.6" fill="#2563eb"/>
-<circle cx="516.7" cy="258.5" r="3.6" fill="#2563eb"/>
-<circle cx="736.0" cy="121.9" r="3.6" fill="#2563eb"/>
+<polyline fill="none" stroke="#2563eb" stroke-width="2.2" points="78.0,355.3 297.3,316.1 516.7,240.4 736.0,109.0"/>
+<circle cx="78.0" cy="355.3" r="3.6" fill="#2563eb"/>
+<circle cx="297.3" cy="316.1" r="3.6" fill="#2563eb"/>
+<circle cx="516.7" cy="240.4" r="3.6" fill="#2563eb"/>
+<circle cx="736.0" cy="109.0" r="3.6" fill="#2563eb"/>
 <rect x="92" y="56" width="14" height="3" fill="#2563eb"/><text x="112" y="60" fill="#0f172a">rlis: N requests, no sharing (a)</text>
-<polyline fill="none" stroke="#ea580c" stroke-width="2.2" points="78.0,319.3 297.3,319.2 516.7,304.1 736.0,250.9"/>
-<circle cx="78.0" cy="319.3" r="3.6" fill="#ea580c"/>
-<circle cx="297.3" cy="319.2" r="3.6" fill="#ea580c"/>
-<circle cx="516.7" cy="304.1" r="3.6" fill="#ea580c"/>
-<circle cx="736.0" cy="250.9" r="3.6" fill="#ea580c"/>
+<polyline fill="none" stroke="#ea580c" stroke-width="2.2" points="78.0,357.4 297.3,342.9 516.7,316.6 736.0,280.8"/>
+<circle cx="78.0" cy="357.4" r="3.6" fill="#ea580c"/>
+<circle cx="297.3" cy="342.9" r="3.6" fill="#ea580c"/>
+<circle cx="516.7" cy="316.6" r="3.6" fill="#ea580c"/>
+<circle cx="736.0" cy="280.8" r="3.6" fill="#ea580c"/>
 <rect x="92" y="74" width="14" height="3" fill="#ea580c"/><text x="112" y="78" fill="#0f172a">rlis: n=N, forked from one prefill (b)</text>
-<polyline fill="none" stroke="#16a34a" stroke-width="2.2" points="78.0,321.8 297.3,317.7 516.7,305.8 736.0,249.1"/>
-<circle cx="78.0" cy="321.8" r="3.6" fill="#16a34a"/>
-<circle cx="297.3" cy="317.7" r="3.6" fill="#16a34a"/>
-<circle cx="516.7" cy="305.8" r="3.6" fill="#16a34a"/>
-<circle cx="736.0" cy="249.1" r="3.6" fill="#16a34a"/>
+<polyline fill="none" stroke="#16a34a" stroke-width="2.2" points="78.0,358.1 297.3,344.7 516.7,312.8 736.0,284.6"/>
+<circle cx="78.0" cy="358.1" r="3.6" fill="#16a34a"/>
+<circle cx="297.3" cy="344.7" r="3.6" fill="#16a34a"/>
+<circle cx="516.7" cy="312.8" r="3.6" fill="#16a34a"/>
+<circle cx="736.0" cy="284.6" r="3.6" fill="#16a34a"/>
 <rect x="92" y="92" width="14" height="3" fill="#16a34a"/><text x="112" y="96" fill="#0f172a">rlis: N requests, prefix caching (a')</text>
-<polyline fill="none" stroke="#9333ea" stroke-width="2.2" points="78.0,366.3 297.3,341.9 516.7,301.5 736.0,219.5"/>
-<circle cx="78.0" cy="366.3" r="3.6" fill="#9333ea"/>
-<circle cx="297.3" cy="341.9" r="3.6" fill="#9333ea"/>
-<circle cx="516.7" cy="301.5" r="3.6" fill="#9333ea"/>
-<circle cx="736.0" cy="219.5" r="3.6" fill="#9333ea"/>
+<polyline fill="none" stroke="#9333ea" stroke-width="2.2" points="78.0,357.3 297.3,326.9 516.7,276.4 736.0,173.9"/>
+<circle cx="78.0" cy="357.3" r="3.6" fill="#9333ea"/>
+<circle cx="297.3" cy="326.9" r="3.6" fill="#9333ea"/>
+<circle cx="516.7" cy="276.4" r="3.6" fill="#9333ea"/>
+<circle cx="736.0" cy="173.9" r="3.6" fill="#9333ea"/>
 <rect x="92" y="110" width="14" height="3" fill="#9333ea"/><text x="112" y="114" fill="#0f172a">llama.cpp: N requests, prompt cache (c)</text>
-<polyline fill="none" stroke="#0891b2" stroke-width="2.2" points="78.0,368.7 297.3,364.4 516.7,361.3 736.0,353.2"/>
-<circle cx="78.0" cy="368.7" r="3.6" fill="#0891b2"/>
-<circle cx="297.3" cy="364.4" r="3.6" fill="#0891b2"/>
-<circle cx="516.7" cy="361.3" r="3.6" fill="#0891b2"/>
-<circle cx="736.0" cy="353.2" r="3.6" fill="#0891b2"/>
+<polyline fill="none" stroke="#0891b2" stroke-width="2.2" points="78.0,360.4 297.3,355.1 516.7,351.1 736.0,341.0"/>
+<circle cx="78.0" cy="360.4" r="3.6" fill="#0891b2"/>
+<circle cx="297.3" cy="355.1" r="3.6" fill="#0891b2"/>
+<circle cx="516.7" cy="351.1" r="3.6" fill="#0891b2"/>
+<circle cx="736.0" cy="341.0" r="3.6" fill="#0891b2"/>
 <rect x="92" y="128" width="14" height="3" fill="#0891b2"/><text x="112" y="132" fill="#0f172a">llama.cpp: n=N (c')</text>
 </svg>
