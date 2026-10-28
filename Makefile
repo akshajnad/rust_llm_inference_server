@@ -20,7 +20,7 @@ LLAMA_CPP_CMAKE_FLAGS ?= -DGGML_METAL=ON
 LLAMA_CPP_JOBS ?=
 WIKITEXT_URL := $(HF)/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
 
-.PHONY: serve chat models models-all wikitext llama-cpp bench-mac bench-cuda bench-ablations bench-charts soak build test test-metal parity-ref chat-ref parity lint fuzz teardown
+.PHONY: serve chat install uninstall models models-all wikitext llama-cpp bench-mac bench-cuda bench-ablations bench-charts soak build test test-metal parity-ref chat-ref parity lint fuzz teardown
 
 # One command from a fresh clone to a running server on http://127.0.0.1:8000.
 serve: models
@@ -31,6 +31,18 @@ serve: models
 chat: models
 	cargo build --release -p server -p chat --features server/$(FEATURES)
 	target/release/rlis-chat
+
+# Puts `rlis-chat` on the PATH (rustup already adds ~/.cargo/bin) as a link to this build, so it
+# runs from any directory and picks up rebuilds.
+INSTALL_DIR ?= $(HOME)/.cargo/bin
+install: models
+	cargo build --release -p server -p chat --features server/$(FEATURES)
+	mkdir -p $(INSTALL_DIR)
+	ln -sf $(CURDIR)/target/release/rlis-chat $(INSTALL_DIR)/rlis-chat
+	@echo "installed: $(INSTALL_DIR)/rlis-chat -> $(CURDIR)/target/release/rlis-chat"
+
+uninstall:
+	rm -f $(INSTALL_DIR)/rlis-chat
 
 # $(call fetch,repo,file,destination)
 define fetch
@@ -147,7 +159,7 @@ soak: models
 	cargo build --release -p bench
 	scripts/bench/soak.sh $(SOAK_SECS)
 
-teardown:
+teardown: uninstall
 	-pkill -f 'target/.*/rlis' || true
 	-pkill -f 'llama-server' || true
 	rm -rf models target third_party .venv .uv-cache fuzz/target fuzz/corpus fuzz/artifacts

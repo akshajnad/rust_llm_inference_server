@@ -167,17 +167,13 @@ fn model_name(url: &str) -> Option<String> {
     v["data"][0]["id"].as_str().map(str::to_string)
 }
 
-/// The directory `rlis serve` runs in, so its default `models/...` paths resolve: the current
-/// one if it has `models/`, else the repo that holds this binary (`<repo>/target/release`).
+/// The directory `rlis serve` runs in, so its default `models/...` paths resolve: the repo that
+/// holds this binary (`<repo>/target/release`), else the current directory.
 fn server_dir(exe: &Path) -> PathBuf {
-    let cwd = env::current_dir().unwrap_or_default();
-    if cwd.join("models").is_dir() {
-        return cwd;
-    }
     exe.ancestors()
         .nth(3)
         .filter(|repo| repo.join("models").is_dir())
-        .map_or(cwd, Path::to_path_buf)
+        .map_or_else(|| env::current_dir().unwrap_or_default(), Path::to_path_buf)
 }
 
 fn ensure_server(args: &Args) -> Result<Option<Server>> {
@@ -190,7 +186,8 @@ fn ensure_server(args: &Args) -> Result<Option<Server>> {
     if args.no_start || !matches!(host, "127.0.0.1" | "localhost") {
         bail!("no server is answering at {}", args.url);
     }
-    let exe = env::current_exe()?;
+    // Resolved through the symlink `make install` puts on the PATH, to find the build.
+    let exe = env::current_exe()?.canonicalize()?;
     let bin = exe.with_file_name("rlis");
     if !bin.exists() {
         bail!(
