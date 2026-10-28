@@ -12,6 +12,9 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 CC=$(nvidia-smi -i "$CUDA_VISIBLE_DEVICES" --query-gpu=compute_cap --format=csv,noheader | tr -d .)
 export CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP:-$CC}
 export PATH=/usr/local/cuda/bin:$HOME/.cargo/bin:$PATH
+# Containers mount the driver's libcuda.so.1 but not the unversioned libcuda.so the linker
+# wants; link against the toolkit's stub (its soname is libcuda.so.1, so the real one loads).
+export LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}
 
 TIMINGS=$OUT/timings.tsv
 : >"$TIMINGS"
