@@ -74,6 +74,25 @@ One change at a time against the default configuration (concurrency 4 / 16 / 32)
 | **Q8_0** (default) | 14.0035 ± 0.104 | 99.38% | 145 tok/s |
 | Q4_K_M | 14.4563 ± 0.108 | 94.45% | 196 tok/s |
 
+### Targets
+
+The spec's starting targets against what was measured on the Mac:
+
+| Target | Result | |
+|---|---|---|
+| Single-stream decode ≥ 70% of llama.cpp | 83% (120 vs 144 tok/s) | met |
+| Throughput at 32 concurrent requests ≥ 4× single-stream | 4.4× (524 vs 120 tok/s) | met |
+| p99 time to first token at moderate load within 2× of unloaded | 2.7× at 4 concurrent, 9.4× at 16 (llama.cpp: 2.1×, 6.8×) | missed |
+| KV utilization under load > 90% with no out-of-memory errors | pool reaches 100%; 18 preemptions, 0 errors (64-request stress test) | met |
+| Peak footprint, default run ≤ 3.5 GB | 3.26 GB in the worst case | met |
+| Memory flat over a 1-hour soak | 10-minute averages within 2,589–2,645 MB (+2.9% early to late) | met |
+| Single-stream decode on CUDA ≥ 60% of llama.cpp | — | pending (cloud run) |
+
+The time-to-first-token miss comes from the workload: every benchmark client sends a ~300-token
+prompt the moment its last request finishes, so a new prompt queues behind other prompts'
+prefill chunks. Shared prefixes remove most of it (with prefix caching, p99 stays at ~0.5 s
+from 4 to 32 concurrent requests, see Ablations); unique prompts need faster prefill.
+
 ## What's inside
 
 - **Continuous batching** with chunked prefill, FCFS admission, and preemption by recompute
@@ -99,9 +118,10 @@ How it works and why: [DESIGN.md](DESIGN.md). The hardest bug:
 |---|---|
 | Default run (Q8_0, 1 GiB KV pool), benchmark load | 2.7–3.2 GB peak footprint |
 | Default run, 64 long requests overfilling the pool | 3.26 GB peak footprint |
+| Upper-bound run (3B Q4_K_M, 2 GiB pool) | not measured yet; the spec's budget estimate is ~5 GB |
 | Model files (`make models` / `make models-all`) | 1.3 GB / 4.6 GB |
-| Rust build (`./target`) | ~3–4 GB |
-| llama.cpp build (`./third_party`) | < 1 GB |
+| Rust build (`./target`, release + debug, with and without Metal) | 13 GB |
+| llama.cpp build (`./third_party`) | 0.36 GB |
 
 `make teardown` stops project processes and deletes `models/`, `target/`, `third_party/` and
 any virtualenv, leaving only code and results.
