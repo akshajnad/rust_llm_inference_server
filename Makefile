@@ -20,12 +20,17 @@ LLAMA_CPP_CMAKE_FLAGS ?= -DGGML_METAL=ON
 LLAMA_CPP_JOBS ?=
 WIKITEXT_URL := $(HF)/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
 
-.PHONY: serve models models-all wikitext llama-cpp bench-mac bench-cuda bench-ablations bench-charts soak build test test-metal parity-ref chat-ref parity lint fuzz teardown
+.PHONY: serve chat models models-all wikitext llama-cpp bench-mac bench-cuda bench-ablations bench-charts soak build test test-metal parity-ref chat-ref parity lint fuzz teardown
 
 # One command from a fresh clone to a running server on http://127.0.0.1:8000.
 serve: models
 	cargo build --release --features $(FEATURES) -p server
 	target/release/rlis serve
+
+# Terminal chat; starts the server in the background (and stops it on exit) if none is running.
+chat: models
+	cargo build --release -p server -p chat --features server/$(FEATURES)
+	target/release/rlis-chat
 
 # $(call fetch,repo,file,destination)
 define fetch

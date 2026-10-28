@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/kvcache", "crates/model", "crates/engine", "crates/server", "crates/bench"]
+members = ["crates/kvcache", "crates/model", "crates/engine", "crates/server", "crates/bench", "crates/chat"]
 exclude = ["fuzz"]
 
 [workspace.package]
