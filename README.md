@@ -18,8 +18,9 @@ downloaded or built.
 
 ### Terminal chat
 
-`make chat` (or `target/release/rlis-chat` once built, from any directory) opens a chat in the
-terminal: replies stream in with Markdown styling (headings, bold, code, lists) and a status
+`make chat` opens a chat in the terminal. `make install` links `rlis-chat` into
+`~/.cargo/bin` so you can run it from any directory (`make uninstall` removes the link).
+Replies stream in with Markdown styling (headings, bold, code, lists) and a status
 line, and each one ends with its token count, decode speed and time to first token. If no
 server answers at `--url` (default `http://127.0.0.1:8000`), it starts `rlis serve` in the
 background, warms it up so the first reply is fast, and stops it on exit; an already running
