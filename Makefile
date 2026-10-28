@@ -14,9 +14,10 @@ DEFAULT_GGUF := Llama-3.2-1B-Instruct-Q8_0.gguf
 
 LLAMA_CPP_TAG := b11936
 LLAMA_CPP_DIR := third_party/llama.cpp
+LLAMA_CPP_CMAKE_FLAGS ?= -DGGML_METAL=ON
 WIKITEXT_URL := $(HF)/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
 
-.PHONY: serve models models-all wikitext llama-cpp bench-mac bench-ablations bench-charts soak build test test-metal parity-ref chat-ref parity lint fuzz teardown
+.PHONY: serve models models-all wikitext llama-cpp bench-mac bench-cuda bench-ablations bench-charts soak build test test-metal parity-ref chat-ref parity lint fuzz teardown
 
 # One command from a fresh clone to a running server on http://127.0.0.1:8000.
 serve: models
@@ -60,7 +61,7 @@ llama-cpp:
 	uv venv .venv --python 3.12
 	VIRTUAL_ENV=.venv uv pip install cmake
 	.venv/bin/cmake -S $(LLAMA_CPP_DIR) -B $(LLAMA_CPP_DIR)/build -DCMAKE_BUILD_TYPE=Release \
-		-DGGML_METAL=ON -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+		$(LLAMA_CPP_CMAKE_FLAGS) -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
 	.venv/bin/cmake --build $(LLAMA_CPP_DIR)/build --target llama-server -j
 	rm -rf .venv .uv-cache
 	@ls -l $(LLAMA_CPP_DIR)/build/bin/llama-server
@@ -112,7 +113,16 @@ fuzz:
 bench-mac: models
 	cargo build --release --features $(FEATURES) -p server
 	cargo build --release -p bench
-	scripts/bench/mac_sweep.sh
+	scripts/bench/sweep.sh
+
+# The free CUDA run (M6): one Kaggle T4 session pinned to HEAD, which must be pushed to GitHub.
+# Parity first, then the same sweep against llama.cpp (CUDA); results land in results/cuda/.
+# Needs ~/.kaggle/kaggle.json from a phone-verified account (GPU and internet access).
+bench-cuda:
+	uv venv .venv --python 3.12
+	VIRTUAL_ENV=.venv uv pip install kaggle
+	KAGGLE=.venv/bin/kaggle scripts/cuda/kaggle.sh
+	rm -rf .venv .uv-cache
 
 bench-ablations: models
 	cargo build --release --features $(FEATURES) -p server
