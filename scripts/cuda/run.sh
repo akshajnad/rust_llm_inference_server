@@ -115,5 +115,7 @@ step build-llama-cpp wait "$LLAMA_CPP_BUILD" || {
   session passed-but-llama-cpp-build-failed
   exit 1
 }
-step sweep scripts/bench/sweep.sh
+# The spec's sweep is 1/4/16/32, with 64 only if it fits; free GPU time is about 6 hours a week,
+# so the cloud run stops at 32.
+step sweep env LEVELS="${LEVELS:-1,4,16,32}" scripts/bench/sweep.sh
 session passed
