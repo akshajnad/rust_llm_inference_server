@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Concurrency sweep of rlis and llama.cpp's server on the same model, quantization, KV budget
-# and batch size. Writes results/mac/<name>.json. Usage: scripts/bench/mac_sweep.sh [suffix]
+# and batch size. Writes $OUT/<name>.json (default results/mac). Usage: scripts/bench/sweep.sh [suffix]
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 SUFFIX=${1:-}
 MODEL=models/Llama-3.2-1B-Instruct-Q8_0.gguf
 PORT=${PORT:-18200}
-OUT=results/mac
+OUT=${OUT:-results/mac}
 mkdir -p "$OUT"
 BENCH=target/release/rlis-bench
 LEVELS=${LEVELS:-1,4,16,32,64}
