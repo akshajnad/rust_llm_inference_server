@@ -13,21 +13,72 @@ llama.cpp's server at high concurrency.
 make chat           # downloads the model (1.3 GB, into ./models), builds, chats in the terminal
 ```
 
-`make chat` opens a terminal chat (streaming, Markdown-styled replies, `/help` for commands, esc
-to interrupt). It starts a server in the background if none is running and stops it on exit.
-To run the server on its own instead:
+Needs Rust (`rustup`) and an Apple Silicon Mac. `make teardown` removes everything the project
+downloaded or built.
+
+### Terminal chat
+
+`make chat` (or `target/release/rlis-chat` once built, from any directory) opens a chat in the
+terminal: replies stream in with Markdown styling (headings, bold, code, lists) and a status
+line, and each one ends with its token count, decode speed and time to first token. If no
+server answers at `--url` (default `http://127.0.0.1:8000`), it starts `rlis serve` in the
+background, warms it up so the first reply is fast, and stops it on exit; an already running
+server is used as is. The conversation is kept across turns, and the oldest exchanges are
+dropped when it outgrows the 2,048-token context.
+
+| Command | |
+|---|---|
+| `/clear` | start a new conversation |
+| `/retry` | regenerate the last reply |
+| `/system <prompt>` | show or set the system prompt (`/system none` removes it) |
+| `/temp <x>` | show or set the temperature (default 0.6, top-p 0.9) |
+| `/help`, `/exit` | |
+
+| Key | |
+|---|---|
+| enter | send |
+| `\` then enter | new line (shift+enter and option+enter also work in terminals that send them) |
+| esc | interrupt a reply (generation stops on the server too), or clear the input |
+| ↑ ↓ | previous messages |
+| tab | complete a command |
+| ctrl-c twice, or ctrl-d on an empty line | quit |
+
+Options: `--system`, `--temperature`, `--top-p`, `--max-tokens`, `--url`, `--no-start` (fail
+instead of starting a server), and `rlis serve` flags after `--` for a server it starts, e.g.
+`rlis-chat -- --model models/Llama-3.2-1B-Instruct-Q4_K_M.gguf --kv-cache-gb 2`. A started
+server logs to `target/release/rlis-chat-server.log`.
+
+### Server and API
 
 ```sh
-make serve          # serves on :8000
+make serve          # serves on http://127.0.0.1:8000
 ```
 
 ```sh
-curl -N http://127.0.0.1:8000/v1/chat/completions -H 'content-type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Why is the sky blue?"}],"stream":true}'
+curl http://127.0.0.1:8000/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Why is the sky blue?"}]}'
 ```
 
-Needs Rust (`rustup`) and an Apple Silicon Mac. Any OpenAI client works against
-`http://127.0.0.1:8000/v1`. `make teardown` removes everything the project downloaded or built.
+With `"stream": true` (and `curl -N`) the reply arrives as server-sent events, one `data:` line
+per token. Any OpenAI client works against `http://127.0.0.1:8000/v1`:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="unused")
+stream = client.chat.completions.create(
+    model="llama-3.2-1b-instruct",
+    messages=[{"role": "user", "content": "Why is the sky blue?"}],
+    stream=True,
+)
+for chunk in stream:
+    if chunk.choices:
+        print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+Endpoints: `POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models`, `GET /health`,
+`GET /metrics`. `target/release/rlis serve --help` lists the server's flags (model, KV pool size,
+context length, host and port, scheduler).
 
 ## Benchmarks
 
@@ -113,6 +164,8 @@ from 4 to 32 concurrent requests, see Ablations); unique prompts need faster pre
   paged batch of 32), property tests for the allocator, a scheduler simulator, fuzzing of the
   request parser and stop strings, and a one-hour soak (13,018 requests with random client
   hang-ups, 0 errors, every KV block returned, memory flat within 3%).
+- **Terminal client** (`rlis-chat`): a dependency-light chat UI over the same API, with a
+  redrawn-in-place prompt box, streaming Markdown rendering and interrupt-by-disconnect.
 - **Observability**: Prometheus `/metrics` (TTFT, ITL, throughput, queue, batch, preemptions,
   KV utilization, prefix-cache hits, memory footprint) and opt-in per-stage GPU timing
   (`RLIS_PROFILE=1`).
