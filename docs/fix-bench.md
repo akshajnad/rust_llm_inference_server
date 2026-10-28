@@ -216,3 +216,107 @@ for occupancy.
     step at 8k) as it did in Automatic (34.4 ms), and the rerun's per-token times match the
     kernel benchmark.
   - llama.cpp's numbers were measured in Automatic.
+
+## `rlis fix` on 10 small tasks
+
+**Answer: the pipeline works; this model mostly can't write the fixes.** `rlis fix` with
+Qwen2.5-Coder 1.5B Instruct (Q8_0) fixed 1 of 10 small, single-bug Python tasks (flatten) with
+8 attempts each: pass@8 = 1/10, pass@1 = 0.03. Each task took 5–12 s end to end, almost all of
+it generation. The model's attempts fail in two roughly equal ways. Half of them don't produce a
+usable diff. The other half apply and change the right line, but the change is wrong.
+
+- **Tasks** (`bench/fix-tasks`, run with `make bench-fix`): 10 stdlib-only modules of 15–30
+  lines, each with one bug and a `unittest` file that fails on it (median of even lists, leap
+  years, a dropped last chunk, a binary search off-by-one, minutes parsed as hours, an LRU
+  `get` that doesn't refresh, slugify dashes, subtractive Roman numerals, unsorted or touching
+  intervals, one-level flatten). Each is solvable with a 1–6 line change (checked by hand). The
+  harness copies each into `target/fix-tasks/<name>` and runs `git init` there, so no repository
+  is nested in rlis.
+- **One run per task:** one `n=8` request at temperature 0.7, seed 0 (attempt i uses seed
+  i), up to 1,024 tokens each, 1 GiB KV pool, High Power mode. The prompt holds the task, the
+  failing test's output, the source and test files the traceback names, and `git grep` hits
+  for identifiers in the task: 600–1,060 tokens. Tests run 4 at a time. The test file is
+  protected: edits to it are dropped from a candidate before it is applied.
+- **pass@1** is c/8, the unbiased estimate from the 8 samples; **pass@8** is whether any
+  attempt passed. Times are wall clock from `rlis fix` start to the printed result.
+
+| task | applied | passed | pass@1 | pass@8 | prompt tok | output tok | generate (s) | tests (s) | total (s) |
+|---|---|---|---|---|---|---|---|---|---|
+| binary_search | 5/8 | 0/8 | 0.00 | 0 | 721 | 1082 | 4.8 | 0.5 | 5.7 |
+| chunk | 4/8 | 0/8 | 0.00 | 0 | 841 | 2448 | 10.7 | 0.4 | 11.5 |
+| duration | 3/8 | 0/8 | 0.00 | 0 | 860 | 1793 | 8.9 | 0.4 | 9.7 |
+| flatten | 8/8 | 2/8 | 0.25 | 1 | 772 | 1225 | 7.3 | 0.5 | 8.1 |
+| intervals | 3/8 | 0/8 | 0.00 | 0 | 1060 | 1950 | 9.8 | 0.4 | 10.6 |
+| leap_year | 3/8 | 0/8 | 0.00 | 0 | 833 | 1982 | 9.5 | 0.5 | 10.4 |
+| lru | 4/8 | 0/8 | 0.00 | 0 | 796 | 1689 | 9.3 | 0.4 | 10.1 |
+| median | 4/8 | 0/8 | 0.00 | 0 | 598 | 1465 | 7.3 | 0.5 | 8.2 |
+| roman | 1/8 | 0/8 | 0.00 | 0 | 859 | 841 | 4.2 | 0.4 | 5.0 |
+| slugify | 3/8 | 0/8 | 0.00 | 0 | 595 | 1416 | 6.5 | 0.4 | 7.3 |
+| **all 10** | 38/80 | 2/80 | **0.03** | **1/10** | | | 78.4 | | 86.6 |
+
+Server peak footprint over the whole run: 3.25 GB. Raw results, including every attempt's raw
+and applied diff: `results/mac/fix/*.json`.
+
+**Where the 80 attempts went:**
+
+| Outcome | Attempts |
+|---|---|
+| Passed | 2 |
+| Applied, test still fails | 36 |
+| Didn't apply | 23 |
+| Applied but changed nothing | 6 |
+| Only edited the test file | 13 |
+
+- **Wrong fixes.** Applied patches mostly change the right line in the wrong way. In
+  binary_search, 4 of 5 turn `==` or `<` into `<=`. In chunk, they drop the step or add a
+  filter that drops the remainder again. In the LRU cache, they change the capacity check or
+  `__len__`.
+- **Unusable diffs.** Typical failures: the fixed line written as an unchanged context line
+  (no `-`/`+`, so it can't match the file), or a line the patch deletes repeated as context
+  after it. Neither can be repaired mechanically without guessing what was meant. `git apply
+  --recount` tolerates wrong hunk counts and line numbers, but 21 of the 38 applied patches
+  needed `patch --fuzz` on top.
+- **Test edits.** 35 of 80 attempts edit the test file. The first run rejected those attempts
+  outright: 26/80 applied, 1 passed (`results/mac/fix-reject-test-edits/`). Dropping just the
+  test-file sections gave the same samples (same seeds, identical token counts) 12 more applied
+  patches and 1 more pass, and didn't change pass@8.
+
+**Cost.** Generation is 90% of the wall time: 8 attempts of 100–300 tokens decode together at
+170–230 tok/s aggregate. Building the context takes ≤ 0.11 s, and applying and testing all 8
+takes 0.3–0.5 s.
+
+**Caveats.**
+- One seed per task, so pass@1 = 0.03 rests on 2 passes.
+- Ten tiny tasks say little about real repositories. The prompt includes whole files and
+  would need a budget for large ones.
+- The protected-file rule assumes the test file is known. `rlis fix` takes it as `--protect`.
+- The model, not the inference path, is the bottleneck here. Two pieces of evidence: forked
+  outputs equal separate requests token for token, and Qwen parity passes (below).
+
+### Qwen2 support
+
+`rlis fix` needed a coding model, and rlis only ran Llama. Qwen2.5-Coder 1.5B now loads from
+GGUF (`make models-qwen`) as Llama plus Q/K/V biases, with `qwen2.*` metadata and unpermuted
+(rotate-half) RoPE. Three things broke on the way:
+
+- **Paged decode kernel limits.** Qwen has 12 query heads over 2 KV heads (6 per KV head),
+  over the kernel's limit of 4. The kernel is now compiled for up to 4 and up to 8. Llama's
+  attention time at 8k context and batch 8: 21.9 ms before, 25.0 ms with one 8-wide kernel,
+  22.1 ms with the two variants. Its decode step: 40.0, 42.9 and 40.2 ms.
+- **f16 overflow.** With the f16 KV pool every logit came out NaN. Qwen's K bias makes |k|
+  reach ~360 in layer 0, and q·k in f16 overflows before the scale is applied. The pool stays
+  f16, but Qwen's gathered attention (prefill, v1) runs in f32. The decode kernel already
+  scored in f32.
+- **Sampler.** The GPU sampler occasionally gave infinite Gumbel noise to one token (see
+  DESIGN.md, Sampling). That put stray tokens in about 1% of steps for any model. Before the
+  fix, `rlis fix` diffs were full of them.
+
+Parity (`make parity-qwen`) runs against transformers' own Qwen2 code. It holds the GGUF's
+weights in f16 and does every matmul in f32, since f32 weights (~6 GB) would break the memory
+budget; that reference run peaked at 3.98 GB. Results:
+- logits within 0.016 (f16 gate: 0.15);
+- greedy output token-for-token on 20 prompts × 128 tokens, alone and as a paged batch of 32
+  through the 6-head kernel;
+- tokenizer and ChatML template match transformers.
+
+Llama's f16 parity gate still passes as before.

@@ -51,9 +51,15 @@ pub fn sample_rows(logits: &Tensor, rows: &[RowSampling]) -> Result<Vec<u32>> {
 }
 
 fn gumbel(key: u32, v: u32) -> f32 {
-    let h = lowbias32(key ^ v.wrapping_mul(0x9e37_79b9));
-    let u = ((h >> 8) as f32 + 0.5) * (1.0 / 16_777_216.0);
+    let u = uniform(lowbias32(key ^ v.wrapping_mul(0x9e37_79b9)));
     -(-(u.ln())).ln()
+}
+
+/// A uniform draw in (0, 1) from a hash: its top 23 bits plus a half, which f32 holds exactly.
+/// (With 24 bits, 2^24 - 0.5 rounds up to 2^24, so one hash in 2^24 gave u = 1 and infinite
+/// noise: that token won whatever its logit, on ~1% of steps over a 150k vocabulary.)
+fn uniform(h: u32) -> f32 {
+    ((h >> 9) as f32 + 0.5) * (1.0 / 8_388_608.0)
 }
 
 struct SampleRows;
@@ -186,6 +192,16 @@ mod tests {
             [1, 0]
         );
         Ok(())
+    }
+
+    /// Every hash gives a uniform strictly inside (0, 1), so the noise is always finite.
+    #[test]
+    fn uniform_stays_inside_the_unit_interval() {
+        for top in 0..1u32 << 23 {
+            let u = uniform(top << 9 | 0x1ff);
+            assert!(u > 0.0 && u < 1.0, "hash {:#x}: u = {u}", top << 9);
+        }
+        assert!(gumbel(0, 0).is_finite() && (-(-(uniform(u32::MAX).ln())).ln()).is_finite());
     }
 
     /// Gumbel-max over many keys reproduces softmax(logits / T).

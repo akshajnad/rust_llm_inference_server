@@ -1,0 +1,1 @@
+{"task": "`is_leap_year()` in dates.py treats every year divisible by 4 as a leap year, so 1900 and 2100 come out wrong. Use the Gregorian rule.", "test": "python -m unittest -q", "protect": ["test_dates.py"]}

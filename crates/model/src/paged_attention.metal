@@ -15,14 +15,19 @@
 // (flash-decoding): `paged_attention_decode_split` runs one threadgroup per (pair, partition)
 // and writes each partition's max score, softmax denominator and unnormalized output, and
 // `paged_attention_reduce` merges the partitions.
+//
+// Each kernel comes in two widths, REP = 4 and 8 query heads per kv head (`_r4`, `_r8`). The
+// per-lane state is sized by REP, and the wider variant's registers cost the narrow layouts
+// (Llama 3.2) about 10% if they share it.
 
 #include <metal_stdlib>
 using namespace metal;
 
 #define NSG 8
-#define MAX_REP 4
 #define MAX_DPL 4
 #define MAX_HEAD_DIM 128
+// Query heads whose outputs are merged across simdgroups per round of threadgroup staging.
+#define MERGE_HEADS 4
 
 // Eight consecutive K elements as two float4s, in one 16-byte load for half.
 inline void load8(device const half* p, thread float4& a, thread float4& b) {
@@ -38,17 +43,18 @@ inline void load8(device const float* p, thread float4& a, thread float4& b) {
 
 // Online-softmax state for every query head of a GQA group: max score, denominator relative
 // to it, and unnormalized output (this lane's dimensions).
+template <uint REP>
 struct Partial {
-    float m[MAX_REP];
-    float l[MAX_REP];
-    float acc[MAX_REP][MAX_DPL];
+    float m[REP];
+    float l[REP];
+    float acc[REP][MAX_DPL];
 };
 
 // Attends context positions [start, end) of one (kv head, sequence) pair and merges the
 // simdgroups' states; every thread returns the merged state for its lane's dimensions. An
 // empty range gives m = -inf, l = 0, acc = 0.
-template <typename T>
-inline Partial attend_range(
+template <typename T, uint REP>
+inline Partial<REP> attend_range(
     device const T* q,
     device const T* k_cache,
     device const T* v_cache,
@@ -78,7 +84,7 @@ inline Partial attend_range(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    Partial p;
+    Partial<REP> p;
     for (uint r = 0; r < n_rep; r++) {
         for (uint d = 0; d < dpl; d++) {
             p.acc[r][d] = 0.0f;
@@ -92,13 +98,16 @@ inline Partial attend_range(
         const uint t = t0 + lane;
         const bool valid = t < end;
         const uint slot = valid ? table[t / block_size] * block_size + t % block_size : 0;
-        float s[MAX_REP];
+        float s[REP];
         for (uint r = 0; r < n_rep; r++) {
             s[r] = -INFINITY;
         }
         if (valid) {
             device const T* krow = k_cache + (slot * n_kv + kvh) * head_dim;
-            float dots[MAX_REP] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float dots[REP];
+            for (uint r = 0; r < n_rep; r++) {
+                dots[r] = 0.0f;
+            }
             for (uint i = 0; i < head_dim / 8; i++) {
                 float4 ka, kb;
                 load8(krow + i * 8, ka, kb);
@@ -112,7 +121,7 @@ inline Partial attend_range(
             }
         }
         // One online-softmax update for the whole block.
-        float e[MAX_REP];
+        float e[REP];
         for (uint r = 0; r < n_rep; r++) {
             const float m_new = max(p.m[r], simd_max(s[r]));
             const float corr = exp(p.m[r] - m_new);
@@ -141,42 +150,51 @@ inline Partial attend_range(
         }
     }
 
-    for (uint r = 0; r < n_rep; r++) {
-        if (lane == 0) {
-            tg_m[sg * MAX_REP + r] = p.m[r];
-            tg_l[sg * MAX_REP + r] = p.l[r];
-        }
-        for (uint d = 0; d < dpl; d++) {
-            tg_acc[(sg * MAX_REP + r) * MAX_HEAD_DIM + lane * dpl + d] = p.acc[r][d];
+    // Merge the simdgroups' states, staging MERGE_HEADS heads' outputs per round: all of
+    // them at once would take NSG * REP * MAX_HEAD_DIM floats, 32 KB at REP 8.
+    if (lane == 0) {
+        for (uint r = 0; r < n_rep; r++) {
+            tg_m[sg * REP + r] = p.m[r];
+            tg_l[sg * REP + r] = p.l[r];
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    Partial out;
-    for (uint r = 0; r < n_rep; r++) {
-        float big = -INFINITY;
-        for (uint g = 0; g < NSG; g++) {
-            big = max(big, tg_m[g * MAX_REP + r]);
+    for (uint r0 = 0; r0 < n_rep; r0 += MERGE_HEADS) {
+        const uint r1 = min(r0 + MERGE_HEADS, n_rep);
+        if (r0 > 0) {
+            // Everyone has read the previous round before it is overwritten.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        // Simdgroups that saw no positions have l = 0 and m = -inf; weight them 0 rather
-        // than exp(-inf - -inf).
-        float w[NSG];
-        float total = 0.0f;
-        for (uint g = 0; g < NSG; g++) {
-            w[g] = tg_l[g * MAX_REP + r] > 0.0f ? exp(tg_m[g * MAX_REP + r] - big) : 0.0f;
-            total += tg_l[g * MAX_REP + r] * w[g];
-        }
-        out.m[r] = big;
-        out.l[r] = total;
-        for (uint d = 0; d < dpl; d++) {
-            float a = 0.0f;
-            for (uint g = 0; g < NSG; g++) {
-                a += tg_acc[(g * MAX_REP + r) * MAX_HEAD_DIM + lane * dpl + d] * w[g];
+        for (uint r = r0; r < r1; r++) {
+            for (uint d = 0; d < dpl; d++) {
+                tg_acc[(sg * MERGE_HEADS + r - r0) * MAX_HEAD_DIM + lane * dpl + d] = p.acc[r][d];
             }
-            out.acc[r][d] = a;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = r0; r < r1; r++) {
+            float big = -INFINITY;
+            for (uint g = 0; g < NSG; g++) {
+                big = max(big, tg_m[g * REP + r]);
+            }
+            // Simdgroups that saw no positions have l = 0 and m = -inf; weight them 0 rather
+            // than exp(-inf - -inf).
+            float w[NSG];
+            float total = 0.0f;
+            for (uint g = 0; g < NSG; g++) {
+                w[g] = tg_l[g * REP + r] > 0.0f ? exp(tg_m[g * REP + r] - big) : 0.0f;
+                total += tg_l[g * REP + r] * w[g];
+            }
+            p.m[r] = big;
+            p.l[r] = total;
+            for (uint d = 0; d < dpl; d++) {
+                float a = 0.0f;
+                for (uint g = 0; g < NSG; g++) {
+                    a += tg_acc[(g * MERGE_HEADS + r - r0) * MAX_HEAD_DIM + lane * dpl + d] * w[g];
+                }
+                p.acc[r][d] = a;
+            }
         }
     }
-    return out;
+    return p;
 }
 
 #define DECODE_ARGS(T)                                                                 \
@@ -195,19 +213,19 @@ inline Partial attend_range(
     uint sg [[simdgroup_index_in_threadgroup]],                                        \
     uint lane [[thread_index_in_simdgroup]]
 
-#define THREADGROUP_SCRATCH                                                            \
-    threadgroup float tg_q[MAX_REP * MAX_HEAD_DIM];                                    \
-    threadgroup float tg_m[NSG * MAX_REP];                                             \
-    threadgroup float tg_l[NSG * MAX_REP];                                             \
-    threadgroup float tg_acc[NSG * MAX_REP * MAX_HEAD_DIM]
+#define THREADGROUP_SCRATCH(REP)                                                       \
+    threadgroup float tg_q[REP * MAX_HEAD_DIM];                                        \
+    threadgroup float tg_m[NSG * REP];                                                 \
+    threadgroup float tg_l[NSG * REP];                                                 \
+    threadgroup float tg_acc[NSG * MERGE_HEADS * MAX_HEAD_DIM]
 
 // Grid (n_kv, sequences): the whole context in one threadgroup, normalized output.
-#define INSTANTIATE_DECODE(NAME, T)                                                    \
+#define INSTANTIATE_DECODE(NAME, T, REP)                                               \
 kernel void NAME(DECODE_ARGS(T), device T* out [[buffer(5)]])                          \
 {                                                                                      \
-    THREADGROUP_SCRATCH;                                                               \
+    THREADGROUP_SCRATCH(REP);                                                          \
     const uint kvh = tgid.x, seq = tgid.y;                                             \
-    const Partial p = attend_range<T>(q, k_cache, v_cache,                             \
+    const Partial<REP> p = attend_range<T, REP>(q, k_cache, v_cache,                   \
         block_tables + seq * max_blocks, seq, kvh, n_heads, n_kv, head_dim,            \
         block_size, scale, 0, ctx_lens[seq], tg_q, tg_m, tg_l, tg_acc, sg, lane);            \
     if (sg == 0) {                                                                     \
@@ -224,19 +242,19 @@ kernel void NAME(DECODE_ARGS(T), device T* out [[buffer(5)]])                   
 
 // Grid (n_kv, sequences, partitions of `part` positions). Writes each partition's (m, l) to
 // `ml` and unnormalized output to `acc`, indexed by ((seq * n_heads + head) * splits + split).
-#define INSTANTIATE_SPLIT(NAME, T)                                                     \
+#define INSTANTIATE_SPLIT(NAME, T, REP)                                                \
 kernel void NAME(DECODE_ARGS(T),                                                       \
     device float* ml [[buffer(5)]],                                                    \
     device float* acc [[buffer(12)]],                                                  \
     constant uint& part [[buffer(13)]],                                                \
     constant uint& splits [[buffer(14)]])                                              \
 {                                                                                      \
-    THREADGROUP_SCRATCH;                                                               \
+    THREADGROUP_SCRATCH(REP);                                                          \
     const uint kvh = tgid.x, seq = tgid.y, split = tgid.z;                             \
     const uint ctx = ctx_lens[seq];                                                    \
     const uint start = min(split * part, ctx);                                         \
     const uint end = min(start + part, ctx);                                           \
-    const Partial p = attend_range<T>(q, k_cache, v_cache,                             \
+    const Partial<REP> p = attend_range<T, REP>(q, k_cache, v_cache,                   \
         block_tables + seq * max_blocks, seq, kvh, n_heads, n_kv, head_dim,            \
         block_size, scale, start, end, tg_q, tg_m, tg_l, tg_acc, sg, lane);                  \
     if (sg == 0) {                                                                     \
@@ -285,9 +303,13 @@ kernel void NAME(                                                               
     out[row * head_dim + d] = T(a / total);                                            \
 }
 
-INSTANTIATE_DECODE(paged_attention_decode_f32, float)
-INSTANTIATE_DECODE(paged_attention_decode_f16, half)
-INSTANTIATE_SPLIT(paged_attention_decode_split_f32, float)
-INSTANTIATE_SPLIT(paged_attention_decode_split_f16, half)
+INSTANTIATE_DECODE(paged_attention_decode_f32_r4, float, 4)
+INSTANTIATE_DECODE(paged_attention_decode_f16_r4, half, 4)
+INSTANTIATE_DECODE(paged_attention_decode_f32_r8, float, 8)
+INSTANTIATE_DECODE(paged_attention_decode_f16_r8, half, 8)
+INSTANTIATE_SPLIT(paged_attention_decode_split_f32_r4, float, 4)
+INSTANTIATE_SPLIT(paged_attention_decode_split_f16_r4, half, 4)
+INSTANTIATE_SPLIT(paged_attention_decode_split_f32_r8, float, 8)
+INSTANTIATE_SPLIT(paged_attention_decode_split_f16_r8, half, 8)
 INSTANTIATE_REDUCE(paged_attention_reduce_f32, float)
 INSTANTIATE_REDUCE(paged_attention_reduce_f16, half)

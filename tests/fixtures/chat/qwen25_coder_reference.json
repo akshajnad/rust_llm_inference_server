@@ -1,0 +1,196 @@
+[
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello!"
+   }
+  ],
+  "text": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n",
+  "ids": [
+   151644,
+   8948,
+   198,
+   2610,
+   525,
+   1207,
+   16948,
+   11,
+   3465,
+   553,
+   54364,
+   14817,
+   13,
+   1446,
+   525,
+   264,
+   10950,
+   17847,
+   13,
+   151645,
+   198,
+   151644,
+   872,
+   198,
+   9707,
+   0,
+   151645,
+   198,
+   151644,
+   77091,
+   198
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "  You are terse.  "
+   },
+   {
+    "role": "user",
+    "content": "Why is the sky blue?"
+   }
+  ],
+  "text": "<|im_start|>system\n  You are terse.  <|im_end|>\n<|im_start|>user\nWhy is the sky blue?<|im_end|>\n<|im_start|>assistant\n",
+  "ids": [
+   151644,
+   8948,
+   198,
+   220,
+   1446,
+   525,
+   50537,
+   13,
+   256,
+   151645,
+   198,
+   151644,
+   872,
+   198,
+   10234,
+   374,
+   279,
+   12884,
+   6303,
+   30,
+   151645,
+   198,
+   151644,
+   77091,
+   198
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Name a prime."
+   },
+   {
+    "role": "assistant",
+    "content": "7"
+   },
+   {
+    "role": "user",
+    "content": "Another, with emoji 🎉 and ünïcödé."
+   }
+  ],
+  "text": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nName a prime.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nAnother, with emoji 🎉 and ünïcödé.<|im_end|>\n<|im_start|>assistant\n",
+  "ids": [
+   151644,
+   8948,
+   198,
+   2610,
+   525,
+   1207,
+   16948,
+   11,
+   3465,
+   553,
+   54364,
+   14817,
+   13,
+   1446,
+   525,
+   264,
+   10950,
+   17847,
+   13,
+   151645,
+   198,
+   151644,
+   872,
+   198,
+   675,
+   264,
+   10250,
+   13,
+   151645,
+   198,
+   151644,
+   77091,
+   198,
+   22,
+   151645,
+   198,
+   151644,
+   872,
+   198,
+   14037,
+   11,
+   448,
+   42365,
+   11162,
+   236,
+   231,
+   323,
+   10489,
+   77,
+   37572,
+   66,
+   2956,
+   128505,
+   13,
+   151645,
+   198,
+   151644,
+   77091,
+   198
+  ]
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": ""
+   },
+   {
+    "role": "user",
+    "content": "\nleading and trailing newlines\n"
+   }
+  ],
+  "text": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n\nleading and trailing newlines\n<|im_end|>\n<|im_start|>assistant\n",
+  "ids": [
+   151644,
+   8948,
+   198,
+   151645,
+   198,
+   151644,
+   872,
+   271,
+   20654,
+   323,
+   27748,
+   501,
+   7969,
+   198,
+   151645,
+   198,
+   151644,
+   77091,
+   198
+  ]
+ }
+]

@@ -1,6 +1,10 @@
 //! Parity against Hugging Face transformers (float32, CPU), using the fixture written by
 //! `make parity-ref`. Needs the downloaded model, so it is ignored by default:
 //! `make parity` (or `PARITY_DEVICE=cpu|metal|cuda PARITY_DTYPE=f32|f16 cargo test ...`).
+//!
+//! `PARITY_MODEL=qwen` (`make parity-qwen`) tests Qwen2.5-Coder 1.5B instead: the Q8_0 GGUF as
+//! served (f32 activations, f16 KV) against `make parity-ref-qwen`, whose reference holds the
+//! same weights rounded to f16, so it gets the f16 tolerances.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +34,29 @@ fn tie_margin(dtype: DType) -> f32 {
     }
 }
 
+/// The model under test and its reference.
+struct Target {
+    fixture: &'static str,
+    tokenizer_dir: &'static str,
+    /// Served from this GGUF; otherwise the safetensors in `tokenizer_dir` at `PARITY_DTYPE`.
+    gguf: Option<&'static str>,
+}
+
+fn target() -> Target {
+    match std::env::var("PARITY_MODEL").as_deref() {
+        Ok("qwen") => Target {
+            fixture: "tests/fixtures/parity/qwen25_coder_reference.safetensors",
+            tokenizer_dir: "models/qwen2.5-coder-1.5b-instruct",
+            gguf: Some("models/Qwen2.5-Coder-1.5B-Instruct-Q8_0.gguf"),
+        },
+        _ => Target {
+            fixture: "tests/fixtures/parity/reference.safetensors",
+            tokenizer_dir: "models/llama-3.2-1b-instruct",
+            gguf: None,
+        },
+    }
+}
+
 struct Case {
     prompt_ids: Vec<u32>,
     greedy_ids: Vec<u32>,
@@ -43,7 +70,7 @@ fn root() -> PathBuf {
 }
 
 fn load_cases() -> Vec<Case> {
-    let path = root().join("tests/fixtures/parity/reference.safetensors");
+    let path = root().join(target().fixture);
     let t: HashMap<String, Tensor> = candle_core::safetensors::load(&path, &Device::Cpu)
         .unwrap_or_else(|e| panic!("{}: {e}; run `make parity-ref`", path.display()));
     let get = |k: String| t.get(&k).unwrap_or_else(|| panic!("missing {k}")).clone();
@@ -59,6 +86,7 @@ fn load_cases() -> Vec<Case> {
         .collect()
 }
 
+/// The model, its device, and the dtype that sets the tolerances (f16 for a GGUF).
 fn setup() -> (Llama, Device, DType) {
     let (dev_name, device) = device();
     let dtype = match std::env::var("PARITY_DTYPE").as_deref() {
@@ -66,9 +94,21 @@ fn setup() -> (Llama, Device, DType) {
         Ok("bf16") => DType::BF16,
         _ => DType::F32,
     };
-    let dir = root().join("models/llama-3.2-1b-instruct");
-    let model = Llama::load(&dir, dtype, &device, 1024).unwrap();
-    eprintln!("parity: device={dev_name} dtype={dtype:?}");
+    let t = target();
+    let (model, dtype) = match t.gguf {
+        Some(file) => (
+            model::load(&root().join(file), DType::F32, &device, 1024).unwrap(),
+            DType::F16,
+        ),
+        None => (
+            Llama::load(&root().join(t.tokenizer_dir), dtype, &device, 1024).unwrap(),
+            dtype,
+        ),
+    };
+    eprintln!(
+        "parity: {} device={dev_name} tolerances={dtype:?}",
+        t.fixture
+    );
     (model, device, dtype)
 }
 
@@ -106,7 +146,7 @@ fn logsumexp(v: &[f32]) -> f32 {
 #[ignore = "needs models/ (make models) and a GPU"]
 fn tokenizer_matches_reference() {
     let tok = tokenizers::Tokenizer::from_file(
-        root().join("models/llama-3.2-1b-instruct/tokenizer.json"),
+        root().join(target().tokenizer_dir).join("tokenizer.json"),
     )
     .unwrap();
     let prompts: Vec<String> = serde_json::from_str(
@@ -134,7 +174,7 @@ fn teacher_forced_logits_match_reference() {
         let mut kv = ContiguousKvCache::new(
             model.config(),
             case.prompt_ids.len() + STEPS,
-            dtype,
+            model.dtype(),
             &device,
         )
         .unwrap();
@@ -171,7 +211,7 @@ fn greedy_tokens_match_reference() {
         let mut kv = ContiguousKvCache::new(
             model.config(),
             case.prompt_ids.len() + STEPS,
-            dtype,
+            model.dtype(),
             &device,
         )
         .unwrap();
@@ -225,7 +265,8 @@ fn paged_batch_of_32_matches_reference() {
     let batch: Vec<&Case> = (0..N).map(|i| &cases[i % cases.len()]).collect();
     let longest = batch.iter().map(|c| c.prompt_ids.len()).max().unwrap() + STEPS;
     let per_seq = longest.div_ceil(BS);
-    let mut cache = PagedKvCache::new(model.config(), N * per_seq, BS, dtype, &device).unwrap();
+    let mut cache =
+        PagedKvCache::new(model.config(), N * per_seq, BS, model.kv_dtype(), &device).unwrap();
     let attention = match std::env::var("PARITY_ATTENTION").as_deref() {
         Ok("v1") => AttentionImpl::Gather,
         _ => AttentionImpl::Kernel,

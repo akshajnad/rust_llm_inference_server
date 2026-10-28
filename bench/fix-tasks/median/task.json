@@ -1,0 +1,1 @@
+{"task": "`median()` in stats.py is wrong for lists with an even number of elements: it should return the average of the two middle values.", "test": "python -m unittest -q", "protect": ["test_stats.py"]}

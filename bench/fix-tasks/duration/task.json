@@ -1,0 +1,1 @@
+{"task": "`parse_duration()` in timefmt.py gets minutes wrong: parse_duration(\"45m\") should be 2700 seconds.", "test": "python -m unittest -q", "protect": ["test_timefmt.py"]}

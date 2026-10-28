@@ -1,0 +1,1 @@
+{"task": "`merge()` in intervals.py should merge overlapping or touching intervals and return them sorted, but it fails on unsorted input and on intervals that only touch, like (1, 2) and (2, 4).", "test": "python -m unittest -q", "protect": ["test_intervals.py"]}

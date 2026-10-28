@@ -68,7 +68,8 @@ impl candle_nn::var_builder::SimpleBackend for CastOnCpu {
     }
 }
 
-/// Llama-architecture decoder (RMSNorm, RoPE, grouped-query attention, SwiGLU).
+/// Llama-architecture decoder (RMSNorm, RoPE, grouped-query attention, SwiGLU), optionally
+/// with Q/K/V biases (Qwen2).
 #[derive(Debug, Clone)]
 pub struct Llama {
     cfg: LlamaConfig,
@@ -90,6 +91,8 @@ pub struct BlockWeights {
     pub q: Linear,
     pub k: Linear,
     pub v: Linear,
+    /// Q, K and V biases (Qwen2); Llama has none.
+    pub qkv_bias: Option<[Tensor; 3]>,
     pub o: Linear,
     pub post_attn_norm: RmsNorm,
     pub gate: Linear,
@@ -172,7 +175,7 @@ impl Llama {
             .into_iter()
             .map(|b| Block {
                 input_norm: b.input_norm,
-                attn: Attention::new(b.q, b.k, b.v, b.o, &p.cfg),
+                attn: Attention::new(b.q, b.k, b.v, b.qkv_bias, b.o, &p.cfg),
                 post_attn_norm: b.post_attn_norm,
                 mlp: Mlp::new(b.gate, b.up, b.down),
             })

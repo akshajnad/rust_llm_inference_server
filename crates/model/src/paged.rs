@@ -28,6 +28,9 @@ pub struct PagedKvCache {
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    /// Dtype that gathered (v1) attention computes in: the cache dtype, or f32 when the model
+    /// needs f32 scores (`LlamaConfig::attention_f32`). The decode kernel always scores in f32.
+    math_dtype: DType,
     attention: AttentionImpl,
     #[cfg(feature = "metal")]
     pipelines: std::sync::Arc<crate::paged_attention::metal_impl::Pipelines>,
@@ -60,6 +63,10 @@ impl PagedKvCache {
             n_heads: cfg.num_attention_heads,
             n_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim(),
+            math_dtype: match cfg.attention_f32 {
+                true => DType::F32,
+                false => dtype,
+            },
             attention: AttentionImpl::Gather,
             #[cfg(feature = "metal")]
             pipelines: Default::default(),
@@ -316,37 +323,37 @@ impl KvBatch for PagedBatch<'_> {
     ) -> Result<Tensor> {
         let (kc, vc) = (&self.cache.k[layer], &self.cache.v[layer]);
         // Attention runs in the cache dtype (f16 KV under f32 activations for quantized
-        // models); casts are no-ops when the dtypes already match.
-        let act_dtype = q.dtype();
-        let (q, k, v) = (
-            &q.to_dtype(kc.dtype())?,
-            &k.to_dtype(kc.dtype())?,
-            &v.to_dtype(kc.dtype())?,
-        );
+        // models) unless the model needs f32 scores; casts are no-ops when the dtypes match.
+        let (act_dtype, math) = (q.dtype(), self.cache.math_dtype);
+        let q = &q.to_dtype(math)?;
         // (1, n_kv, T, d) -> (T, n_kv, d), one scatter for the whole batch.
-        let rows = |t: &Tensor| t.squeeze(0)?.transpose(0, 1)?.contiguous();
+        let rows = |t: &Tensor| {
+            t.to_dtype(kc.dtype())?
+                .squeeze(0)?
+                .transpose(0, 1)?
+                .contiguous()
+        };
         kc.scatter_set(&self.write_index, &rows(k)?, 0)?;
         vc.scatter_set(&self.write_index, &rows(v)?, 0)?;
+        let gather =
+            |cache: &Tensor, i: usize| self.cache.gather(cache, self.slots(i)?)?.to_dtype(math);
         let Some(plan) = &self.decode else {
-            return attend_segments(q, segments, |i, _| {
-                Ok((
-                    self.cache.gather(kc, self.slots(i)?)?,
-                    self.cache.gather(vc, self.slots(i)?)?,
-                ))
-            })?
-            .to_dtype(act_dtype);
+            return attend_segments(q, segments, |i, _| Ok((gather(kc, i)?, gather(vc, i)?)))?
+                .to_dtype(act_dtype);
         };
         // (1, n_heads, T, d) -> (T, n_heads, d) query rows.
-        let q_rows = q.squeeze(0)?.transpose(0, 1)?;
+        let q_rows = q.to_dtype(kc.dtype())?.squeeze(0)?.transpose(0, 1)?;
         let q_dec = match &plan.token_rows {
             None => q_rows.contiguous()?,
             Some(rows) => q_rows.contiguous()?.index_select(rows, 0)?,
         };
-        let out_dec = q_dec.apply_op3_no_bwd(
-            &plan.tables,
-            &plan.ctx_lens,
-            &self.cache.kernel_op(layer, plan.max_context),
-        )?;
+        let out_dec = q_dec
+            .apply_op3_no_bwd(
+                &plan.tables,
+                &plan.ctx_lens,
+                &self.cache.kernel_op(layer, plan.max_context),
+            )?
+            .to_dtype(math)?;
         let out_rows = match &plan.reorder {
             None => out_dec,
             Some(reorder) => {
@@ -356,8 +363,7 @@ impl KvBatch for PagedBatch<'_> {
                     .enumerate()
                     .filter(|(i, _)| !plan.seqs.contains(i))
                 {
-                    let k_all = self.cache.gather(kc, self.slots(i)?)?;
-                    let v_all = self.cache.gather(vc, self.slots(i)?)?;
+                    let (k_all, v_all) = (gather(kc, i)?, gather(vc, i)?);
                     let qs = q.narrow(2, seg.offset, seg.len)?;
                     let o = segment_attention(&qs, &k_all, &v_all, seg)?;
                     parts.push(o.squeeze(0)?.transpose(0, 1)?);
@@ -435,6 +441,52 @@ mod tests {
                 assert!(d < 1e-4, "seq {i}: logit diff {d}");
             }
         }
+        Ok(())
+    }
+
+    /// Scores past f16's range (Qwen2's |k| reaches ~360) overflow an f16 cache's attention
+    /// unless the model asks for f32 scores; then the result matches f32 attention over the
+    /// same f16-stored keys and values.
+    #[test]
+    fn f32_scores_survive_f16_overflow() -> Result<()> {
+        use crate::attention::{causal_mask, gqa_attention};
+        let dev = Device::Cpu;
+        let base = LlamaConfig::tiny();
+        let (n, d) = (5, base.head_dim());
+        let q = (Tensor::randn(0f32, 1.0, (1, base.num_attention_heads, n, d), &dev)? + 30.0)?;
+        let k = (Tensor::randn(0f32, 1.0, (1, base.num_key_value_heads, n, d), &dev)? + 300.0)?;
+        let v = Tensor::randn(0f32, 1.0, (1, base.num_key_value_heads, n, d), &dev)?;
+        let mask = causal_mask(n, 0, &dev)?;
+        let attend = |attention_f32| -> Result<Tensor> {
+            let cfg = LlamaConfig {
+                attention_f32,
+                ..base.clone()
+            };
+            let cache = PagedKvCache::new(&cfg, 4, 2, DType::F16, &dev)?;
+            let seq = [PagedSeq {
+                block_table: &[3, 0, 2],
+                start_pos: 0,
+                len: n,
+            }];
+            let seg = [Segment {
+                offset: 0,
+                len: n,
+                start_pos: 0,
+                mask: Some(mask.clone()),
+            }];
+            PagedBatch::new(&cache, &seq)?.attend(0, &q, &k, &v, &seg)
+        };
+        let finite = |t: &Tensor| -> Result<bool> {
+            Ok(t.flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .all(|x| x.is_finite()))
+        };
+        assert!(!finite(&attend(false)?)?, "expected f16 scores to overflow");
+        let f16_round = |t: &Tensor| t.to_dtype(DType::F16)?.to_dtype(DType::F32);
+        let want = gqa_attention(&q, &f16_round(&k)?, &f16_round(&v)?, Some(&mask))?;
+        let d = max_diff(&attend(true)?, &want)?;
+        assert!(d < 1e-4, "max diff {d}");
         Ok(())
     }
 

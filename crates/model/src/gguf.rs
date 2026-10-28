@@ -1,12 +1,14 @@
 //! Loads llama.cpp GGUF checkpoints (Q8_0, Q4_K_M, ...) into the same `Llama` forward pass.
+//! Two architectures: `llama` and `qwen2` (Llama plus Q/K/V biases).
 //!
 //! Differences from HF safetensors, all handled here:
-//! - Config comes from `llama.*` metadata.
+//! - Config comes from `<arch>.*` metadata.
 //! - Matrices stay block-quantized (`QMatMul`, f32 activations); the token embedding stays
 //!   quantized too and doubles as the tied LM head.
 //! - Llama 3 RoPE scaling is stored as `rope_freqs.weight`, per-frequency divisors of the base
 //!   inverse frequencies.
-//! - The converter permutes Q/K rows for interleaved RoPE, so rotation uses adjacent pairs.
+//! - For `llama` the converter permutes Q/K rows for interleaved RoPE, so rotation uses
+//!   adjacent pairs. `qwen2` is converted unpermuted and keeps HF's rotate-half (NEOX) layout.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -28,30 +30,47 @@ pub fn config(content: &gguf_file::Content) -> Result<LlamaConfig> {
             .get(k)
             .with_context(|| format!("GGUF metadata missing {k}"))
     };
-    let u = |k: &str| -> Result<usize> { Ok(md(k)?.to_u32()? as usize) };
-    let arch = md("general.architecture")?.to_string()?;
-    anyhow::ensure!(arch == "llama", "unsupported GGUF architecture {arch:?}");
+    let arch = architecture(content)?;
+    let u = |k: &str| -> Result<usize> { Ok(md(&format!("{arch}.{k}"))?.to_u32()? as usize) };
+    let f = |k: &str| -> Result<f64> { Ok(md(&format!("{arch}.{k}"))?.to_f32()? as f64) };
     let embd = content
         .tensor_infos
         .get("token_embd.weight")
         .context("no token_embd.weight")?;
     Ok(LlamaConfig {
-        hidden_size: u("llama.embedding_length")?,
-        intermediate_size: u("llama.feed_forward_length")?,
-        num_hidden_layers: u("llama.block_count")?,
-        num_attention_heads: u("llama.attention.head_count")?,
-        num_key_value_heads: u("llama.attention.head_count_kv")?,
-        head_dim: Some(u("llama.rope.dimension_count")?),
+        hidden_size: u("embedding_length")?,
+        intermediate_size: u("feed_forward_length")?,
+        num_hidden_layers: u("block_count")?,
+        num_attention_heads: u("attention.head_count")?,
+        num_key_value_heads: u("attention.head_count_kv")?,
+        // qwen2 files omit it; then it is hidden_size / heads.
+        head_dim: u("rope.dimension_count").ok(),
         vocab_size: embd.shape.dims()[0],
-        rms_norm_eps: md("llama.attention.layer_norm_rms_epsilon")?.to_f32()? as f64,
-        rope_theta: md("llama.rope.freq_base")?.to_f32()? as f64,
+        rms_norm_eps: f("attention.layer_norm_rms_epsilon")?,
+        rope_theta: f("rope.freq_base")?,
         rope_scaling: None,
-        max_position_embeddings: u("llama.context_length")?,
+        max_position_embeddings: u("context_length")?,
         tie_word_embeddings: !content.tensor_infos.contains_key("output.weight"),
         bos_token_id: md("tokenizer.ggml.bos_token_id")
             .ok()
             .and_then(|v| v.to_u32().ok()),
+        attention_f32: arch == "qwen2",
     })
+}
+
+/// `general.architecture`, if it is one this loader supports.
+pub fn architecture(content: &gguf_file::Content) -> Result<String> {
+    let arch = content
+        .metadata
+        .get("general.architecture")
+        .context("GGUF metadata missing general.architecture")?
+        .to_string()?
+        .clone();
+    anyhow::ensure!(
+        matches!(arch.as_str(), "llama" | "qwen2"),
+        "unsupported GGUF architecture {arch:?}"
+    );
+    Ok(arch)
 }
 
 /// Base inverse frequencies divided by the `rope_freqs` factors, when present.
@@ -109,6 +128,7 @@ pub fn load(path: &Path, device: &Device, max_seq_len: usize) -> Result<Llama> {
         std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let content = gguf_file::Content::read(&mut file)?;
     let cfg = config(&content)?;
+    let interleaved_rope = architecture(&content)? == "llama";
     let mut r = Reader {
         content: &content,
         file,
@@ -122,10 +142,20 @@ pub fn load(path: &Path, device: &Device, max_seq_len: usize) -> Result<Llama> {
     let mut blocks = Vec::with_capacity(cfg.num_hidden_layers);
     for i in 0..cfg.num_hidden_layers {
         let b = |n: &str| format!("blk.{i}.{n}.weight");
+        let bias = |n: &str| format!("blk.{i}.{n}.bias");
+        let qkv_bias = match content.tensor_infos.contains_key(&bias("attn_q")) {
+            true => Some([
+                r.dense_f32(&bias("attn_q"))?,
+                r.dense_f32(&bias("attn_k"))?,
+                r.dense_f32(&bias("attn_v"))?,
+            ]),
+            false => None,
+        };
         blocks.push(BlockWeights {
             q: r.linear(&b("attn_q"))?,
             k: r.linear(&b("attn_k"))?,
             v: r.linear(&b("attn_v"))?,
+            qkv_bias,
             o: r.linear(&b("attn_output"))?,
             gate: r.linear(&b("ffn_gate"))?,
             up: r.linear(&b("ffn_up"))?,
@@ -147,7 +177,7 @@ pub fn load(path: &Path, device: &Device, max_seq_len: usize) -> Result<Llama> {
         DType::F32,
         device,
     )?
-    .interleaved(true);
+    .interleaved(interleaved_rope);
     // Quantized matmuls produce f32; keep KV at f16 on GPUs to hold the spec's 32 KB/token.
     let kv_dtype = if device.is_cpu() {
         DType::F32

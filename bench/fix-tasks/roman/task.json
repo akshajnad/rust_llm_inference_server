@@ -1,0 +1,1 @@
+{"task": "`from_roman()` in roman.py ignores subtractive notation: from_roman(\"IV\") returns 6 instead of 4.", "test": "python -m unittest -q", "protect": ["test_roman.py"]}

@@ -1,0 +1,1 @@
+{"task": "`binary_search()` in search.py misses some elements that are present (for example the last element, or the only element of a one-item list).", "test": "python -m unittest -q", "protect": ["test_search.py"]}

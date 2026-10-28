@@ -1,0 +1,1 @@
+{"task": "`flatten()` in nested.py only flattens one level: flatten([1, [2, [3, [4, []]]], 5]) should be [1, 2, 3, 4, 5].", "test": "python -m unittest -q", "protect": ["test_nested.py"]}

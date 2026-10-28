@@ -6,8 +6,8 @@
 
 use candle_core::{CpuStorage, CustomOp3, DType, Layout, Result, Shape, Tensor};
 
-/// Most query heads per KV head and dims per lane the kernel supports (`MAX_REP`, `MAX_DPL`).
-pub const MAX_REP: usize = 4;
+/// Most query heads per KV head (the widest kernel variant) and the largest head_dim.
+pub const MAX_REP: usize = 8;
 pub const MAX_HEAD_DIM: usize = 128;
 
 /// Whether the kernel supports this head layout.
@@ -152,10 +152,14 @@ pub mod metal_impl {
     const SOURCE: &str = include_str!("paged_attention.metal");
     const THREADS: usize = 8 * 32;
 
-    /// Kernels for one dtype.
+    /// Query heads per kv head of the kernel variants (`_r4`, `_r8`); a layout uses the
+    /// narrowest that fits.
+    const REPS: [usize; 2] = [4, 8];
+
+    /// Kernels for one dtype; `decode` and `split` per entry of `REPS`.
     struct Kernels {
-        decode: ComputePipeline,
-        split: ComputePipeline,
+        decode: [ComputePipeline; 2],
+        split: [ComputePipeline; 2],
         reduce: ComputePipeline,
     }
 
@@ -178,9 +182,16 @@ pub mod metal_impl {
                         .map_err(candle_core::Error::wrap)
                 };
                 let kernels = |ty: &str| -> Result<Kernels> {
+                    let [r4, r8] = REPS;
                     Ok(Kernels {
-                        decode: make(&format!("paged_attention_decode_{ty}"))?,
-                        split: make(&format!("paged_attention_decode_split_{ty}"))?,
+                        decode: [
+                            make(&format!("paged_attention_decode_{ty}_r{r4}"))?,
+                            make(&format!("paged_attention_decode_{ty}_r{r8}"))?,
+                        ],
+                        split: [
+                            make(&format!("paged_attention_decode_split_{ty}_r{r4}"))?,
+                            make(&format!("paged_attention_decode_split_{ty}_r{r8}"))?,
+                        ],
                         reduce: make(&format!("paged_attention_reduce_{ty}"))?,
                     })
                 };
@@ -212,6 +223,10 @@ pub mod metal_impl {
         let device = q.device();
         let dtype = q.dtype();
         let kernels = op.pipelines.get(device, dtype)?;
+        let width = REPS
+            .iter()
+            .position(|&r| n_heads / n_kv <= r)
+            .expect("supported() bounds the heads per kv head");
         let (splits, part) = super::split_plan(n_kv * nd, op.max_context);
         let (ks, kl) = op.k_cache.storage_and_layout();
         let (vs, vl) = op.v_cache.storage_and_layout();
@@ -255,8 +270,8 @@ pub mod metal_impl {
             let holder = provider.encoder();
             let enc = holder.as_ref();
             enc.set_compute_pipeline_state(match partials {
-                None => &kernels.decode,
-                Some(_) => &kernels.split,
+                None => &kernels.decode[width],
+                Some(_) => &kernels.split[width],
             });
             enc.set_input_buffer(0, Some(q.buffer()), lq.start_offset() * elem);
             enc.set_input_buffer(1, Some(ks.buffer()), kl.start_offset() * elem);
@@ -431,18 +446,30 @@ mod tests {
     fn rejects_unsupported_layouts() {
         assert!(supported(32, 8, 64));
         assert!(supported(24, 8, 128));
-        assert!(!supported(32, 4, 64), "8 query heads per kv head");
+        assert!(
+            supported(12, 2, 128),
+            "Qwen2.5 1.5B: 6 query heads per kv head"
+        );
+        assert!(supported(32, 4, 64), "8 query heads per kv head");
+        assert!(!supported(32, 2, 64), "16 query heads per kv head");
         assert!(!supported(8, 2, 48), "head_dim not a multiple of 32");
     }
 
     /// The MSL kernel against the CPU reference: many sequences, contexts shorter and longer
-    /// than one simdgroup sweep, both Llama 3.2 head layouts, f32 and f16.
+    /// than one simdgroup sweep, both Llama 3.2 head layouts, Qwen2.5 1.5B's (6 query heads
+    /// per kv head) and the 8-per-kv-head limit, f32 and f16.
     #[cfg(feature = "metal")]
     #[test]
     fn metal_kernel_matches_cpu_reference() -> Result<()> {
         let metal = Device::new_metal(0)?;
         let lens: Vec<usize> = (0..37).map(|i| 1 + (i * 53) % 700).collect();
-        for (n_heads, n_kv, hd) in [(32, 8, 64), (24, 8, 128), (8, 8, 64)] {
+        for (n_heads, n_kv, hd) in [
+            (32, 8, 64),
+            (24, 8, 128),
+            (8, 8, 64),
+            (12, 2, 128),
+            (32, 4, 64),
+        ] {
             for (dtype, tol) in [(DType::F32, 1e-4), (DType::F16, 2e-2)] {
                 let c = case(&Device::Cpu, dtype, n_heads, n_kv, hd, &lens)?;
                 let want = run_op(&c, &Device::Cpu)?;
@@ -464,7 +491,7 @@ mod tests {
 
     /// The split-context kernels against the CPU reference: few sequences with long contexts
     /// (so the context is partitioned), next to ones shorter than a partition (so some
-    /// partitions are empty), for both head layouts and dtypes.
+    /// partitions are empty), for the Llama 3.2 and Qwen2.5 head layouts and both dtypes.
     #[cfg(feature = "metal")]
     #[test]
     fn metal_split_kernel_matches_cpu_reference() -> Result<()> {
@@ -475,7 +502,7 @@ mod tests {
                 split_plan(8 * lens.len(), max).0 > 1,
                 "{lens:?} should split"
             );
-            for (n_heads, n_kv, hd) in [(32, 8, 64), (24, 8, 128)] {
+            for (n_heads, n_kv, hd) in [(32, 8, 64), (24, 8, 128), (12, 2, 128)] {
                 for (dtype, tol) in [(DType::F32, 1e-4), (DType::F16, 2e-2)] {
                     let c = case(&Device::Cpu, dtype, n_heads, n_kv, hd, &lens)?;
                     let want = run_op(&c, &Device::Cpu)?;

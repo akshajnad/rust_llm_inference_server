@@ -1,0 +1,1 @@
+{"task": "`chunk()` in listutil.py drops the last, shorter chunk: chunk([1, 2, 3, 4, 5], 2) should be [[1, 2], [3, 4], [5]].", "test": "python -m unittest -q", "protect": ["test_listutil.py"]}

@@ -1,7 +1,9 @@
 # Design
 
-rlis is an LLM serving engine in Rust for one Llama-architecture model on an Apple Silicon GPU
-(Metal), with continuous batching, a paged KV cache and an OpenAI-compatible API. This document
+rlis is an LLM serving engine in Rust for Llama-architecture models on an Apple Silicon GPU
+(Metal), with continuous batching, a paged KV cache and an OpenAI-compatible API. It was built
+for Llama 3.2 1B; Qwen2 (Qwen2.5-Coder 1.5B, for `rlis fix`) loads from GGUF as Llama plus
+Q/K/V biases. This document
 covers how it works, why it is built this way, and what was measured along the way. Numbers are
 from an M4 Pro (20-core GPU, 24 GB) running Llama 3.2 1B Instruct, except the
 [CUDA run](#cuda-run) on a Tesla T4; the benchmark files under `results/` carry full provenance.
@@ -93,9 +95,12 @@ every block returned.
   once per block, and lanes then accumulate their slice of V. Long contexts with few sequences
   are split into partitions that run as separate threadgroups and are merged by a second
   kernel (flash-decoding). Without the split, one sequence was only 8 threadgroups on a
-  20-core GPU, and an 8k-context decode step took 34 ms instead of 10. It matches a CPU
-  reference for both Llama 3.2 head layouts, on 37 sequences up to 700 tokens and on split
-  contexts up to 9,000.
+  20-core GPU, and an 8k-context decode step took 34 ms instead of 10. It is compiled for up
+  to 4 and up to 8 query heads per KV head: Qwen2.5 1.5B has 6, and sizing Llama's per-lane
+  state for 8 cost it ~10% of attention time. The wide variant merges its simdgroups' outputs
+  4 heads per round, since staging all 8 would take 32 KB of threadgroup memory. It matches a
+  CPU reference for both Llama 3.2 head layouts and Qwen2.5's, on 37 sequences up to 700
+  tokens and on split contexts up to 9,000.
 - **Fused prefill.** Multi-token segments use MLX's fused attention (`candle_nn::ops::sdpa`)
   with a bottom-right-aligned causal mask, which is exactly chunked-prefill semantics. The
   first version materialized f32 score matrices and spent 313 ms of a 1024-token prefill in
@@ -108,7 +113,15 @@ scaling, grouped-query attention, SwiGLU. Weights load from HF safetensors (f32/
 
 GGUF needs three adjustments, each covered by a test: config from `llama.*` metadata; Llama 3
 RoPE scaling stored as `rope_freqs.weight` divisors (checked to reproduce the HF frequencies);
-and Q/K rows permuted for interleaved RoPE (`rope_i`). Matrices stay block-quantized, and the
+and Q/K rows permuted for interleaved RoPE (`rope_i`). `qwen2` files differ: `qwen2.*` keys,
+Q/K/V biases, and Q/K left unpermuted, so rotation stays rotate-half. Qwen2's biases also make
+q·k overflow f16 (|k| reaches ~360 in the first layer), which turned every logit into NaN with
+the f16 KV pool. The pool stays f16, but for Qwen2 the gathered attention (prefill, v1) runs in
+f32, as llama.cpp does for this architecture; the decode kernel scores in f32 anyway. Parity
+for Qwen2.5-Coder 1.5B is against transformers' own Qwen2 code holding the GGUF's weights in
+f16 with f32 matmuls (f32 weights would be ~6 GB): logits within 0.016 and greedy output
+token-for-token on 20 prompts × 128 tokens, alone and as a paged batch of 32 (`make
+parity-qwen`). Matrices stay block-quantized, and the
 token embedding stays quantized too — looked up row by row on the GPU and shared with the tied
 LM head — so no 525 MB dequantized table ever exists.
 
@@ -130,10 +143,14 @@ paths. Step time at batch 2 went from 22.7 ms to 10.2 ms, at batch 4 from 36.2 m
 Greedy and temperature-only rows are sampled on the GPU in one kernel: Gumbel-max (argmax of
 logit / T plus Gumbel noise is an exact draw from softmax(logit / T)), with noise from a
 counter-based hash of (request seed, position, token id). A draw is reproducible and
-independent of what else is in the batch, and only token ids cross back to the host. Rows with
-top-k, top-p or a repetition penalty bring their logits to the CPU sampler, which is O(vocab)
-without sorting the vocabulary (an earlier version sorted all 128k entries per token and spent
-half of each step doing it).
+independent of what else is in the batch, and only token ids cross back to the host. The
+uniform draw takes 23 bits of the hash: with 24, (2^24 − 0.5) / 2^24 rounds to exactly 1 in
+f32, the noise is infinite, and that token wins whatever its logit. That hit one vocabulary
+entry in 2^24 per step, ~1% of steps over Qwen's 152k vocabulary (0.8% over Llama's), and
+showed up as stray tokens mid-sentence (`median耵r`) once `rlis fix` sampled code at T = 0.7.
+Rows with top-k, top-p or a repetition penalty bring their logits to the CPU sampler, which is
+O(vocab) without sorting the vocabulary (an earlier version sorted all 128k entries per token
+and spent half of each step doing it).
 
 ## Memory
 

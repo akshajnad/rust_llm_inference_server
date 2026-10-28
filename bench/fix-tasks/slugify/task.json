@@ -1,0 +1,1 @@
+{"task": "`slugify()` in text.py leaves runs of dashes and leading/trailing dashes: slugify(\"  Rust, Metal & You!  \") should be \"rust-metal-you\".", "test": "python -m unittest -q", "protect": ["test_text.py"]}

@@ -1,0 +1,1 @@
+{"task": "`LRUCache` in cache.py evicts the wrong key: reading a key with `get()` should make it the most recently used, but it doesn't.", "test": "python -m unittest -q", "protect": ["test_cache.py"]}

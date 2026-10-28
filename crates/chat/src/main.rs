@@ -1,9 +1,10 @@
 //! `rlis-chat`: chat with an rlis server (or any OpenAI-compatible one) in the terminal. Starts
 //! `rlis serve` in the background when nothing answers at `--url`, and stops it on exit.
 //! `make install` puts it on the PATH as `rlis`, so it also hands the server binary's own
-//! subcommands (`rlis serve`, ...) through to it.
+//! subcommands (`rlis serve`, ...) through to it. `rlis fix` is its own (see `fix.rs`).
 
 mod api;
+mod fix;
 mod frame;
 mod http;
 mod input;
@@ -63,7 +64,8 @@ const COMMANDS: &[SlashCommand] = &[
 #[command(
     name = "rlis",
     about = "Chat with an rlis server in the terminal",
-    after_help = "`rlis serve`, `rlis generate` and `rlis perplexity` run the server binary."
+    after_help = "`rlis serve`, `rlis generate` and `rlis perplexity` run the server binary.\n\
+                  `rlis fix --help`: parallel attempts at a patch that makes a test pass."
 )]
 struct Args {
     /// Server to talk to; a local one is started if nothing answers there.
@@ -96,8 +98,11 @@ fn main() -> Result<()> {
     {
         return run_server_command();
     }
+    if env::args().nth(1).as_deref() == Some("fix") {
+        return fix::run(fix::FixArgs::parse_from(env::args().skip(1)));
+    }
     let args = Args::parse();
-    let _server = ensure_server(&args)?;
+    let _server = ensure_server(&args.url, args.no_start, &args.serve_args)?;
     let model = model_name(&args.url).unwrap_or_else(|| "unknown model".to_string());
     let _terminal = Terminal::enter()?;
     let mut chat = Chat {
@@ -211,15 +216,17 @@ fn server_bin(exe: &Path) -> Result<PathBuf> {
     Ok(bin)
 }
 
-fn ensure_server(args: &Args) -> Result<Option<Server>> {
-    if healthy(&args.url) {
+/// Starts `rlis serve <serve_args>` when nothing answers at `url` (a local one); the returned
+/// guard stops it.
+fn ensure_server(url: &str, no_start: bool, serve_args: &[String]) -> Result<Option<Server>> {
+    if healthy(url) {
         return Ok(None);
     }
-    let (host, port) = http::authority(&args.url)?
+    let (host, port) = http::authority(url)?
         .rsplit_once(':')
         .context("--url needs a port")?;
-    if args.no_start || !matches!(host, "127.0.0.1" | "localhost") {
-        bail!("no server is answering at {}", args.url);
+    if no_start || !matches!(host, "127.0.0.1" | "localhost") {
+        bail!("no server is answering at {url}");
     }
     // Resolved through the symlink `make install` puts on the PATH, to find the build.
     let exe = env::current_exe()?.canonicalize()?;
@@ -229,10 +236,10 @@ fn ensure_server(args: &Args) -> Result<Option<Server>> {
         File::create(&log_path).with_context(|| format!("creating {}", log_path.display()))?;
     let mut cmd = Command::new(&bin);
     cmd.arg("serve");
-    if !args.serve_args.iter().any(|a| a.starts_with("--port")) {
+    if !serve_args.iter().any(|a| a.starts_with("--port")) {
         cmd.args(["--port", port]);
     }
-    cmd.args(&args.serve_args)
+    cmd.args(serve_args)
         .current_dir(server_dir(&exe))
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
@@ -244,7 +251,7 @@ fn ensure_server(args: &Args) -> Result<Option<Server>> {
 
     let start = Instant::now();
     let mut out = io::stdout();
-    while !healthy(&args.url) {
+    while !healthy(url) {
         if let Some(status) = server.0.try_wait()? {
             print!("\r\x1b[2K");
             let log = fs::read_to_string(&log_path).unwrap_or_default();
@@ -272,8 +279,7 @@ fn ensure_server(args: &Args) -> Result<Option<Server>> {
     // The first request after startup compiles GPU pipelines (seconds); pay for it here
     // rather than on the first message.
     let warmup = br#"{"prompt": "Hello", "max_tokens": 1}"#;
-    let _ =
-        http::request(&args.url, "POST", "/v1/completions", Some(warmup)).and_then(|r| r.text());
+    let _ = http::request(url, "POST", "/v1/completions", Some(warmup)).and_then(|r| r.text());
     print!("\r\x1b[2K");
     out.flush()?;
     Ok(Some(server))

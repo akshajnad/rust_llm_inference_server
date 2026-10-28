@@ -19,6 +19,10 @@ pub struct LlamaConfig {
     #[serde(default)]
     pub tie_word_embeddings: bool,
     pub bos_token_id: Option<u32>,
+    /// Compute attention scores in f32 even when the KV cache is f16. Qwen2's Q/K biases make
+    /// q·k overflow f16 (|k| reaches ~360 in layer 0); llama.cpp forces f32 there too.
+    #[serde(default)]
+    pub attention_f32: bool,
 }
 
 /// Llama 3 style frequency-dependent RoPE scaling (`rope_type: "llama3"`).
@@ -63,6 +67,7 @@ impl LlamaConfig {
             max_position_embeddings: 128,
             tie_word_embeddings: true,
             bos_token_id: Some(1),
+            attention_f32: false,
         }
     }
 }

@@ -12,6 +12,7 @@ pub struct Attention {
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
+    qkv_bias: Option<[Tensor; 3]>,
     o_proj: Linear,
     n_heads: usize,
     n_kv_heads: usize,
@@ -23,6 +24,7 @@ impl Attention {
         q_proj: Linear,
         k_proj: Linear,
         v_proj: Linear,
+        qkv_bias: Option<[Tensor; 3]>,
         o_proj: Linear,
         cfg: &LlamaConfig,
     ) -> Self {
@@ -30,6 +32,7 @@ impl Attention {
             q_proj,
             k_proj,
             v_proj,
+            qkv_bias,
             o_proj,
             n_heads: cfg.num_attention_heads,
             n_kv_heads: cfg.num_key_value_heads,
@@ -44,6 +47,7 @@ impl Attention {
             q_proj: Linear::load(vb.pp("q_proj"), h, nh * hd)?,
             k_proj: Linear::load(vb.pp("k_proj"), h, nkv * hd)?,
             v_proj: Linear::load(vb.pp("v_proj"), h, nkv * hd)?,
+            qkv_bias: None,
             o_proj: Linear::load(vb.pp("o_proj"), nh * hd, h)?,
             n_heads: nh,
             n_kv_heads: nkv,
@@ -67,11 +71,19 @@ impl Attention {
             |t: Tensor, heads: usize| t.reshape((b, total, heads, self.head_dim))?.transpose(1, 2);
         let dev = x.device();
         let (q, k, v) = span(dev, "qkv proj", || {
-            Ok((
+            let (q, k, v) = (
                 self.q_proj.forward(x)?,
                 self.k_proj.forward(x)?,
                 self.v_proj.forward(x)?,
-            ))
+            );
+            match &self.qkv_bias {
+                Some([bq, bk, bv]) => Ok((
+                    q.broadcast_add(bq)?,
+                    k.broadcast_add(bk)?,
+                    v.broadcast_add(bv)?,
+                )),
+                None => Ok((q, k, v)),
+            }
         })?;
         let (q, k) = span(dev, "qk split + rope", || {
             Ok((

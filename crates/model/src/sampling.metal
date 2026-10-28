@@ -44,7 +44,8 @@ kernel void sample_rows(
         float s = l[v];
         if (inv_t > 0.0f) {
             const uint h = lowbias32(key ^ (v * 0x9e3779b9u));
-            const float u = (float(h >> 8) + 0.5f) * (1.0f / 16777216.0f);
+            // 23 bits plus a half is exact in f32, so u < 1 (see `uniform` in sampling.rs).
+            const float u = (float(h >> 9) + 0.5f) * (1.0f / 8388608.0f);
             s = s * inv_t - precise::log(-precise::log(u));
         }
         keep_best(best, best_i, s, v);

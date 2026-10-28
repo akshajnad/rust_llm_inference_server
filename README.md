@@ -55,6 +55,22 @@ instead of starting a server), and `rlis serve` flags after `--` for a server it
 `rlis -- --model models/Llama-3.2-1B-Instruct-Q4_K_M.gguf --kv-cache-gb 2`. A started
 server logs to `target/release/rlis-chat-server.log`.
 
+### `rlis fix` (prototype)
+
+```sh
+make models-qwen    # Qwen2.5-Coder 1.5B Instruct, Q8_0 (1.6 GB)
+rlis fix --repo path/to/repo --test "python -m unittest -q" --task "median() is wrong for even lists"
+```
+
+Eight attempts at a patch from one request: the task, the failing test's output and the files
+it names go to the server once with `n: 8`, so the prompt is prefilled once and the attempts
+decode together. Each diff is applied in its own git worktree (under the repository's `.git`,
+removed afterwards) and the test runs there, four at a time; the smallest passing diff wins.
+The working tree isn't touched unless `--apply` is given. With no server running it starts one
+with the Qwen model and stops it on exit. Other options: `--n`, `--temperature`, `--seed`,
+`--protect <file>` (reject patches that touch it, e.g. the test), `--json <file>`. Results on
+ten small buggy Python tasks: [docs/fix-bench.md](docs/fix-bench.md#rlis-fix-on-10-small-tasks).
+
 ### Server and API
 
 ```sh
@@ -219,7 +235,7 @@ How it works and why: [DESIGN.md](DESIGN.md). The hardest bug:
 | Default run (Q8_0, 1 GiB KV pool), benchmark load | 2.7–3.2 GB peak footprint |
 | Default run, 64 long requests overfilling the pool | 3.26 GB peak footprint |
 | Upper-bound run (3B Q4_K_M, 2 GiB pool) | not measured yet; the spec's budget estimate is ~5 GB |
-| Model files (`make models` / `make models-all`) | 1.3 GB / 4.6 GB |
+| Model files (`make models` / `make models-all` / `make models-qwen`) | 1.3 GB / 4.6 GB / 1.7 GB |
 | Rust build (`./target`, release + debug, with and without Metal) | 13 GB |
 | llama.cpp build (`./third_party`) | 0.36 GB |
 

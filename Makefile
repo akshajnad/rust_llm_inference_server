@@ -20,7 +20,7 @@ LLAMA_CPP_CMAKE_FLAGS ?= -DGGML_METAL=ON
 LLAMA_CPP_JOBS ?=
 WIKITEXT_URL := $(HF)/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
 
-.PHONY: serve chat install uninstall models models-all wikitext llama-cpp bench-mac bench-cuda bench-ablations bench-fork bench-charts soak build test test-metal parity-ref chat-ref parity lint fuzz teardown
+.PHONY: serve chat install uninstall models models-qwen models-all wikitext llama-cpp bench-mac bench-cuda bench-ablations bench-fork bench-fix bench-charts soak build test test-metal parity-ref parity-ref-qwen chat-ref chat-ref-qwen parity parity-qwen lint fuzz teardown
 
 # One command from a fresh clone to a running server on http://127.0.0.1:8000.
 serve: models
@@ -60,6 +60,19 @@ models:
 	$(call fetch,$(DENSE_REPO),tokenizer.json,$(MODEL_DIR)/tokenizer.json)
 	$(call fetch,$(DENSE_REPO),tokenizer_config.json,$(MODEL_DIR)/tokenizer_config.json)
 	$(call fetch,$(GGUF_REPO),$(DEFAULT_GGUF),models/$(DEFAULT_GGUF))
+
+# Qwen2.5-Coder 1.5B for `rlis fix`: tokenizer files from the HF repo, Q8_0 GGUF (tied embeddings).
+QWEN_DIR := models/qwen2.5-coder-1.5b-instruct
+QWEN_REPO := Qwen/Qwen2.5-Coder-1.5B-Instruct
+QWEN_GGUF_REPO := bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF
+QWEN_GGUF := Qwen2.5-Coder-1.5B-Instruct-Q8_0.gguf
+
+models-qwen:
+	$(call fetch,$(QWEN_REPO),config.json,$(QWEN_DIR)/config.json)
+	$(call fetch,$(QWEN_REPO),generation_config.json,$(QWEN_DIR)/generation_config.json)
+	$(call fetch,$(QWEN_REPO),tokenizer.json,$(QWEN_DIR)/tokenizer.json)
+	$(call fetch,$(QWEN_REPO),tokenizer_config.json,$(QWEN_DIR)/tokenizer_config.json)
+	$(call fetch,$(QWEN_GGUF_REPO),$(QWEN_GGUF),models/$(QWEN_GGUF))
 
 models-all: models
 	$(call fetch,$(DENSE_REPO),model.safetensors,$(MODEL_DIR)/model.safetensors)
@@ -114,10 +127,32 @@ chat-ref: models-all
 		--out tests/fixtures/chat/llama32_reference.json
 	rm -rf .venv .uv-cache
 
+# Qwen2.5-Coder reference from the GGUF's own weights (f16 storage, f32 compute: f32 weights
+# would be ~6 GB). Prompts are the Llama fixture's.
+parity-ref-qwen: models-qwen
+	uv venv .venv --python 3.12
+	VIRTUAL_ENV=.venv uv pip install torch transformers safetensors numpy gguf
+	.venv/bin/python -I scripts/parity/dump_reference.py --model $(QWEN_DIR) --gguf models/$(QWEN_GGUF) \
+		--prompts tests/fixtures/parity/prompts.json --out tests/fixtures/parity/qwen25_coder_reference.safetensors
+	rm -rf .venv .uv-cache
+
+chat-ref-qwen: models-qwen
+	uv venv .venv --python 3.12
+	VIRTUAL_ENV=.venv uv pip install transformers jinja2
+	.venv/bin/python -I scripts/parity/dump_chat_reference.py --model $(QWEN_DIR) \
+		--out tests/fixtures/chat/qwen25_coder_reference.json
+	rm -rf .venv .uv-cache
+
 parity: models-all
 	PARITY_DTYPE=f32 cargo test --release -p model --features $(FEATURES) --test parity -- --ignored --nocapture --test-threads=1
 	PARITY_DTYPE=f16 cargo test --release -p model --features $(FEATURES) --test parity -- --ignored --nocapture --test-threads=1 --skip gguf_tracks_reference
-	cargo test --release -p engine --test chat_template -- --ignored
+	cargo test --release -p engine --test chat_template -- --ignored llama32
+
+# The GGUF is the model under test (f32 activations, f16 KV); its reference has f16-rounded
+# weights, so it is held to the f16 gate.
+parity-qwen: models-qwen
+	PARITY_MODEL=qwen cargo test --release -p model --features $(FEATURES) --test parity -- --ignored --nocapture --test-threads=1 --skip gguf_tracks_reference
+	cargo test --release -p engine --test chat_template -- --ignored qwen25
 
 lint:
 	cargo fmt --all --check
@@ -155,6 +190,12 @@ bench-fork: models
 	cargo build --release --features $(FEATURES) -p server
 	cargo build --release -p bench
 	scripts/bench/fork.sh
+
+# `rlis fix` on the 10 buggy Python tasks in bench/fix-tasks (results/mac/fix/, docs/fix-bench.md).
+bench-fix: models-qwen
+	cargo build --release --features $(FEATURES) -p server
+	cargo build --release -p chat
+	scripts/bench/fix-tasks.sh
 
 bench-charts:
 	cargo build --release -p bench
