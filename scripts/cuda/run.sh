@@ -14,8 +14,12 @@ export CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP:-$CC}
 export PATH=/usr/local/cuda/bin:$HOME/.cargo/bin:$PATH
 # Containers mount the driver's libcuda.so.1 but not the unversioned libcuda.so that -lcuda
 # looks for (and Kaggle's toolkit has no stub), so give the linker a symlink to the real one.
+# Look where the loader will find it at runtime first, not at copies other tools bundle.
 LIBCUDA=$(ldconfig -p | awk '/libcuda\.so\.1 /{print $NF; exit}')
-[ -n "$LIBCUDA" ] || LIBCUDA=$(find / -xdev -name 'libcuda.so.1' 2>/dev/null | head -1)
+for d in ${LD_LIBRARY_PATH//:/ } /usr/local/nvidia/lib64 /usr/lib64-nvidia /usr/lib/x86_64-linux-gnu; do
+  [ -n "$LIBCUDA" ] || { [ -e "$d/libcuda.so.1" ] && LIBCUDA=$d/libcuda.so.1; }
+done
+[ -n "$LIBCUDA" ] || LIBCUDA=$(find / -name 'libcuda.so.1' -not -path '/proc/*' 2>/dev/null | head -1)
 CUDA_LINK=$(mktemp -d)
 ln -s "$LIBCUDA" "$CUDA_LINK/libcuda.so"
 echo "linking against $LIBCUDA"
@@ -81,10 +85,13 @@ build_rlis() {
 parity() {
   make parity FEATURES=cuda 2>&1 | tee "$OUT/parity.log"
 }
-build_llama_cpp() {
+# Kaggle sets UV_* variables that send `uv pip install` to the system Python instead of the
+# Makefile's throwaway venv; clear them (a subshell, so only for this step).
+build_llama_cpp() (
+  for v in $(compgen -e | grep '^UV_'); do unset "$v"; done
   { command -v uv >/dev/null || pip install -q uv; } &&
     make llama-cpp LLAMA_CPP_CMAKE_FLAGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=$CUDA_COMPUTE_CAP"
-}
+)
 
 step rust install_rust
 step models make models-all
