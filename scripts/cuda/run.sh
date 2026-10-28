@@ -87,11 +87,14 @@ parity() {
   make parity FEATURES=cuda 2>&1 | tee "$OUT/parity.log"
 }
 # Kaggle sets UV_* variables that send `uv pip install` to the system Python instead of the
-# Makefile's throwaway venv; clear them (a subshell, so only for this step).
+# Makefile's throwaway venv; clear them (a subshell, so only for this step). One compile job per
+# CPU: unlimited jobs ran the session out of memory, and the OOM-killed build stalled for hours,
+# so the step is also capped.
 build_llama_cpp() (
   for v in $(compgen -e | grep '^UV_'); do unset "$v"; done
   { command -v uv >/dev/null || pip install -q uv; } &&
-    make llama-cpp LLAMA_CPP_CMAKE_FLAGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=$CUDA_COMPUTE_CAP \
+    timeout 75m make llama-cpp LLAMA_CPP_JOBS="$(nproc)" \
+      LLAMA_CPP_CMAKE_FLAGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=$CUDA_COMPUTE_CAP \
       -DCUDA_cuda_driver_LIBRARY=$CUDA_LINK/libcuda.so"
 )
 

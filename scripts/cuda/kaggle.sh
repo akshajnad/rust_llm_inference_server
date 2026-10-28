@@ -24,7 +24,8 @@ cat >"$STAGE/kernel-metadata.json" <<EOF
  "dataset_sources": [], "competition_sources": [], "kernel_sources": []}
 EOF
 if [ -z "${KAGGLE_ATTACH:-}" ]; then
-  "$KAGGLE" kernels push -p "$STAGE" --accelerator NvidiaTeslaT4
+  # A hard stop for the session, well under Kaggle's 12-hour cap: free GPU quota is per week.
+  "$KAGGLE" kernels push -p "$STAGE" --accelerator NvidiaTeslaT4 -t "${KAGGLE_TIMEOUT:-10800}"
   echo "running $KERNEL at $COMMIT; https://www.kaggle.com/code/$KERNEL"
 fi
 
