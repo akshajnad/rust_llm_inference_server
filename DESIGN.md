@@ -3,8 +3,8 @@
 rlis is an LLM serving engine in Rust for one Llama-architecture model on an Apple Silicon GPU
 (Metal), with continuous batching, a paged KV cache and an OpenAI-compatible API. This document
 covers how it works, why it is built this way, and what was measured along the way. Numbers are
-from an M4 Pro (20-core GPU, 24 GB) running Llama 3.2 1B Instruct; the benchmark files under
-`results/` carry full provenance.
+from an M4 Pro (20-core GPU, 24 GB) running Llama 3.2 1B Instruct, except the
+[CUDA run](#cuda-run) on a Tesla T4; the benchmark files under `results/` carry full provenance.
 
 ## Architecture
 

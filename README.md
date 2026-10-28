@@ -3,7 +3,9 @@
 An LLM serving engine in Rust with continuous batching, a paged KV cache, custom Metal kernels
 and an OpenAI-compatible streaming API. It runs Llama 3.2 1B on a MacBook's GPU inside a fixed
 ~3 GB memory budget, matches Hugging Face transformers token-for-token, and out-serves
-llama.cpp's server at high concurrency.
+llama.cpp's server at high concurrency. The same code also builds for NVIDIA GPUs: on a free
+Kaggle Tesla T4 it passes the same parity tests and reaches 89% of llama.cpp's single-stream
+decode speed.
 
 ![Streaming output, recorded with real timing](docs/streaming.svg)
 
@@ -199,6 +201,8 @@ from 4 to 32 concurrent requests, see Ablations); unique prompts need faster pre
   paged batch of 32), property tests for the allocator, a scheduler simulator, fuzzing of the
   request parser and stop strings, and a one-hour soak (13,018 requests with random client
   hang-ups, 0 errors, every KV block returned, memory flat within 3%).
+- **CUDA build** (`--features cuda`): portable fallbacks for every Metal kernel; parity and
+  the benchmark sweep verified on a Tesla T4 (`make bench-cuda`).
 - **Terminal client** (`rlis-chat`): a dependency-light chat UI over the same API, with a
   redrawn-in-place prompt box, streaming Markdown rendering and interrupt-by-disconnect.
 - **Observability**: Prometheus `/metrics` (TTFT, ITL, throughput, queue, batch, preemptions,
