@@ -1,5 +1,5 @@
 {
-  "applied": 8,
+  "applied": 7,
   "attempts": [
     {
       "applied": true,
@@ -12,7 +12,7 @@
       "passed": false,
       "raw_diff": "diff --git a/nested.py b/nested.py\nindex 9f0a1a1..e0e0e0e 100644\n--- a/nested.py\n+++ b/nested.py\n@@ -4,7 +4,9 @@ def flatten(items):\n     \"\"\"All non-list values of an arbitrarily nested list, in order.\"\"\"\n     out = []\n     for x in items:\n-        if isinstance(x, list):\n+        if isinstance(x, list) and len(x) > 0:\n             out.extend(x)\n         else:\n             out.append(x)\n",
       "rejected": null,
-      "test_secs": 0.050642709
+      "test_secs": 0.050916541
     },
     {
       "applied": true,
@@ -25,7 +25,7 @@
       "passed": false,
       "raw_diff": "diff --git a/nested.py b/nested.py\nindex 1234567..89abcdef 100644\n--- a/nested.py\n+++ b/nested.py\n@@ -4,7 +4,7 @@ def flatten(items):\n     \"\"\"All non-list values of an arbitrarily nested list, in order.\"\"\"\n     out = []\n     for x in items:\n-        if isinstance(x, list):\n+        if isinstance(x, list) and len(x) > 0:  # Ensure list is not empty\n             out.extend(x)\n         else:\n             out.append(x)\n",
       "rejected": null,
-      "test_secs": 0.050504416
+      "test_secs": 0.050908666
     },
     {
       "applied": true,
@@ -38,7 +38,7 @@
       "passed": false,
       "raw_diff": "diff --git a/nested.py b/nested.py\nindex 8a1b2c3..b456789 100644\n--- a/nested.py\n+++ b/nested.py\n@@ -4,7 +4,7 @@ def flatten(items):\n     \"\"\"All non-list values of an arbitrarily nested list, in order.\"\"\"\n     out = []\n     for x in items:\n-        if isinstance(x, list):\n+        if isinstance(x, (list, tuple)):\n             out.extend(x)\n         else:\n             out.append(x)\n",
       "rejected": null,
-      "test_secs": 0.050616834
+      "test_secs": 0.048413458
     },
     {
       "applied": true,
@@ -51,7 +51,7 @@
       "passed": false,
       "raw_diff": "diff --git a/nested.py b/nested.py\nindex 0123456..7890abcdef 100644\n--- a/nested.py\n+++ b/nested.py\n@@ -4,7 +4,7 @@ def flatten(items):\n     \"\"\"All non-list values of an arbitrarily nested list, in order.\"\"\"\n     out = []\n     for x in items:\n-        if isinstance(x, list):\n-            out.extend(x)\n+        if isinstance(x, list) and x != []:\n+            out.extend(x)\n         else:\n             out.append(x)\n     return out\n",
       "rejected": null,
-      "test_secs": 0.046049375
+      "test_secs": 0.050897292
     },
     {
       "applied": true,
@@ -64,7 +64,7 @@
       "passed": true,
       "raw_diff": "diff --git a/nested.py b/nested.py\nindex 51b57c6..7c8e4b3 100644\n--- a/nested.py\n+++ b/nested.py\n@@ -4,7 +4,7 @@ def flatten(items):\n     out = []\n     for x in items:\n         if isinstance(x, list):\n-            out.extend(x)\n+            out.extend(flatten(x))\n         else:\n             out.append(x)\n     return out\n",
       "rejected": null,
-      "test_secs": 0.049969792
+      "test_secs": 0.049046625
     },
     {
       "applied": true,
@@ -77,20 +77,20 @@
       "passed": true,
       "raw_diff": "diff --git a/nested.py b/nested.py\nindex abc1234..def56789 100644\n--- a/nested.py\n+++ b/nested.py\n@@ -4,7 +4,7 @@ def flatten(items):\n     out = []\n     for x in items:\n         if isinstance(x, list):\n-            out.extend(x)\n+            out.extend(flatten(x))\n         else:\n             out.append(x)\n     return out\n \ndiff --git a/test_nested.py b/test_nested.py\nindex abc1234..def56789 100644\n--- a/test_nested.py\n+++ b/test_nested.py\n@@ -3,7 +3,7 @@ from nested import depth, flatten\n \n \n class NestedTest(unittest.TestCase):\n-    def test_flat(self):\n+    def test_flat(self):\n         self.assertEqual(flatten([1, 2, 3]), [1, 2, 3])\n \n     def test_one_level(self):\n@@ -8,7 +8,7 @@ class NestedTest(unittest.TestCase):\n         self.assertEqual(flatten([1, [2, 3], 4]), [1, 2, 3, 4])\n \n     def test_deep(self):\n-        self.assertEqual(flatten([1, [2, [3, [4, []]]], 5]), [1, 2, 3, 4, 5])\n+        self.assertEqual(flatten([1, [2, [3, [4, []]]], 5]), [1, 2, 3, 4, 5])\n \n     def test_depth(self):\n         self.assertEqual(depth([1, [2, [3]]]), 3)\n",
       "rejected": null,
-      "test_secs": 0.048765375
+      "test_secs": 0.048253
     },
     {
-      "applied": true,
-      "diff": "diff --git a/nested.py b/nested.py\nindex 650b42f..7b2bfb2 100644\n--- a/nested.py\n+++ b/nested.py\n@@ -4,7 +4,7 @@\n def flatten(items):\n     \"\"\"All non-list values of an arbitrarily nested list, in order.\"\"\"\n     out = []\n-    for x in items:\n+    for x in items if isinstance(x, list):\n         if isinstance(x, list):\n             out.extend(x)\n         else:\n",
+      "applied": false,
+      "diff": "",
       "dropped_protected": false,
-      "exit": 1,
+      "exit": null,
       "finish_reason": "stop",
-      "fuzzy": true,
-      "lines_changed": 2,
+      "fuzzy": false,
+      "lines_changed": 0,
       "passed": false,
       "raw_diff": "diff --git a/nested.py b/nested.py\n--- a/nested.py\n+++ b/nested.py\n@@ -4,7 +4,7 @@\n def flatten(items):\n     \"\"\"All non-list values of an arbitrarily nested list, in order.\"\"\"\n     out = []\n-    for x in items:\n+    for x in items if isinstance(x, list):\n         out.extend(x)\n     return out\n \n def depth(items):\n",
-      "rejected": null,
-      "test_secs": 0.045987709
+      "rejected": "did not apply",
+      "test_secs": 0.0
     },
     {
       "applied": true,
@@ -103,7 +103,7 @@
       "passed": false,
       "raw_diff": "diff --git a/nested.py b/nested.py\nindex 2a3b5c1..1234567 100644\n--- a/nested.py\n+++ b/nested.py\n@@ -4,7 +4,7 @@ def flatten(items):\n     \"\"\"All non-list values of an arbitrarily nested list, in order.\"\"\"\n     out = []\n     for x in items:\n-        if isinstance(x, list):\n+        if isinstance(x, list) and not isinstance(x, str):\n             out.extend(x)\n         else:\n             out.append(x)\n",
       "rejected": null,
-      "test_secs": 0.048621042
+      "test_secs": 0.047411
     }
   ],
   "completion_tokens": 1225,
@@ -114,10 +114,10 @@
   "prompt_tokens": 772,
   "repo": "/Users/akshaj/rust_llm_inference_server/target/fix-tasks/flatten",
   "secs": {
-    "context": 0.105363875,
-    "generate": 7.265712875,
-    "tests": 0.513963959,
-    "total": 8.14800875
+    "context": 0.100423625,
+    "generate": 7.248220208,
+    "tests": 0.584793584,
+    "total": 8.21152
   },
   "seed": 0,
   "task": "`flatten()` in nested.py only flattens one level: flatten([1, [2, [3, [4, []]]], 5]) should be [1, 2, 3, 4, 5].",

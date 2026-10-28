@@ -4,12 +4,16 @@
 # and fixed with one n=$N request to a Qwen2.5-Coder server. Writes $OUT/<name>.json per
 # task, $OUT/table.md (pass@1, pass@N, times) and the server's peak footprint.
 # Usage: scripts/bench/fix-tasks.sh [extra rlis fix args, e.g. --seed 1]
+# MODEL, TOKENIZER and NAME pick another model (default Qwen2.5-Coder 1.5B Q8_0).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$PWD
 PORT=${PORT:-18300}
 OUT=${OUT:-results/mac/fix}
 N=${N:-8}
+MODEL=${MODEL:-models/Qwen2.5-Coder-1.5B-Instruct-Q8_0.gguf}
+TOKENIZER=${TOKENIZER:-models/qwen2.5-coder-1.5b-instruct}
+NAME=${NAME:-qwen2.5-coder-1.5b-instruct}
 WORK=target/fix-tasks
 mkdir -p "$OUT" "$WORK"
 
@@ -27,9 +31,8 @@ uv venv --clear -q .venv --python 3.12
 export PATH="$ROOT/.venv/bin:$PATH" PYTHONDONTWRITEBYTECODE=1
 
 pmset -g | grep -i powermode >"$OUT/powermode.txt" || true
-target/release/rlis serve --port "$PORT" --model models/Qwen2.5-Coder-1.5B-Instruct-Q8_0.gguf \
-  --tokenizer models/qwen2.5-coder-1.5b-instruct --served-model-name qwen2.5-coder-1.5b-instruct \
-  --max-seq-len 8192 >"$OUT/server.log" 2>&1 &
+target/release/rlis serve --port "$PORT" --model "$MODEL" --tokenizer "$TOKENIZER" \
+  --served-model-name "$NAME" --max-seq-len 8192 >"$OUT/server.log" 2>&1 &
 PID=$!
 for _ in $(seq 1 240); do
   curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break

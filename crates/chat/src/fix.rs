@@ -1,7 +1,8 @@
 //! `rlis fix`: N attempts at a patch from one request. The task, the failing test's output and
 //! the code it points at go to the server once with `n` completions, which rlis prefills once
 //! and forks. Each candidate diff is applied in its own git worktree and the test command runs
-//! there, a few at a time; the smallest passing diff wins.
+//! there, a few at a time; the smallest passing diff wins. Diffs `git apply` refuses are
+//! applied by content (`apply_by_content`), which small models' diffs often need.
 //!
 //! The user's working tree is only read (`git stash create` snapshots its tracked files
 //! without touching it) unless `--apply` is given. Worktrees live under
@@ -25,15 +26,16 @@ use serde_json::{Value, json};
 
 use crate::{ACCENT, ensure_server, http, model_name};
 
-/// What `rlis fix` starts when no server is running: the coding model, with room for a prompt
-/// of a few files plus the reply.
+/// What `rlis fix` starts when no server is running: the coding model (the 3B fixed 6 of the
+/// 10 benchmark tasks, the 1.5B 2; docs/fix-bench.md), with room for a prompt of a few files
+/// plus the reply.
 const QWEN_SERVE_ARGS: &[&str] = &[
     "--model",
-    "models/Qwen2.5-Coder-1.5B-Instruct-Q8_0.gguf",
+    "models/Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf",
     "--tokenizer",
-    "models/qwen2.5-coder-1.5b-instruct",
+    "models/qwen2.5-coder-3b-instruct",
     "--served-model-name",
-    "qwen2.5-coder-1.5b-instruct",
+    "qwen2.5-coder-3b-instruct",
     "--max-seq-len",
     "8192",
 ];
@@ -106,7 +108,7 @@ struct Attempt {
     /// The diff as the model wrote it (empty if it wrote none).
     raw_diff: String,
     applied: bool,
-    /// Applied only with `patch --fuzz`.
+    /// `git apply` refused it; applied by content (`apply_by_content`).
     fuzzy: bool,
     /// Sections for protected files (the tests) were dropped from the diff.
     dropped_protected: bool,
@@ -563,20 +565,81 @@ fn touched(diff: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// Hunk headers recounted from their bodies, and empty lines inside hunks written as blank
+/// context lines. Small models get both wrong (and drop the space from blank context lines);
+/// `git apply --recount` copes with the counts but never fuzzes, and `patch` rejects such
+/// hunks as malformed before it tries any fuzz.
+fn normalize_hunks(diff: &str) -> String {
+    let lines: Vec<&str> = diff.lines().collect();
+    let file_header = |j: usize| {
+        lines[j].starts_with("diff --git ")
+            || (lines[j].starts_with("--- ")
+                && lines.get(j + 1).is_some_and(|n| n.starts_with("+++ ")))
+    };
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let Some((old_start, new_start, tail)) = hunk_header(lines[i]) else {
+            out.push(lines[i].to_string());
+            i += 1;
+            continue;
+        };
+        let mut j = i + 1;
+        let mut body = Vec::new();
+        while j < lines.len() && !lines[j].starts_with("@@") && !file_header(j) {
+            body.push(match lines[j] {
+                "" => " ".to_string(),
+                l => l.to_string(),
+            });
+            j += 1;
+        }
+        // Blank lines at the end separate this hunk from what follows; they aren't context.
+        while body.last().is_some_and(|l| l == " ") {
+            body.pop();
+        }
+        let count = |c: char| {
+            body.iter()
+                .filter(|l| l.starts_with(' ') || l.starts_with(c))
+                .count()
+        };
+        out.push(format!(
+            "@@ -{old_start},{} +{new_start},{} @@{tail}",
+            count('-'),
+            count('+')
+        ));
+        out.extend(body);
+        i = j;
+    }
+    out.join("\n") + "\n"
+}
+
+/// `@@ -a,b +c,d @@ tail` -> (a, c, tail).
+fn hunk_header(line: &str) -> Option<(usize, usize, &str)> {
+    let (old, rest) = line.strip_prefix("@@ -")?.split_once(" +")?;
+    let (new, tail) = rest.split_once(" @@")?;
+    let start = |r: &str| r.split(',').next()?.parse::<usize>().ok();
+    Some((start(old)?, start(new)?, tail))
+}
+
 /// `diff` without the file sections that touch any of `files`. Sections start at `diff --git`
-/// lines, or at `--- ` headers followed by `+++ ` when the diff has no `diff --git` lines.
+/// lines or at `--- `/`+++ ` header pairs.
 fn without_files(diff: &str, files: &[String]) -> String {
     let lines: Vec<&str> = diff.split_inclusive('\n').collect();
-    let git_style = lines.iter().any(|l| l.starts_with("diff --git "));
-    let starts: Vec<usize> = (0..lines.len())
-        .filter(|&i| match git_style {
-            true => lines[i].starts_with("diff --git "),
-            false => {
-                lines[i].starts_with("--- ")
-                    && lines.get(i + 1).is_some_and(|n| n.starts_with("+++ "))
+    // A `---`/`+++` pair starts a section unless it belongs to the `diff --git` line before it;
+    // models mix both styles in one reply.
+    let mut starts = Vec::new();
+    let mut git_header_open = false;
+    for (i, l) in lines.iter().enumerate() {
+        if l.starts_with("diff --git ") {
+            starts.push(i);
+            git_header_open = true;
+        } else if l.starts_with("--- ") && lines.get(i + 1).is_some_and(|n| n.starts_with("+++ ")) {
+            if !git_header_open {
+                starts.push(i);
             }
-        })
-        .collect();
+            git_header_open = false;
+        }
+    }
     let mut out: String = lines[..starts.first().copied().unwrap_or(lines.len())].concat();
     for (k, &start) in starts.iter().enumerate() {
         let section = lines[start..starts.get(k + 1).copied().unwrap_or(lines.len())].concat();
@@ -587,15 +650,180 @@ fn without_files(diff: &str, files: &[String]) -> String {
     out
 }
 
-/// Applies the candidate in `dir` (git apply, else `patch` with fuzz) and records the result.
+/// One file's hunks: each line tagged ' ' (context), '-' or '+'.
+struct FilePatch {
+    path: String,
+    new_file: bool,
+    hunks: Vec<Hunk>,
+}
+
+struct Hunk {
+    old_start: usize,
+    lines: Vec<(char, String)>,
+}
+
+fn parse_diff(diff: &str) -> Result<Vec<FilePatch>> {
+    let lines: Vec<&str> = diff.lines().collect();
+    let header = |p: &str| p.split('\t').next().unwrap_or(p).trim().to_string();
+    let mut files: Vec<FilePatch> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
+        if let (Some(old), Some(new)) = (
+            l.strip_prefix("--- "),
+            lines.get(i + 1).and_then(|n| n.strip_prefix("+++ ")),
+        ) {
+            let (old, new) = (header(old), header(new));
+            anyhow::ensure!(new != "/dev/null", "deleting files is not supported");
+            files.push(FilePatch {
+                path: new,
+                new_file: old == "/dev/null",
+                hunks: Vec::new(),
+            });
+            i += 2;
+            continue;
+        }
+        if let Some((old_start, _, _)) = hunk_header(l) {
+            let file = files.last_mut().context("hunk before any file header")?;
+            let mut hunk = Hunk {
+                old_start,
+                lines: Vec::new(),
+            };
+            i += 1;
+            while i < lines.len() {
+                let l = lines[i];
+                let next_is_new = l.starts_with("+++ ");
+                let file_header = l.starts_with("--- ")
+                    && lines.get(i + 1).is_some_and(|n| n.starts_with("+++ "));
+                if l.starts_with("@@") || l.starts_with("diff --git ") || file_header || next_is_new
+                {
+                    break;
+                }
+                match l.chars().next() {
+                    None => hunk.lines.push((' ', String::new())),
+                    Some(c @ (' ' | '-' | '+')) => hunk.lines.push((c, l[1..].to_string())),
+                    Some('\\') => {}
+                    // Prose after the diff ends the hunk.
+                    Some(_) => break,
+                }
+                i += 1;
+            }
+            file.hunks.push(hunk);
+            continue;
+        }
+        i += 1;
+    }
+    anyhow::ensure!(!files.is_empty(), "no file headers");
+    Ok(files)
+}
+
+/// Where `h` goes in `lines`: (start, old line count, replacement lines). Old lines (context
+/// and removals) are compared ignoring surrounding whitespace, the match nearest to where the
+/// header says wins, and up to 3 context lines at either end may be dropped (`patch -F 3`).
+/// Context lines keep the file's own text.
+fn place(lines: &[String], h: &Hunk, shift: isize) -> Option<(usize, usize, Vec<String>)> {
+    let n = h.lines.len();
+    let lead = h.lines.iter().take_while(|(c, _)| *c == ' ').count();
+    let trail = h.lines.iter().rev().take_while(|(c, _)| *c == ' ').count();
+    let want = (h.old_start as isize - 1 + shift).max(0) as usize;
+    for fuzz in 0..=3 {
+        let (a, b) = (fuzz.min(lead), fuzz.min(trail));
+        if a + b >= n {
+            continue;
+        }
+        let body = &h.lines[a..n - b];
+        let old: Vec<&str> = body
+            .iter()
+            .filter(|(c, _)| *c != '+')
+            .map(|(_, l)| l.trim())
+            .collect();
+        let at = match old.is_empty() {
+            // Pure insertion: only into an empty (new) file, with nothing to anchor it otherwise.
+            true if lines.is_empty() => Some(0),
+            true => None,
+            false => (0..=lines.len().saturating_sub(old.len()))
+                .filter(|&i| {
+                    i + old.len() <= lines.len()
+                        && old
+                            .iter()
+                            .enumerate()
+                            .all(|(k, o)| lines[i + k].trim() == *o)
+                })
+                .min_by_key(|&i| i.abs_diff(want + a)),
+        };
+        let Some(at) = at else { continue };
+        let mut replacement = Vec::new();
+        let mut k = at;
+        for (c, l) in body {
+            match c {
+                ' ' => {
+                    replacement.push(lines[k].clone());
+                    k += 1;
+                }
+                '-' => k += 1,
+                _ => replacement.push(l.clone()),
+            }
+        }
+        return Some((at, old.len(), replacement));
+    }
+    None
+}
+
+/// Applies `diff` in `dir` by content instead of line numbers, for diffs `git apply` refuses
+/// (see `place`). Small models write the right change with context that is a little off:
+/// a double blank line collapsed to one, three lines of context before the change and none
+/// after (which `git apply` and `patch` both anchor to the end of the file), or wrong
+/// indentation on a context line.
+fn apply_by_content(dir: &Path, diff: &str) -> Result<()> {
+    for file in parse_diff(diff)? {
+        let rel = Path::new(&file.path);
+        let rel = match (
+            rel.strip_prefix("a").or(rel.strip_prefix("b")),
+            dir.join(rel).exists(),
+        ) {
+            (Ok(stripped), false) => stripped,
+            _ => rel,
+        };
+        anyhow::ensure!(
+            rel.components()
+                .all(|c| matches!(c, std::path::Component::Normal(_))),
+            "path outside the repository: {}",
+            file.path
+        );
+        let path = dir.join(rel);
+        let text = match file.new_file {
+            true => String::new(),
+            false => fs::read_to_string(&path)?,
+        };
+        let mut lines: Vec<String> = text.lines().map(String::from).collect();
+        let mut shift = 0isize;
+        for h in &file.hunks {
+            let (at, len, replacement) = place(&lines, h, shift).context("hunk does not match")?;
+            shift += replacement.len() as isize - len as isize;
+            lines.splice(at..at + len, replacement);
+        }
+        let mut out = lines.join("\n");
+        if !lines.is_empty() && (text.is_empty() || text.ends_with('\n')) {
+            out.push('\n');
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, out)?;
+    }
+    Ok(())
+}
+
+/// Applies the candidate in `dir` (git apply, else by content) and records the result.
 fn apply_candidate(dir: &Path, a: &mut Attempt, protect: &[String]) -> Result<()> {
     if a.raw_diff.trim().is_empty() {
         a.rejected = Some(format!("no diff (finish: {})", a.finish_reason));
         return Ok(());
     }
     // Edits to protected files (the tests) are dropped; the rest of the patch still counts.
-    let diff = without_files(&a.raw_diff, protect);
-    a.dropped_protected = diff != a.raw_diff;
+    let kept = without_files(&a.raw_diff, protect);
+    a.dropped_protected = kept != a.raw_diff;
+    let diff = normalize_hunks(&kept);
     if diff.trim().is_empty() {
         a.rejected = Some("only edits protected files".into());
         return Ok(());
@@ -605,30 +833,15 @@ fn apply_candidate(dir: &Path, a: &mut Attempt, protect: &[String]) -> Result<()
         false => "-p0",
     };
     if git_apply(dir, &diff, &[strip]).is_err() {
-        let patch_file = dir.join(".rlis-fix.patch");
-        fs::write(&patch_file, &diff)?;
-        let file = patch_file.to_str().context("non-UTF-8 path")?;
-        let patch = |check: bool| -> Result<bool> {
-            let mut cmd = Command::new("patch");
-            cmd.args([strip, "-F", "3", "-N", "-t", "-s", "-i", file])
-                .current_dir(dir)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            if check {
-                cmd.arg("-C");
-            }
-            Ok(cmd.status()?.success())
-        };
-        let ok = patch(true)? && patch(false)?;
-        fs::remove_file(&patch_file)?;
-        if !ok {
+        if apply_by_content(dir, &diff).is_err() {
             a.rejected = Some("did not apply".into());
             return Ok(());
         }
         a.fuzzy = true;
     }
-    a.diff = git(dir, &["diff"])?;
+    // Staged so that files the patch creates show up too.
+    git(dir, &["add", "-A"])?;
+    a.diff = git(dir, &["diff", "--cached"])?;
     if a.diff.is_empty() {
         a.rejected = Some("applied, but changed nothing".into());
         return Ok(());
@@ -725,12 +938,62 @@ mod tests {
     }
 
     #[test]
+    fn recounts_hunks_and_restores_blank_context() {
+        // Header claims 7 lines each; the body has 5 old and 5 new, and its blank context
+        // line lost its leading space. The trailing blank line is not context.
+        let diff = "--- a/d.py\n+++ b/d.py\n@@ -6,7 +6,7 @@ X = 1\n\n def f(y):\n-    return y\n+    return y + 1\n \n def g():\n\n";
+        assert_eq!(
+            normalize_hunks(diff),
+            "--- a/d.py\n+++ b/d.py\n@@ -6,5 +6,5 @@ X = 1\n \n def f(y):\n-    return y\n+    return y + 1\n \n def g():\n"
+        );
+        assert_eq!(
+            normalize_hunks("@@ -10 flickr\n-a\n"),
+            "@@ -10 flickr\n-a\n"
+        );
+    }
+
+    fn apply_in_temp(file: &str, diff: &str) -> Result<String> {
+        let dir = std::env::temp_dir().join(format!(
+            "rlis-fix-test-{}-{}",
+            std::process::id(),
+            unix_millis()
+        ));
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("m.py"), file)?;
+        let r =
+            apply_by_content(&dir, diff).and_then(|()| Ok(fs::read_to_string(dir.join("m.py"))?));
+        let _ = fs::remove_dir_all(&dir);
+        r
+    }
+
+    /// The shapes `git apply` refuses: no trailing context, a collapsed double blank line,
+    /// a context line with the wrong indentation, and a wrong line number.
+    #[test]
+    fn applies_by_content() -> Result<()> {
+        let file = "X = 1\n\n\ndef f(y):\n    if y:\n        pass\n    return y\n\n\ndef g():\n    return 2\n";
+        let no_trailing = "--- a/m.py\n+++ b/m.py\n@@ -1,4 +1,4 @@\n def f(y):\n     if y:\n         pass\n-    return y\n+    return y + 1\n";
+        let want = file.replace("return y\n", "return y + 1\n");
+        assert_eq!(apply_in_temp(file, no_trailing)?, want);
+        let collapsed = "--- a/m.py\n+++ b/m.py\n@@ -40,6 +40,6 @@\n   if y:\n         pass\n-    return y\n+    return y + 1\n\n def g():\n     return 2\n";
+        assert_eq!(apply_in_temp(file, collapsed)?, want);
+        // Old lines that aren't in the file never apply, however much context is dropped.
+        let wrong = "--- a/m.py\n+++ b/m.py\n@@ -1 +1 @@\n-    return z\n+    return y + 1\n";
+        assert!(apply_in_temp(file, wrong).is_err());
+        let escape = "--- a/../m.py\n+++ b/../m.py\n@@ -1 +1 @@\n-X = 1\n+X = 2\n";
+        assert!(apply_in_temp(file, escape).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn drops_protected_sections() {
         let src = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n";
         let test = "diff --git a/t.py b/t.py\n--- a/t.py\n+++ b/t.py\n@@ -1 +1 @@\n-c\n+d\n";
         let protect = ["t.py".to_string()];
         assert_eq!(without_files(&format!("{src}{test}"), &protect), src);
         assert_eq!(without_files(&format!("{test}{src}"), &protect), src);
+        // Both styles in one reply: the plain section isn't part of the git one after it.
+        let plain_test = "--- a/t.py\n+++ b/t.py\n@@ -1 +1 @@\n-c\n+d\n";
+        assert_eq!(without_files(&format!("{plain_test}{src}"), &protect), src);
         // Plain `---`/`+++` headers, with a removed line that itself starts with dashes.
         let plain = "--- x.py\n+++ x.py\n@@ -1,2 +1 @@\n--- old\n-a\n--- t.py\n+++ t.py\n@@ -1 +1 @@\n-c\n+d\n";
         assert_eq!(

@@ -2,8 +2,8 @@
 
 rlis is an LLM serving engine in Rust for Llama-architecture models on an Apple Silicon GPU
 (Metal), with continuous batching, a paged KV cache and an OpenAI-compatible API. It was built
-for Llama 3.2 1B; Qwen2 (Qwen2.5-Coder 1.5B, for `rlis fix`) loads from GGUF as Llama plus
-Q/K/V biases. This document
+for Llama 3.2 1B; Qwen2 (Qwen2.5-Coder 1.5B and 3B, for `rlis fix`) loads from GGUF as Llama
+plus Q/K/V biases. This document
 covers how it works, why it is built this way, and what was measured along the way. Numbers are
 from an M4 Pro (20-core GPU, 24 GB) running Llama 3.2 1B Instruct, except the
 [CUDA run](#cuda-run) on a Tesla T4; the benchmark files under `results/` carry full provenance.
@@ -96,11 +96,11 @@ every block returned.
   are split into partitions that run as separate threadgroups and are merged by a second
   kernel (flash-decoding). Without the split, one sequence was only 8 threadgroups on a
   20-core GPU, and an 8k-context decode step took 34 ms instead of 10. It is compiled for up
-  to 4 and up to 8 query heads per KV head: Qwen2.5 1.5B has 6, and sizing Llama's per-lane
-  state for 8 cost it ~10% of attention time. The wide variant merges its simdgroups' outputs
-  4 heads per round, since staging all 8 would take 32 KB of threadgroup memory. It matches a
-  CPU reference for both Llama 3.2 head layouts and Qwen2.5's, on 37 sequences up to 700
-  tokens and on split contexts up to 9,000.
+  to 4 and up to 8 query heads per KV head: Qwen2.5 1.5B has 6 and 3B has 8, and sizing
+  Llama's per-lane state for 8 cost it ~10% of attention time. The wide variant merges its
+  simdgroups' outputs 4 heads per round, since staging all 8 would take 32 KB of threadgroup
+  memory. It matches a CPU reference for both Llama 3.2 head layouts, Qwen2.5 1.5B's and 8
+  heads per KV head, on 37 sequences up to 700 tokens and on split contexts up to 9,000.
 - **Fused prefill.** Multi-token segments use MLX's fused attention (`candle_nn::ops::sdpa`)
   with a bottom-right-aligned causal mask, which is exactly chunked-prefill semantics. The
   first version materialized f32 score matrices and spent 313 ms of a 1024-token prefill in

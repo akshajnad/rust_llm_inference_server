@@ -20,7 +20,7 @@ LLAMA_CPP_CMAKE_FLAGS ?= -DGGML_METAL=ON
 LLAMA_CPP_JOBS ?=
 WIKITEXT_URL := $(HF)/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
 
-.PHONY: serve chat install uninstall models models-qwen models-all wikitext llama-cpp bench-mac bench-cuda bench-ablations bench-fork bench-fix bench-charts soak build test test-metal parity-ref parity-ref-qwen chat-ref chat-ref-qwen parity parity-qwen lint fuzz teardown
+.PHONY: serve chat install uninstall models models-qwen models-qwen-3b models-all wikitext llama-cpp bench-mac bench-cuda bench-ablations bench-fork bench-fix bench-fix-3b bench-charts soak build test test-metal parity-ref parity-ref-qwen chat-ref chat-ref-qwen parity parity-qwen lint fuzz teardown
 
 # One command from a fresh clone to a running server on http://127.0.0.1:8000.
 serve: models
@@ -73,6 +73,18 @@ models-qwen:
 	$(call fetch,$(QWEN_REPO),tokenizer.json,$(QWEN_DIR)/tokenizer.json)
 	$(call fetch,$(QWEN_REPO),tokenizer_config.json,$(QWEN_DIR)/tokenizer_config.json)
 	$(call fetch,$(QWEN_GGUF_REPO),$(QWEN_GGUF),models/$(QWEN_GGUF))
+
+# The 3B (36 layers, 8 query heads per KV head), Q4_K_M to stay inside the memory budget.
+QWEN3B_DIR := models/qwen2.5-coder-3b-instruct
+QWEN3B_REPO := Qwen/Qwen2.5-Coder-3B-Instruct
+QWEN3B_GGUF := Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf
+
+models-qwen-3b:
+	$(call fetch,$(QWEN3B_REPO),config.json,$(QWEN3B_DIR)/config.json)
+	$(call fetch,$(QWEN3B_REPO),generation_config.json,$(QWEN3B_DIR)/generation_config.json)
+	$(call fetch,$(QWEN3B_REPO),tokenizer.json,$(QWEN3B_DIR)/tokenizer.json)
+	$(call fetch,$(QWEN3B_REPO),tokenizer_config.json,$(QWEN3B_DIR)/tokenizer_config.json)
+	$(call fetch,bartowski/Qwen2.5-Coder-3B-Instruct-GGUF,$(QWEN3B_GGUF),models/$(QWEN3B_GGUF))
 
 models-all: models
 	$(call fetch,$(DENSE_REPO),model.safetensors,$(MODEL_DIR)/model.safetensors)
@@ -196,6 +208,12 @@ bench-fix: models-qwen
 	cargo build --release --features $(FEATURES) -p server
 	cargo build --release -p chat
 	scripts/bench/fix-tasks.sh
+
+bench-fix-3b: models-qwen-3b
+	cargo build --release --features $(FEATURES) -p server
+	cargo build --release -p chat
+	MODEL=models/$(QWEN3B_GGUF) TOKENIZER=$(QWEN3B_DIR) NAME=qwen2.5-coder-3b-instruct \
+		OUT=results/mac/fix-3b scripts/bench/fix-tasks.sh
 
 bench-charts:
 	cargo build --release -p bench

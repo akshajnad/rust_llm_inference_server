@@ -219,88 +219,139 @@ for occupancy.
 
 ## `rlis fix` on 10 small tasks
 
-**Answer: the pipeline works; this model mostly can't write the fixes.** `rlis fix` with
-Qwen2.5-Coder 1.5B Instruct (Q8_0) fixed 1 of 10 small, single-bug Python tasks (flatten) with
-8 attempts each: pass@8 = 1/10, pass@1 = 0.03. Each task took 5–12 s end to end, almost all of
-it generation. The model's attempts fail in two roughly equal ways. Half of them don't produce a
-usable diff. The other half apply and change the right line, but the change is wrong.
+**Answer: with Qwen2.5-Coder 3B, 8 attempts fix 6 of 10 tasks where one attempt fixes about 2;
+the 1.5B fixes 2 of 10.** Each 3B run takes 9–26 s, almost all of it generation. Sampling 8
+attempts is what makes it useful: pass@1 is 0.23, so one attempt per task would fix about 2.3
+of the 10 on average, against 6 for the best of 8. The n=1 time for these tasks wasn't
+measured; on Llama above, 8 forked attempts cost about 3× one.
 
-- **Tasks** (`bench/fix-tasks`, run with `make bench-fix`): 10 stdlib-only modules of 15–30
-  lines, each with one bug and a `unittest` file that fails on it (median of even lists, leap
-  years, a dropped last chunk, a binary search off-by-one, minutes parsed as hours, an LRU
-  `get` that doesn't refresh, slugify dashes, subtractive Roman numerals, unsorted or touching
-  intervals, one-level flatten). Each is solvable with a 1–6 line change (checked by hand). The
-  harness copies each into `target/fix-tasks/<name>` and runs `git init` there, so no repository
-  is nested in rlis.
-- **One run per task:** one `n=8` request at temperature 0.7, seed 0 (attempt i uses seed
-  i), up to 1,024 tokens each, 1 GiB KV pool, High Power mode. The prompt holds the task, the
-  failing test's output, the source and test files the traceback names, and `git grep` hits
-  for identifiers in the task: 600–1,060 tokens. Tests run 4 at a time. The test file is
-  protected: edits to it are dropped from a candidate before it is applied.
+| Model | pass@1 | pass@8 | passed / applied / attempts | time for all 10 | server peak footprint |
+|---|---|---|---|---|---|
+| Qwen2.5-Coder 3B Instruct, Q4_K_M (default) | **0.23** | **6/10** | 18 / 61 / 80 | 160 s | 3.54 GB |
+| Qwen2.5-Coder 1.5B Instruct, Q8_0 | 0.04 | 2/10 | 3 / 42 / 80 | 148 s* | 3.26 GB |
+
+\* 61 s of it is one 1.5B binary_search candidate that loops forever until the 60 s test
+timeout kills it; generation took 79 s against the 3B's 150 s.
+
+- **Tasks** (`bench/fix-tasks`; `make bench-fix-3b`, `make bench-fix` for the 1.5B): 10
+  stdlib-only modules of 15–30 lines, each with one bug and a `unittest` file that fails on it:
+  - median of even-length lists;
+  - leap years;
+  - a dropped last chunk;
+  - a binary search off-by-one;
+  - minutes parsed as hours;
+  - an LRU `get` that doesn't refresh;
+  - slugify dashes;
+  - subtractive Roman numerals;
+  - unsorted or touching intervals;
+  - one-level flatten.
+
+  Each is solvable with a 1–6 line change (checked by hand). The harness copies each into
+  `target/fix-tasks/<name>` and runs `git init` there, so no repository is nested in rlis.
+- **One run per task:** one `n=8` request at temperature 0.7, seed 0 (attempt i uses seed i),
+  up to 1,024 tokens each, 1 GiB KV pool. The prompt holds the task, the failing test's output,
+  the source and test files the traceback names, and `git grep` hits for identifiers in the
+  task: 600–1,060 tokens. Tests run 4 at a time. The test file is protected: sections of a
+  candidate that edit it are dropped before applying.
 - **pass@1** is c/8, the unbiased estimate from the 8 samples; **pass@8** is whether any
   attempt passed. Times are wall clock from `rlis fix` start to the printed result.
+- Power mode was Automatic (0) for these runs; the macOS setting changed from High Power
+  partway through the session.
+
+**Qwen2.5-Coder 3B, Q4_K_M:**
 
 | task | applied | passed | pass@1 | pass@8 | prompt tok | output tok | generate (s) | tests (s) | total (s) |
 |---|---|---|---|---|---|---|---|---|---|
-| binary_search | 5/8 | 0/8 | 0.00 | 0 | 721 | 1082 | 4.8 | 0.5 | 5.7 |
-| chunk | 4/8 | 0/8 | 0.00 | 0 | 841 | 2448 | 10.7 | 0.4 | 11.5 |
-| duration | 3/8 | 0/8 | 0.00 | 0 | 860 | 1793 | 8.9 | 0.4 | 9.7 |
-| flatten | 8/8 | 2/8 | 0.25 | 1 | 772 | 1225 | 7.3 | 0.5 | 8.1 |
-| intervals | 3/8 | 0/8 | 0.00 | 0 | 1060 | 1950 | 9.8 | 0.4 | 10.6 |
-| leap_year | 3/8 | 0/8 | 0.00 | 0 | 833 | 1982 | 9.5 | 0.5 | 10.4 |
-| lru | 4/8 | 0/8 | 0.00 | 0 | 796 | 1689 | 9.3 | 0.4 | 10.1 |
-| median | 4/8 | 0/8 | 0.00 | 0 | 598 | 1465 | 7.3 | 0.5 | 8.2 |
-| roman | 1/8 | 0/8 | 0.00 | 0 | 859 | 841 | 4.2 | 0.4 | 5.0 |
-| slugify | 3/8 | 0/8 | 0.00 | 0 | 595 | 1416 | 6.5 | 0.4 | 7.3 |
-| **all 10** | 38/80 | 2/80 | **0.03** | **1/10** | | | 78.4 | | 86.6 |
+| binary_search | 6/8 | 0/8 | 0.00 | 0 | 721 | 1716 | 15.6 | 0.6 | 16.6 |
+| chunk | 7/8 | 3/8 | 0.38 | 1 | 841 | 1547 | 14.9 | 0.6 | 15.9 |
+| duration | 7/8 | 1/8 | 0.12 | 1 | 860 | 2510 | 24.9 | 0.6 | 25.8 |
+| flatten | 8/8 | 3/8 | 0.38 | 1 | 772 | 1294 | 11.7 | 0.6 | 12.7 |
+| intervals | 4/8 | 0/8 | 0.00 | 0 | 1060 | 1715 | 17.0 | 0.5 | 17.9 |
+| leap_year | 7/8 | 6/8 | 0.75 | 1 | 833 | 1612 | 13.4 | 0.6 | 14.4 |
+| lru | 4/8 | 2/8 | 0.25 | 1 | 796 | 1028 | 9.4 | 0.5 | 10.3 |
+| median | 8/8 | 3/8 | 0.38 | 1 | 598 | 1056 | 8.3 | 0.6 | 9.2 |
+| roman | 5/8 | 0/8 | 0.00 | 0 | 859 | 2166 | 21.1 | 0.5 | 22.0 |
+| slugify | 5/8 | 0/8 | 0.00 | 0 | 595 | 1456 | 14.1 | 0.6 | 15.1 |
+| **all 10** | 61/80 | 18/80 | **0.23** | **6/10** | | | 150.4 | | 159.9 |
 
-Server peak footprint over the whole run: 3.25 GB. Raw results, including every attempt's raw
-and applied diff: `results/mac/fix/*.json`.
+**Qwen2.5-Coder 1.5B, Q8_0:**
+
+| task | applied | passed | pass@1 | pass@8 | prompt tok | output tok | generate (s) | tests (s) | total (s) |
+|---|---|---|---|---|---|---|---|---|---|
+| binary_search | 6/8 | 0/8 | 0.00 | 0 | 721 | 1082 | 4.8 | 60.5 | 65.7 |
+| chunk | 4/8 | 0/8 | 0.00 | 0 | 841 | 2448 | 10.6 | 0.4 | 11.4 |
+| duration | 4/8 | 0/8 | 0.00 | 0 | 860 | 1793 | 8.9 | 0.5 | 9.7 |
+| flatten | 7/8 | 2/8 | 0.25 | 1 | 772 | 1225 | 7.2 | 0.6 | 8.2 |
+| intervals | 3/8 | 0/8 | 0.00 | 0 | 1060 | 1950 | 9.8 | 0.5 | 10.7 |
+| leap_year | 2/8 | 0/8 | 0.00 | 0 | 833 | 1982 | 9.6 | 0.6 | 10.6 |
+| lru | 6/8 | 0/8 | 0.00 | 0 | 796 | 1689 | 9.4 | 0.6 | 10.4 |
+| median | 5/8 | 1/8 | 0.12 | 1 | 598 | 1465 | 7.4 | 0.6 | 8.4 |
+| roman | 1/8 | 0/8 | 0.00 | 0 | 859 | 841 | 4.3 | 0.5 | 5.3 |
+| slugify | 4/8 | 0/8 | 0.00 | 0 | 595 | 1416 | 6.6 | 0.5 | 7.6 |
+| **all 10** | 42/80 | 3/80 | **0.04** | **2/10** | | | 78.7 | | 148.0 |
+
+Every winning patch is a minimal source-only fix, the one a person would write (for example
+`out.extend(flatten(x))`, `range(0, len(items), size)`, `self.items.move_to_end(key)` in
+`get`). Raw results, including every attempt's raw and applied diff: `results/mac/fix/` and
+`results/mac/fix-3b/`.
 
 **Where the 80 attempts went:**
 
-| Outcome | Attempts |
-|---|---|
-| Passed | 2 |
-| Applied, test still fails | 36 |
-| Didn't apply | 23 |
-| Applied but changed nothing | 6 |
-| Only edited the test file | 13 |
+| Outcome | 3B | 1.5B |
+|---|---|---|
+| Passed | 18 | 3 |
+| Applied, test still fails | 43 | 38 (+1 timed out) |
+| Didn't apply | 13 | 11 |
+| Applied but changed nothing | 6 | 14 |
+| Only edited the test file | 0 | 13 |
 
-- **Wrong fixes.** Applied patches mostly change the right line in the wrong way. In
-  binary_search, 4 of 5 turn `==` or `<` into `<=`. In chunk, they drop the step or add a
-  filter that drops the remainder again. In the LRU cache, they change the capacity check or
-  `__len__`.
-- **Unusable diffs.** Typical failures: the fixed line written as an unchanged context line
-  (no `-`/`+`, so it can't match the file), or a line the patch deletes repeated as context
-  after it. Neither can be repaired mechanically without guessing what was meant. `git apply
-  --recount` tolerates wrong hunk counts and line numbers, but 21 of the 38 applied patches
-  needed `patch --fuzz` on top.
-- **Test edits.** 35 of 80 attempts edit the test file. The first run rejected those attempts
-  outright: 26/80 applied, 1 passed (`results/mac/fix-reject-test-edits/`). Dropping just the
-  test-file sections gave the same samples (same seeds, identical token counts) 12 more applied
-  patches and 1 more pass, and didn't change pass@8.
+- **Wrong fixes are the main loss**, worse for the 1.5B. Its applied patches mostly change the
+  right line the wrong way: binary_search turns `==` or `<` into `<=`, chunk drops the step,
+  the LRU changes the capacity check. The 3B fails mostly on the harder tasks (roman,
+  intervals, slugify, binary_search), but on the easy ones it often writes several different
+  correct fixes.
+- **Applying the diffs took three tries.** The models write the right change with context
+  that is slightly off. Typical cases:
+  - a double blank line collapsed to one;
+  - context lines with the wrong indentation;
+  - wrong hunk counts and line numbers;
+  - three lines of context before the change and none after. Both `git apply` and `patch`
+    anchor that shape to the end of the file, so the hunk can't land mid-file.
 
-**Cost.** Generation is 90% of the wall time: 8 attempts of 100–300 tokens decode together at
-170–230 tok/s aggregate. Building the context takes ≤ 0.11 s, and applying and testing all 8
-takes 0.3–0.5 s.
+  `rlis fix` first tries `git apply --recount`. If that refuses, it applies by content: each
+  hunk's removed and context lines are located ignoring indentation, nearest to the line the
+  header names, with up to 3 unmatched context lines dropped at either end like `patch -F 3`.
+  Removed lines must always match. 45 of the 3B's 61 applied patches needed that. With `git
+  apply` then `patch --fuzz` instead, the same samples (same seeds, identical token counts)
+  gave the 3B 34 applied, 9 passed and pass@8 = 5/10. Recounting hunks so `patch` would fuzz
+  them won leap_year but lost chunk (4/10). The 1.5B went from 38 applied, 2 passed and pass@8
+  1/10 to 42, 3 and 2/10.
+- **Test edits.** Many attempts also edit the test file: 35 of the 1.5B's 80 and 11 of the
+  3B's. Rejecting those attempts outright (the first version, with the `git apply`/`patch`
+  applier: `results/mac/fix-reject-test-edits/`) cost the 1.5B 12 applied patches and 1 pass.
+  Dropping just their test sections keeps the source change.
+
+**Cost.** For the 3B, generation is 94% of the wall time: 8 attempts of 130–310 tokens decode
+together at 100–127 tok/s aggregate. The 1.5B runs at 170–230. Building the context takes
+≤ 0.11 s, and applying and testing all 8 takes about 0.6 s.
 
 **Caveats.**
-- One seed per task, so pass@1 = 0.03 rests on 2 passes.
+- One seed per task, so pass@1 for the 3B rests on 18 passes, and on 3 for the 1.5B.
 - Ten tiny tasks say little about real repositories. The prompt includes whole files and
   would need a budget for large ones.
 - The protected-file rule assumes the test file is known. `rlis fix` takes it as `--protect`.
-- The model, not the inference path, is the bottleneck here. Two pieces of evidence: forked
-  outputs equal separate requests token for token, and Qwen parity passes (below).
+- The applier was tuned while looking at these same samples. Its rules are generic (no rule
+  mentions a task), but the numbers are not from a held-out set.
 
 ### Qwen2 support
 
-`rlis fix` needed a coding model, and rlis only ran Llama. Qwen2.5-Coder 1.5B now loads from
-GGUF (`make models-qwen`) as Llama plus Q/K/V biases, with `qwen2.*` metadata and unpermuted
+`rlis fix` needed a coding model, and rlis only ran Llama. Qwen2.5-Coder 1.5B (Q8_0, `make
+models-qwen`) and 3B (Q4_K_M with Q6_K embeddings and down projections, `make models-qwen-3b`)
+now load from GGUF as Llama plus Q/K/V biases, with `qwen2.*` metadata and unpermuted
 (rotate-half) RoPE. Three things broke on the way:
 
-- **Paged decode kernel limits.** Qwen has 12 query heads over 2 KV heads (6 per KV head),
-  over the kernel's limit of 4. The kernel is now compiled for up to 4 and up to 8. Llama's
+- **Paged decode kernel limits.** Qwen 1.5B has 12 query heads over 2 KV heads (6 per KV
+  head) and the 3B 16 over 2 (8), over the kernel's limit of 4. The kernel is now compiled for up to 4 and up to 8. Llama's
   attention time at 8k context and batch 8: 21.9 ms before, 25.0 ms with one 8-wide kernel,
   22.1 ms with the two variants. Its decode step: 40.0, 42.9 and 40.2 ms.
 - **f16 overflow.** With the f16 KV pool every logit came out NaN. Qwen's K bias makes |k|
@@ -320,3 +371,9 @@ budget; that reference run peaked at 3.98 GB. Results:
 - tokenizer and ChatML template match transformers.
 
 Llama's f16 parity gate still passes as before.
+
+The 3B's f16 reference would need ~6.2 GB, over the budget. The 3B shares all of its code paths
+with the 1.5B except the Q4_K/Q6_K matmuls and the 8-wide kernel (which is covered by the
+kernel tests). So it was checked against llama.cpp running the same GGUF instead: 19 of the 20
+parity prompts give identical 64-token greedy output. The 20th diverges about 20 tokens in,
+after both have drifted into chat-token text.

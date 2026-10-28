@@ -1,5 +1,5 @@
 {
-  "applied": 5,
+  "applied": 6,
   "attempts": [
     {
       "applied": false,
@@ -38,20 +38,20 @@
       "passed": false,
       "raw_diff": "diff --git a/search.py b/search.py\nindex 7e8b8d5..1c5b3a1 100644\n--- a/search.py\n+++ b/search.py\n@@ -4,7 +4,7 @@ def binary_search(items, target):\n     lo, hi = 0, len(items) - 1\n     while lo < hi:\n         mid = (lo + hi) // 2\n-        if items[mid] == target:\n+        if items[mid] <= target:\n             lo = mid + 1\n         else:\n             hi = mid - 1\n",
       "rejected": null,
-      "test_secs": 0.050547042
+      "test_secs": 0.045532792
     },
     {
-      "applied": false,
-      "diff": "",
+      "applied": true,
+      "diff": "diff --git a/search.py b/search.py\nindex fdf5a50..8c26fa1 100644\n--- a/search.py\n+++ b/search.py\n@@ -5,7 +5,7 @@ def binary_search(items, target):\n     \"\"\"Index of target in the sorted list items, or -1 if it is absent.\"\"\"\n     lo, hi = 0, len(items) - 1\n     while lo < hi:\n-        mid = (lo + hi) // 2\n+        mid = (lo + hi) // 2 - 1\n         if items[mid] == target:\n             return mid\n         if items[mid] < target:\n",
       "dropped_protected": false,
       "exit": null,
       "finish_reason": "stop",
-      "fuzzy": false,
-      "lines_changed": 0,
+      "fuzzy": true,
+      "lines_changed": 2,
       "passed": false,
       "raw_diff": "diff --git a/search.py b/search.py\n--- a/search.py\n+++ b/search.py\n@@ -4,7 +4,7 @@ def binary_search(items, target):\n     \"\"\"Index of target in the sorted list items, or -1 if it is absent.\"\"\"\n     lo, hi = 0, len(items) - 1\n     while lo < hi:\n-        mid = (lo + hi) // 2\n+        mid = (lo + hi) // 2 - 1\n         if items[mid] == target:\n             return mid\n         if items[mid] < target:\n@@ -19,7 +19,7 @@ def contains(items, target):\n     return binary_search(items, target) != -1\n",
-      "rejected": "did not apply",
-      "test_secs": 0.0
+      "rejected": null,
+      "test_secs": 60.005071958
     },
     {
       "applied": true,
@@ -64,7 +64,7 @@
       "passed": false,
       "raw_diff": "diff --git a/search.py b/search.py\nindex a5b3c1e..b256e3f 100644\n--- a/search.py\n+++ b/search.py\n@@ -4,7 +4,7 @@ def binary_search(items, target):\n     \"\"\"Index of target in the sorted list items, or -1 if it is absent.\"\"\"\n     lo, hi = 0, len(items) - 1\n     while lo <= hi:\n-        mid = (lo + hi) // 2\n+        mid = (lo + hi) // 2 if lo != hi else lo\n         if items[mid] == target:\n             return mid\n         if items[mid] < target:\n",
       "rejected": null,
-      "test_secs": 0.046785708
+      "test_secs": 0.05022
     },
     {
       "applied": true,
@@ -77,7 +77,7 @@
       "passed": false,
       "raw_diff": "diff --git a/search.py b/search.py\nindex 1234567..89abcef 100644\n--- a/search.py\n+++ b/search.py\n@@ -4,7 +4,7 @@ def binary_search(items, target):\n         mid = (lo + hi) // 2\n         if items[mid] == target:\n             return mid\n-        if items[mid] < target:\n+        if items[mid] <= target:\n             lo = mid + 1\n         else:\n             hi = mid - 1\n",
       "rejected": null,
-      "test_secs": 0.046778375
+      "test_secs": 0.050843125
     },
     {
       "applied": true,
@@ -90,7 +90,7 @@
       "passed": false,
       "raw_diff": "diff --git a/search.py b/search.py\nindex 123e456..789abcd 100644\n--- a/search.py\n+++ b/search.py\n@@ -19,7 +19,7 @@ def binary_search(items, target):\n \n     while lo < hi:\n         mid = (lo + hi) // 2\n-        if items[mid] == target:\n+        if items[mid] <= target:\n             lo = mid + 1\n         else:\n             hi = mid - 1\n",
       "rejected": null,
-      "test_secs": 0.048791875
+      "test_secs": 0.04855425
     },
     {
       "applied": true,
@@ -103,7 +103,7 @@
       "passed": false,
       "raw_diff": "diff --git a/search.py b/search.py\nindex a0a3b5a..b0b0b0b 100644\n--- a/search.py\n+++ b/search.py\n@@ -20,7 +20,7 @@ def binary_search(items, target):\n         mid = (lo + hi) // 2\n         if items[mid] == target:\n             return mid\n-        if items[mid] < target:\n+        if items[mid] <= target:\n             lo = mid + 1\n         else:\n             hi = mid - 1\n",
       "rejected": null,
-      "test_secs": 0.049971208
+      "test_secs": 0.050456209
     }
   ],
   "completion_tokens": 1082,
@@ -114,10 +114,10 @@
   "prompt_tokens": 721,
   "repo": "/Users/akshaj/rust_llm_inference_server/target/fix-tasks/binary_search",
   "secs": {
-    "context": 0.102444417,
-    "generate": 4.777892125,
-    "tests": 0.543639666,
-    "total": 5.704717625
+    "context": 0.106506792,
+    "generate": 4.770237875,
+    "tests": 60.515138584,
+    "total": 65.683918625
   },
   "seed": 0,
   "task": "`binary_search()` in search.py misses some elements that are present (for example the last element, or the only element of a one-item list).",

@@ -77,7 +77,7 @@
       "passed": false,
       "raw_diff": "diff --git a/roman.py b/roman.py\nindex 3ac71f9..4a5a1a2 100644\n--- a/roman.py\n+++ b/roman.py\n@@ -20,7 +20,7 @@ def from_roman(s):\n     out = \"\"\n     for value, numeral in PAIRS:\n         while n >= value:\n-            out += numeral\n+            out += numeral if n >= value else \"M\"\n             n -= value\n     return out\n",
       "rejected": null,
-      "test_secs": 0.046267209
+      "test_secs": 0.048407542
     },
     {
       "applied": false,
@@ -98,11 +98,11 @@
       "dropped_protected": false,
       "exit": null,
       "finish_reason": "stop",
-      "fuzzy": false,
+      "fuzzy": true,
       "lines_changed": 0,
       "passed": false,
       "raw_diff": "diff --git a/roman.py b/roman.py\nindex 7f0a5e7..4a5b8c6 100644\n--- a/roman.py\n+++ b/roman.py\n@@ -10,7 +10,7 @@ def from_roman(s):\n     return sum(VALUES[c] for c in s)\n",
-      "rejected": "did not apply",
+      "rejected": "applied, but changed nothing",
       "test_secs": 0.0
     }
   ],
@@ -114,10 +114,10 @@
   "prompt_tokens": 859,
   "repo": "/Users/akshaj/rust_llm_inference_server/target/fix-tasks/roman",
   "secs": {
-    "context": 0.099890833,
-    "generate": 4.245577,
-    "tests": 0.419311041,
-    "total": 5.037295208
+    "context": 0.1074625,
+    "generate": 4.303445667,
+    "tests": 0.528108791,
+    "total": 5.252843958
   },
   "seed": 0,
   "task": "`from_roman()` in roman.py ignores subtractive notation: from_roman(\"IV\") returns 6 instead of 4.",

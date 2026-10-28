@@ -1,5 +1,5 @@
 {
-  "applied": 3,
+  "applied": 4,
   "attempts": [
     {
       "applied": false,
@@ -25,7 +25,7 @@
       "passed": false,
       "raw_diff": "diff --git a/test_text.py b/test_text.py\nindex 7d04c3b..e0b8c31 100644\n--- a/test_text.py\n+++ b/test_text.py\n@@ -11,7 +11,7 @@ class TextTest(unittest.TestCase):\n     self.assertEqual(slugify(\"  Rust, Metal & You!  \"), \"rust-metal-you\")\n     self.assertEqual(slugify(\"a -- b\"), \"a-b\")\n\n-    def test_punctuation_and_spaces(self):\n+    def test_punctuation_and_spaces(self):\n         self.assertEqual(slugify(\"  Rust, Metal & You!  \"), \"rust-metal-you\")\n         self.assertEqual(slugify(\"a -- b\"), \"a-b\")\ndiff --git a/text.py b/text.py\nindex 7d04c3b..e0b8c31 100644\n--- a/text.py\n+++ b/text.py\n@@ -6,7 +6,7 @@ def slugify(title):\n     \"\"\"Lowercase, words joined by single dashes, no leading or trailing dash.\"\"\"\n     slug = title.lower()\n     slug = re.sub(r\"[^a-z0-9]\", \"-\", slug)\n-    return slug\n+    return slug.strip('-')\n",
       "rejected": null,
-      "test_secs": 0.048885708
+      "test_secs": 0.050958666
     },
     {
       "applied": false,
@@ -51,7 +51,7 @@
       "passed": false,
       "raw_diff": "diff --git a/test_text.py b/test_text.py\n--- a/test_text.py\n+++ b/test_text.py\n@@ -11,7 +11,7 @@ def test_punctuation_and_spaces(self):\n         self.assertEqual(slugify(\"  Rust, Metal & You!  \"), \"rust-metal-you\")\n \n     def test_punctuation_and_spaces(self):\n-        self.assertEqual(slugify(\"  Rust, Metal & You!  \"), \"rust-metal-you\")\n+        self.assertEqual(slugify(\"  Rust, Metal & You!  \"), \"rust-metal-you\")\n \n     def test_truncate(self):\n         self.assertEqual(truncate(\"abcdef\", 4), \"abc…\")\ndiff --git a/text.py b/text.py\n--- a/text.py\n+++ b/text.py\n@@ -6,7 +6,7 @@ def slugify(title):\n     \"\"\"Lowercase, words joined by single dashes, no leading or trailing dash.\"\"\"\n     slug = title.lower()\n     slug = re.sub(r\"[^a-z0-9]\", \"-\", slug)\n-    return slug\n+    return slug.strip()\n",
       "rejected": null,
-      "test_secs": 0.050858125
+      "test_secs": 0.046011417
     },
     {
       "applied": false,
@@ -80,17 +80,17 @@
       "test_secs": 0.0
     },
     {
-      "applied": false,
-      "diff": "",
+      "applied": true,
+      "diff": "diff --git a/text.py b/text.py\nindex 2f88c8d..7b4a78a 100644\n--- a/text.py\n+++ b/text.py\n@@ -6,7 +6,7 @@ import re\n def slugify(title):\n     \"\"\"Lowercase, words joined by single dashes, no leading or trailing dash.\"\"\"\n     slug = title.lower()\n-    slug = re.sub(r\"[^a-z0-9]\", \"-\", slug)\n+    slug = re.sub(r\"[^a-z0-9]\", \"-\", slug).strip()\n     return slug\n \n \n",
       "dropped_protected": true,
-      "exit": null,
+      "exit": 1,
       "finish_reason": "stop",
-      "fuzzy": false,
-      "lines_changed": 0,
+      "fuzzy": true,
+      "lines_changed": 2,
       "passed": false,
       "raw_diff": "diff --git a/test_text.py b/test_text.py\n--- a/test_text.py\n+++ b/test_text.py\n@@ -11,7 +11,7 @@ class TextTest(unittest.TestCase):\n        self.assertEqual(slugify(\"  Rust, Metal & You!  \"), \"rust-metal-you\")\n        self.assertEqual(slugify(\"a -- b\"), \"a-b\")\n\n    def test_truncate(self):\n        self.assertEqual(truncate(\"abcdef\", 4), \"abc…\")\n        self.assertEqual(truncate(\"abc\", 4), \"abc\")\ndiff --git a/text.py b/text.py\n--- a/text.py\n+++ b/text.py\n@@ -6,7 +6,7 @@ def slugify(title):\n    \"\"\"Lowercase, words joined by single dashes, no leading or trailing dash.\"\"\"\n    slug = title.lower()\n-    slug = re.sub(r\"[^a-z0-9]\", \"-\", slug)\n+    slug = re.sub(r\"[^a-z0-9]\", \"-\", slug).strip()\n    return slug\n",
-      "rejected": "did not apply",
-      "test_secs": 0.0
+      "rejected": null,
+      "test_secs": 0.050943416
     },
     {
       "applied": true,
@@ -103,7 +103,7 @@
       "passed": false,
       "raw_diff": "diff --git a/text.py b/text.py\n--- a/text.py\n+++ b/text.py\n@@ -6,7 +6,7 @@ def slugify(title):\n     \"\"\"Lowercase, words joined by single dashes, no leading or trailing dash.\"\"\"\n     slug = title.lower()\n     slug = re.sub(r\"[^a-z0-9]\", \"-\", slug)\n-    return slug\n+    return slug.strip('-')\n",
       "rejected": null,
-      "test_secs": 0.04984025
+      "test_secs": 0.043624084
     }
   ],
   "completion_tokens": 1416,
@@ -114,10 +114,10 @@
   "prompt_tokens": 595,
   "repo": "/Users/akshaj/rust_llm_inference_server/target/fix-tasks/slugify",
   "secs": {
-    "context": 0.098170708,
-    "generate": 6.507723,
-    "tests": 0.41996525,
-    "total": 7.303390292
+    "context": 0.102546375,
+    "generate": 6.641168167,
+    "tests": 0.536363791,
+    "total": 7.611117042
   },
   "seed": 0,
   "task": "`slugify()` in text.py leaves runs of dashes and leading/trailing dashes: slugify(\"  Rust, Metal & You!  \") should be \"rust-metal-you\".",

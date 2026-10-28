@@ -1,1 +1,1 @@
- powermode            2
+ powermode            0

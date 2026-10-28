@@ -1,5 +1,5 @@
 {
-  "applied": 4,
+  "applied": 6,
   "attempts": [
     {
       "applied": false,
@@ -38,7 +38,7 @@
       "passed": false,
       "raw_diff": "diff --git a/cache.py b/cache.py\nindex 1234567..89abcdef 100644\n--- a/cache.py\n+++ b/cache.py\n@@ -13,7 +13,7 @@ class LRUCache:\n \n     def get(self, key, default=None):\n         if key not in self.items:\n-            return default\n+            return None\n         return self.items[key]\n \n     def put(self, key, value):\n",
       "rejected": null,
-      "test_secs": 0.047970708
+      "test_secs": 0.05053825
     },
     {
       "applied": true,
@@ -51,20 +51,20 @@
       "passed": false,
       "raw_diff": "diff --git a/cache.py b/cache.py\nindex 1234567..89abcdef 100644\n--- a/cache.py\n+++ b/cache.py\n@@ -17,7 +17,7 @@ def put(self, key, value):\n         if key in self.items:\n             self.items.move_to_end(key)\n         self.items[key] = value\n-        if len(self.items) > self.capacity:\n+        if len(self.items) > self.capacity - 1:\n             self.items.popitem(last=False)\n",
       "rejected": null,
-      "test_secs": 0.046862458
+      "test_secs": 0.050457625
     },
     {
-      "applied": false,
-      "diff": "",
+      "applied": true,
+      "diff": "diff --git a/cache.py b/cache.py\nindex ced7c2f..29ae6d2 100644\n--- a/cache.py\n+++ b/cache.py\n@@ -18,7 +18,7 @@ class LRUCache:\n     def put(self, key, value):\n         if key in self.items:\n             self.items.move_to_end(key)\n-        self.items[key] = value\n+    self.items.move_to_end(key, last=True)\n         if len(self.items) > self.capacity:\n             self.items.popitem(last=False)\n \n",
       "dropped_protected": true,
-      "exit": null,
+      "exit": 1,
       "finish_reason": "stop",
-      "fuzzy": false,
-      "lines_changed": 0,
+      "fuzzy": true,
+      "lines_changed": 2,
       "passed": false,
       "raw_diff": "diff --git a/test_cache.py b/test_cache.py\nindex 7a7b8c4..8c9a9b5 100644\n--- a/test_cache.py\n+++ b/test_cache.py\n@@ -27,7 +27,7 @@ class LRUCacheTest(unittest.TestCase):\n     def test_get_counts_as_use(self):\n         c = LRUCache(2)\n         c.put(\"a\", 1)\n-        c.put(\"b\", 2)\n+        c.put(\"b\", 2)\n         c.get(\"a\")\n         c.put(\"c\", 3)\n         self.assertEqual(c.get(\"a\"), 1)\ndiff --git a/cache.py b/cache.py\nindex 1234567..89abcde 100644\n--- a/cache.py\n+++ b/cache.py\n@@ -13,7 +13,7 @@ def get(self, key, default=None):\n     if key not in self.items:\n         return default\n     self.items.move_to_end(key)\n-    self.items[key] = value\n+    self.items.move_to_end(key, last=True)\n     if len(self.items) > self.capacity:\n         self.items.popitem(last=False)\n",
-      "rejected": "did not apply",
-      "test_secs": 0.0
+      "rejected": null,
+      "test_secs": 0.049460833
     },
     {
       "applied": true,
@@ -77,20 +77,20 @@
       "passed": false,
       "raw_diff": "diff --git a/cache.py b/cache.py\nindex 123abc..456def 100644\n--- a/cache.py\n+++ b/cache.py\n@@ -12,7 +12,7 @@ class LRUCache:\n \n     def get(self, key, default=None):\n         if key not in self.items:\n-            return default\n+            return self.items.get(key, default)\n \n     def put(self, key, value):\n         if key in self.items:\n",
       "rejected": null,
-      "test_secs": 0.047930125
+      "test_secs": 0.050426625
     },
     {
-      "applied": false,
-      "diff": "",
+      "applied": true,
+      "diff": "diff --git a/cache.py b/cache.py\nindex ced7c2f..1609459 100644\n--- a/cache.py\n+++ b/cache.py\n@@ -17,7 +17,7 @@ class LRUCache:\n \n     def put(self, key, value):\n         if key in self.items:\n-            self.items.move_to_end(key)\n+        self.items.move_to_end(key, last=True)  # This line is added to make the key the most recently used\n         self.items[key] = value\n         if len(self.items) > self.capacity:\n             self.items.popitem(last=False)\n",
       "dropped_protected": true,
-      "exit": null,
+      "exit": 1,
       "finish_reason": "stop",
-      "fuzzy": false,
-      "lines_changed": 0,
+      "fuzzy": true,
+      "lines_changed": 2,
       "passed": false,
       "raw_diff": "diff --git a/test_cache.py b/test_cache.py\nindex 1b2c3d4..5e6f789 100644\n--- a/test_cache.py\n+++ b/test_cache.py\n@@ -21,7 +21,7 @@ class LRUCacheTest(unittest.TestCase):\n     def test_get_counts_as_use(self):\n         c = LRUCache(2)\n         c.put(\"a\", 1)\n-        c.get(\"a\")\n+        c.get(\"a\")  # This line is added to make the key the most recently used\n         c.put(\"c\", 3)\n         self.assertEqual(c.get(\"a\"), 1)\n         self.assertIsNone(c.get(\"b\"))\n\ndiff --git a/cache.py b/cache.py\nindex 0a1b2c3..4e5f678 100644\n--- a/cache.py\n+++ b/cache.py\n@@ -13,7 +13,7 @@ class LRUCache:\n     def get(self, key, default=None):\n         if key not in self.items:\n             return default\n-        self.items.move_to_end(key)\n+        self.items.move_to_end(key, last=True)  # This line is added to make the key the most recently used\n         return self.items[key]\n",
-      "rejected": "did not apply",
-      "test_secs": 0.0
+      "rejected": null,
+      "test_secs": 0.050733083
     },
     {
       "applied": true,
@@ -103,7 +103,7 @@
       "passed": false,
       "raw_diff": "diff --git a/cache.py b/cache.py\nindex e4b2d0f..b0a5c1b 100644\n--- a/cache.py\n+++ b/cache.py\n@@ -18,7 +18,7 @@ def put(self, key, value):\n             self.items.popitem(last=False)\n \n     def __len__(self):\n-        return len(self.items)\n+        return len(self.items) - 1\n",
       "rejected": null,
-      "test_secs": 0.047973375
+      "test_secs": 0.04959575
     }
   ],
   "completion_tokens": 1689,
@@ -114,10 +114,10 @@
   "prompt_tokens": 796,
   "repo": "/Users/akshaj/rust_llm_inference_server/target/fix-tasks/lru",
   "secs": {
-    "context": 0.100331958,
-    "generate": 9.313320292,
-    "tests": 0.435133083,
-    "total": 10.114909916
+    "context": 0.104122791,
+    "generate": 9.383236791,
+    "tests": 0.60092175,
+    "total": 10.38799275
   },
   "seed": 0,
   "task": "`LRUCache` in cache.py evicts the wrong key: reading a key with `get()` should make it the most recently used, but it doesn't.",
