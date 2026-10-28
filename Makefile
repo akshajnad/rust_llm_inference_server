@@ -32,17 +32,18 @@ chat: models
 	cargo build --release -p server -p chat --features server/$(FEATURES)
 	target/release/rlis-chat
 
-# Puts `rlis-chat` on the PATH (rustup already adds ~/.cargo/bin) as a link to this build, so it
-# runs from any directory and picks up rebuilds.
+# Puts the chat on the PATH as `rlis` (rustup already adds ~/.cargo/bin), linked to this build
+# so it runs from any directory and picks up rebuilds; `rlis serve` etc. reach the server.
 INSTALL_DIR ?= $(HOME)/.cargo/bin
 install: models
 	cargo build --release -p server -p chat --features server/$(FEATURES)
 	mkdir -p $(INSTALL_DIR)
-	ln -sf $(CURDIR)/target/release/rlis-chat $(INSTALL_DIR)/rlis-chat
-	@echo "installed: $(INSTALL_DIR)/rlis-chat -> $(CURDIR)/target/release/rlis-chat"
+	rm -f $(INSTALL_DIR)/rlis-chat
+	ln -sf $(CURDIR)/target/release/rlis-chat $(INSTALL_DIR)/rlis
+	@echo "installed: $(INSTALL_DIR)/rlis -> $(CURDIR)/target/release/rlis-chat"
 
 uninstall:
-	rm -f $(INSTALL_DIR)/rlis-chat
+	rm -f $(INSTALL_DIR)/rlis $(INSTALL_DIR)/rlis-chat
 
 # $(call fetch,repo,file,destination)
 define fetch
