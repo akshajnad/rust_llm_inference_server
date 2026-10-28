@@ -10,7 +10,15 @@ llama.cpp's server at high concurrency.
 ## Quick start
 
 ```sh
-make serve          # downloads the model (1.3 GB, into ./models), builds, serves on :8000
+make chat           # downloads the model (1.3 GB, into ./models), builds, chats in the terminal
+```
+
+`make chat` opens a terminal chat (streaming, Markdown-styled replies, `/help` for commands, esc
+to interrupt). It starts a server in the background if none is running and stops it on exit.
+To run the server on its own instead:
+
+```sh
+make serve          # serves on :8000
 ```
 
 ```sh
