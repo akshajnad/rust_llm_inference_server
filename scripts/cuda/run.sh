@@ -14,6 +14,7 @@ export CUDA_COMPUTE_CAP=${CUDA_COMPUTE_CAP:-$CC}
 export PATH=/usr/local/cuda/bin:$HOME/.cargo/bin:$PATH
 # Containers mount the driver's libcuda.so.1 but not the unversioned libcuda.so that -lcuda
 # looks for (and Kaggle's toolkit has no stub), so give the linker a symlink to the real one.
+# llama.cpp's CMake needs the same library for its CUDA::cuda_driver target.
 # Look where the loader will find it at runtime first, not at copies other tools bundle.
 LIBCUDA=$(ldconfig -p | awk '/libcuda\.so\.1 /{print $NF; exit}')
 for d in ${LD_LIBRARY_PATH//:/ } /usr/local/nvidia/lib64 /usr/lib64-nvidia /usr/lib/x86_64-linux-gnu; do
@@ -90,7 +91,8 @@ parity() {
 build_llama_cpp() (
   for v in $(compgen -e | grep '^UV_'); do unset "$v"; done
   { command -v uv >/dev/null || pip install -q uv; } &&
-    make llama-cpp LLAMA_CPP_CMAKE_FLAGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=$CUDA_COMPUTE_CAP"
+    make llama-cpp LLAMA_CPP_CMAKE_FLAGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=$CUDA_COMPUTE_CAP \
+      -DCUDA_cuda_driver_LIBRARY=$CUDA_LINK/libcuda.so"
 )
 
 step rust install_rust
