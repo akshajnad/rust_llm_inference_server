@@ -2,6 +2,7 @@
 # Runs scripts/cuda/run.sh on a free Kaggle T4, pinned to HEAD (which must be on GitHub), waits
 # for it, and downloads the results into results/cuda/. Needs the Kaggle CLI ($KAGGLE) and
 # ~/.kaggle/kaggle.json from a phone-verified account (GPU and internet access).
+# KAGGLE_ATTACH=1 skips the push and waits on the session already running.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 KAGGLE=${KAGGLE:-kaggle}
@@ -22,21 +23,23 @@ cat >"$STAGE/kernel-metadata.json" <<EOF
  "kernel_type": "script", "is_private": true, "enable_gpu": true, "enable_internet": true,
  "dataset_sources": [], "competition_sources": [], "kernel_sources": []}
 EOF
-"$KAGGLE" kernels push -p "$STAGE" --accelerator NvidiaTeslaT4
-echo "running $KERNEL at $COMMIT; https://www.kaggle.com/code/$KERNEL"
+if [ -z "${KAGGLE_ATTACH:-}" ]; then
+  "$KAGGLE" kernels push -p "$STAGE" --accelerator NvidiaTeslaT4
+  echo "running $KERNEL at $COMMIT; https://www.kaggle.com/code/$KERNEL"
+fi
 
-# Kaggle caps a session at 12 hours; poll every minute.
+# Kaggle caps a session at 12 hours; poll every minute. Anything but a final status (such as a
+# network error on this side) means keep waiting.
 while :; do
   sleep 60
   status=$("$KAGGLE" kernels status "$KERNEL" 2>&1 || true)
   echo "$(date +%H:%M:%S) $status"
   case $status in
-    *RUNNING* | *QUEUED*) ;;
-    *) break ;;
+    *COMPLETE* | *ERROR* | *CANCEL*) break ;;
   esac
 done
 
-"$KAGGLE" kernels output "$KERNEL" -p "$STAGE/out" -o >/dev/null
+until "$KAGGLE" kernels output "$KERNEL" -p "$STAGE/out" -o >/dev/null; do sleep 60; done
 mkdir -p "$OUT"
 cp -R "$STAGE/out/cuda/." "$OUT/" 2>/dev/null || true
 # The kernel log is JSON lines of {stream, data}; keep it as plain text.
