@@ -171,8 +171,11 @@ grew ~350 MB over an hour at constant load):
 - **Fuzzing** (`cargo-fuzz`): the request parser and the stop-string matcher. The fuzzer found
   that the matcher's output depended on how text was split into tokens; it now stops at the
   stop string that completes first.
-- **Soak**: an hour at high concurrency with random client hang-ups; every KV block must return
-  and memory must stay flat (`rlis-bench soak`).
+- **Soak** (`make soak`): an hour at concurrency 32 with 25% of clients hanging up mid-stream.
+  Result: 13,018 requests, 3,131 hang-ups, 0 errors, KV utilization back to 0.0 when idle, and
+  10-minute footprint averages of 2,598 / 2,589 / 2,607 / 2,640 / 2,645 / 2,626 MB (+2.9% early
+  to late). The first run grew +9.2% (to 2,954 MB) and found the two leaks under *Memory*; it
+  is kept as `results/mac/soak-before-leak-fixes.json`.
 
 ## Rejected alternatives
 
