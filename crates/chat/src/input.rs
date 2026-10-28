@@ -1,6 +1,6 @@
-//! The prompt: a rule carrying the session's settings, a multi-line editor under it, and a hint
-//! line or slash-command menu below, drawn inline under the transcript and redrawn in place on
-//! every keystroke.
+//! The prompt: a card holding a multi-line editor, with the session's settings in its top edge
+//! and a hint line or slash-command menu below it, drawn inline under the transcript and redrawn
+//! in place on every keystroke.
 
 use std::io::Write;
 use std::mem;
@@ -10,10 +10,11 @@ use crossterm::cursor::{MoveToColumn, MoveUp};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::queue;
 use crossterm::style::{Color, Stylize};
-use crossterm::terminal::{self, Clear, ClearType};
+use crossterm::terminal::{Clear, ClearType};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::{ACCENT, USER};
+use crate::frame::{self, INDENT, fit, truncate};
+use crate::{ACCENT, FOCUS, USER};
 
 /// A slash command: its name, its argument (empty if none) and what it does.
 pub type Command = (&'static str, &'static str, &'static str);
@@ -32,8 +33,8 @@ const MENU_KEYS: &[(&str, &str)] = &[
     ("enter", "run"),
     ("esc", "cancel"),
 ];
-/// " › " before the first line of text.
-const PROMPT_W: usize = 3;
+/// "› " before the first line of text.
+const PROMPT_W: usize = 2;
 const KEY: Color = Color::AnsiValue(250);
 
 pub enum Input {
@@ -358,25 +359,47 @@ impl Editor {
     }
 
     fn draw(&mut self, out: &mut impl Write) -> Result<()> {
-        let width = terminal::size().map_or(80, |(w, _)| w as usize).max(24);
-        // The last column stays empty so the cursor never wraps early.
-        let text_w = width - PROMPT_W - 1;
+        let width = frame::text_width();
+        let text_w = width - PROMPT_W;
         let (rows, (row, col)) = layout(&self.buf, self.cursor, text_w);
-        let mut lines = vec![self.rule(width)];
+        let parts: Vec<&str> = self.status.split(" · ").collect();
+        let status = fit(&parts, width.saturating_sub(8));
+        let mut lines = vec![frame::edge(
+            ['┌', '┐'],
+            ("you", USER),
+            (&status, Color::DarkGrey),
+            FOCUS,
+            width,
+        )];
         for (i, r) in rows.iter().enumerate() {
             let prefix = if i == 0 {
-                format!(" {} ", "›".with(USER).bold())
+                format!("{} ", "›".with(USER).bold())
             } else {
                 " ".repeat(PROMPT_W)
             };
-            let content = if self.buf.is_empty() {
-                truncate(PLACEHOLDER, text_w).dark_grey().to_string()
+            let (content, w) = if self.buf.is_empty() {
+                let p = truncate(PLACEHOLDER, text_w);
+                let w = p.width();
+                (p.dark_grey().to_string(), w)
             } else {
-                r.clone()
+                (r.clone(), r.width())
             };
-            lines.push(format!("{prefix}{content}"));
+            lines.push(frame::row(
+                &format!("{prefix}{content}"),
+                PROMPT_W + w,
+                FOCUS,
+                width,
+            ));
         }
-        lines.extend(self.hints(width));
+        lines.push(frame::edge(
+            ['└', '┘'],
+            ("", USER),
+            ("", USER),
+            FOCUS,
+            width,
+        ));
+        // Under the card, as wide as it.
+        lines.extend(self.hints(width + INDENT + 2));
 
         self.erase(out)?;
         write!(out, "{}", lines.join("\r\n"))?;
@@ -385,23 +408,10 @@ impl Editor {
         if up > 0 {
             queue!(out, MoveUp(up as u16))?;
         }
-        queue!(out, MoveToColumn((PROMPT_W + col) as u16))?;
+        queue!(out, MoveToColumn((INDENT + PROMPT_W + col) as u16))?;
         self.cursor_row = target;
         out.flush()?;
         Ok(())
-    }
-
-    /// A horizontal rule with the status near its right end.
-    fn rule(&self, width: usize) -> String {
-        let parts: Vec<&str> = self.status.split(" · ").collect();
-        let status = fit(&parts, width.saturating_sub(10));
-        let left = (width - 1).saturating_sub(status.width() + 5);
-        format!(
-            "{} {} {}",
-            "─".repeat(left).dark_grey(),
-            status.dark_grey(),
-            "───".dark_grey()
-        )
     }
 
     fn hints(&self, width: usize) -> Vec<String> {
@@ -499,36 +509,9 @@ fn keys(pairs: &[(&str, &str)], width: usize) -> String {
     line
 }
 
-/// Joins `parts` with ` · `, leaving off trailing ones that would not fit in `width` columns.
-pub fn fit(parts: &[impl AsRef<str>], width: usize) -> String {
-    let mut line = String::new();
-    for (i, p) in parts.iter().enumerate() {
-        let next = if i == 0 {
-            p.as_ref().to_string()
-        } else {
-            format!("{line} · {}", p.as_ref())
-        };
-        if next.width() > width {
-            break;
-        }
-        line = next;
-    }
-    line
-}
-
-fn truncate(s: &str, width: usize) -> String {
-    let mut w = 0;
-    s.chars()
-        .take_while(|c| {
-            w += c.width().unwrap_or(0);
-            w <= width
-        })
-        .collect()
-}
-
 /// Wraps the buffer into rows at most `width` columns wide; returns them with the cursor's
 /// (row, column).
-pub fn layout(buf: &[char], cursor: usize, width: usize) -> (Vec<String>, (usize, usize)) {
+fn layout(buf: &[char], cursor: usize, width: usize) -> (Vec<String>, (usize, usize)) {
     let mut rows = vec![String::new()];
     let mut col = 0;
     let mut at = (0, 0);
@@ -599,15 +582,6 @@ mod tests {
         e.down();
         e.down();
         assert_eq!(e.text(), "one\ntwo");
-    }
-
-    #[test]
-    fn fits_whole_parts() {
-        assert_eq!(
-            fit(&["model", "temp 0.6", "new chat"], 16),
-            "model · temp 0.6"
-        );
-        assert_eq!(fit(&["model", "temp 0.6"], 3), "");
     }
 
     #[test]

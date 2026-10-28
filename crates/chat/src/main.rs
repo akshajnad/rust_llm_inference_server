@@ -4,6 +4,7 @@
 //! subcommands (`rlis serve`, ...) through to it.
 
 mod api;
+mod frame;
 mod http;
 mod input;
 mod render;
@@ -34,13 +35,16 @@ use serde_json::{Value, json};
 use unicode_width::UnicodeWidthStr;
 
 use api::Update;
+use frame::BORDER;
 use input::{Command as SlashCommand, Editor, Input};
-use render::{INDENT, Renderer};
+use render::Renderer;
 
 /// The model's color: its label, the bar beside its replies, headings and the status meter.
 pub const ACCENT: Color = Color::AnsiValue(43);
-/// The user's color: their label and bar, and the prompt marker.
+/// The user's color: their label and the prompt marker.
 pub const USER: Color = Color::AnsiValue(141);
+/// The prompt card's border, set apart from the transcript's grey ones.
+pub const FOCUS: Color = Color::AnsiValue(103);
 
 const COMMANDS: &[SlashCommand] = &[
     ("/clear", "", "start a new conversation"),
@@ -295,15 +299,6 @@ fn meter(start: Instant) -> String {
         .collect()
 }
 
-/// A speaker's label, right-aligned, and the bar beside their text: `render::INDENT` wide.
-fn gutter(label: &str, color: Color) -> String {
-    format!(
-        "{} {} ",
-        format!("{label:>w$}", w = INDENT - 3).with(color).bold(),
-        "│".with(color)
-    )
-}
-
 /// Decode speed: tokens after the first over the time since it arrived.
 fn rate(tokens: u64, decode: Duration) -> Option<f64> {
     let secs = decode.as_secs_f64();
@@ -348,12 +343,16 @@ impl Chat {
                 Input::Line(line) => line,
                 Input::Exit => return Ok(()),
             };
-            self.echo(&line)?;
             if line.starts_with('/') {
                 if !self.command(&line)? {
                     return Ok(());
                 }
             } else {
+                self.edge(['┌', '┐'], "you", USER, "", BORDER)?;
+                for l in frame::wrap(&line, frame::text_width()) {
+                    self.row(&l, l.width())?;
+                }
+                self.edge(['├', '┤'], "rlis", ACCENT, "", BORDER)?;
                 self.messages.push(Message {
                     role: "user",
                     content: line,
@@ -364,8 +363,8 @@ impl Chat {
         }
     }
 
-    /// Runs one reply to the last user message, dropping the oldest exchanges if the
-    /// conversation outgrew the context window.
+    /// Runs one reply to the last user message inside the open card and closes it, dropping
+    /// the oldest exchanges if the conversation outgrew the context window.
     fn respond(&mut self) -> Result<()> {
         loop {
             match self.generate()? {
@@ -384,6 +383,7 @@ impl Chat {
                 Outcome::TooLong(message) | Outcome::Failed(message) => {
                     self.messages.pop();
                     self.error(&message)?;
+                    self.close()?;
                 }
             }
             return Ok(());
@@ -414,17 +414,18 @@ impl Chat {
         serde_json::to_vec(&body).expect("JSON values serialize")
     }
 
-    /// Streams a reply below the cursor with a live status line under it: the phase (prefill
-    /// until the first token, then decoding) and speed. Esc or Ctrl-C interrupts by closing the
-    /// connection, which also stops generation on the server.
+    /// Streams a reply into the open card with a live status line under it: the phase (prefill
+    /// until the first token, then decoding) and speed. The card is closed with the reply's
+    /// stats, except when nothing was generated, which `respond` reports. Esc or Ctrl-C
+    /// interrupts by closing the connection, which also stops generation on the server.
     fn generate(&mut self) -> Result<Outcome> {
         let (tx, rx) = mpsc::channel();
         let (url, body) = (self.url.clone(), self.body());
         thread::spawn(move || api::stream(&url, &body, &tx));
 
-        let width = term_width();
+        let width = frame::text_width();
         let mut r = Renderer::new(width);
-        let label = gutter("rlis", ACCENT);
+        let left = frame::left(BORDER);
         let start = Instant::now();
         let mut first_token = None;
         let mut text = String::new();
@@ -471,7 +472,7 @@ impl Chat {
             let s = r.take();
             if !s.is_empty() {
                 if !writing {
-                    write!(self.out, "{label}")?;
+                    write!(self.out, "{left}")?;
                     writing = true;
                 }
                 self.out.write_all(s.as_bytes())?;
@@ -479,12 +480,13 @@ impl Chat {
             if let Some(e) = ended {
                 break e;
             }
-            let status = status_line(start, first_token, pieces, width - INDENT);
+            let (status, status_w) = status_line(start, first_token, pieces, width);
+            let status = frame::row(&status, status_w, BORDER, width);
             if writing {
-                write!(self.out, "\r\n{}{status}", gutter("", ACCENT))?;
+                write!(self.out, "\r\n{status}")?;
                 queue!(self.out, MoveUp(1), MoveToColumn(r.col() as u16))?;
             } else {
-                write!(self.out, "{label}{status}")?;
+                write!(self.out, "{status}")?;
                 queue!(self.out, MoveToColumn(0))?;
             }
             self.out.flush()?;
@@ -492,7 +494,7 @@ impl Chat {
 
         let tail = r.finish();
         if !tail.is_empty() && !writing {
-            write!(self.out, "{label}")?;
+            write!(self.out, "{left}")?;
             writing = true;
         }
         self.out.write_all(tail.as_bytes())?;
@@ -509,20 +511,18 @@ impl Chat {
             });
         }
         if interrupted {
-            if !writing {
-                self.print(label.trim_end())?;
-            }
-            let detail = if pieces > 0 {
-                format!(" · {pieces} tokens")
+            let status = if pieces > 0 {
+                format!("interrupted · {pieces} tokens")
             } else {
-                String::new()
+                "interrupted".to_string()
             };
-            self.footer(format!("{}{}", "interrupted".yellow(), detail.dark_grey()))?;
+            self.edge(['└', '┘'], "", BORDER, &status, Color::Yellow)?;
         } else if let Some(e) = error {
             if text.is_empty() {
                 return Ok(Outcome::Failed(e));
             }
-            self.footer(e.replace('\n', " ").red())?;
+            self.error(&e)?;
+            self.close()?;
         } else {
             let elapsed = start.elapsed();
             let n = usage.unwrap_or(pieces);
@@ -536,13 +536,13 @@ impl Chat {
             if finish.as_deref() == Some("length") {
                 parts.push("stopped at the length limit".to_string());
             }
-            let stats = input::fit(&parts, term_width().saturating_sub(INDENT + 2));
-            self.footer(stats.dark_grey())?;
+            let stats = frame::fit(&parts, width.saturating_sub(4));
+            self.edge(['└', '┘'], "", BORDER, &stats, Color::DarkGrey)?;
         }
         Ok(Outcome::Reply(text))
     }
 
-    /// Handles a slash command; false means quit.
+    /// Handles a slash command, answering in a card titled with it; false means quit.
     fn command(&mut self, line: &str) -> Result<bool> {
         let (name, arg) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
         let arg = arg.trim();
@@ -554,14 +554,21 @@ impl Chat {
                 self.banner()?;
                 // `run` prints a blank line after every command; the banner ends with one.
                 queue!(self.out, MoveUp(1))?;
+                return Ok(true);
             }
+            _ => {}
+        }
+        let title = line.lines().next().unwrap_or_default();
+        self.edge(['┌', '┐'], title, ACCENT, "", BORDER)?;
+        match name {
             "/retry" => {
                 if self.messages.last().is_some_and(|m| m.role == "assistant") {
                     self.messages.pop();
+                    // The reply closes the card.
                     self.respond()?;
-                } else {
-                    self.note("Nothing to retry yet")?;
+                    return Ok(true);
                 }
+                self.note("Nothing to retry yet")?;
             }
             "/system" => match arg {
                 "" => {
@@ -590,13 +597,14 @@ impl Chat {
             "/help" => self.help()?,
             _ => self.error(&format!("Unknown command {name}; /help lists them"))?,
         }
+        self.close()?;
         Ok(true)
     }
 
     fn banner(&mut self) -> Result<()> {
         let width = term_width();
         // " rlis " and the spaces around it.
-        let room = width.saturating_sub(11 + self.model.width());
+        let room = width.saturating_sub(12 + self.model.width());
         let url = if self.url.width() < room {
             self.url.clone()
         } else {
@@ -604,7 +612,7 @@ impl Chat {
         };
         self.print("")?;
         self.print(format!(
-            "  {}  {}  {}",
+            " {}  {}  {}",
             " rlis ".black().on(ACCENT).bold(),
             self.model.as_str().bold(),
             url.dark_grey()
@@ -614,12 +622,12 @@ impl Chat {
             "type / for commands",
             "esc stops a reply",
         ];
-        let tips = input::fit(&tips, width.saturating_sub(3));
+        let tips = frame::fit(&tips, width.saturating_sub(4));
         self.print(format!("  {}", tips.dark_grey()))?;
         self.print("")
     }
 
-    /// The settings shown in the prompt's rule.
+    /// The settings shown in the prompt card's top edge.
     fn status(&self) -> String {
         let mut parts = vec![self.model.clone(), format!("temp {}", self.temperature)];
         if self.system.is_some() {
@@ -634,8 +642,6 @@ impl Chat {
     }
 
     fn help(&mut self) -> Result<()> {
-        let pad = " ".repeat(INDENT);
-        self.print(format!("{pad}{}", "commands".with(ACCENT).bold()))?;
         let label = |c: &str, a: &str| {
             if a.is_empty() {
                 c.to_string()
@@ -648,6 +654,7 @@ impl Chat {
             .map(|(c, a, _)| label(c, a).width())
             .max()
             .unwrap_or(0);
+        self.row(&"commands".with(ACCENT).bold().to_string(), 8)?;
         for (c, a, d) in COMMANDS {
             let gap = " ".repeat(w - label(c, a).width() + 3);
             let a = if a.is_empty() {
@@ -655,14 +662,11 @@ impl Chat {
             } else {
                 format!(" {a}")
             };
-            self.print(format!(
-                "{pad}  {}{}{gap}{d}",
-                c.with(ACCENT),
-                a.dark_grey()
-            ))?;
+            let head = format!("  {}{}{gap}", c.with(ACCENT), a.dark_grey());
+            self.columns(&head, 2 + w + 3, d)?;
         }
-        self.print("")?;
-        self.print(format!("{pad}{}", "keys".with(ACCENT).bold()))?;
+        self.row("", 0)?;
+        self.row(&"keys".with(ACCENT).bold().to_string(), 4)?;
         let keys = [
             ("enter", "send"),
             (
@@ -675,9 +679,10 @@ impl Chat {
             ("ctrl-c twice", "quit (or ctrl-d on an empty line)"),
         ];
         for (k, d) in keys {
-            self.print(format!("{pad}  {}  {d}", format!("{k:<14}").with(ACCENT)))?;
+            let head = format!("  {}", format!("{k:<14}").with(ACCENT));
+            self.columns(&head, 16, d)?;
         }
-        self.print("")?;
+        self.row("", 0)?;
         self.note(&format!(
             "temperature {} · top-p {} · {} messages in context",
             self.temperature,
@@ -686,44 +691,70 @@ impl Chat {
         ))
     }
 
-    /// The user's message beside their label, wrapped to the terminal.
-    fn echo(&mut self, line: &str) -> Result<()> {
-        let width = term_width().max(INDENT + 16) - INDENT - 1;
-        let chars: Vec<char> = line.chars().collect();
-        let (rows, _) = input::layout(&chars, 0, width);
-        for (i, row) in rows.iter().enumerate() {
-            let label = if i == 0 { "you" } else { "" };
-            self.print(format!("{}{row}", gutter(label, USER)))?;
+    /// A card row of `head` (`head_w` columns) and then `text`, wrapped beside it.
+    fn columns(&mut self, head: &str, head_w: usize, text: &str) -> Result<()> {
+        let lines = frame::wrap(text, frame::text_width().saturating_sub(head_w).max(8));
+        for (i, l) in lines.iter().enumerate() {
+            let head = if i == 0 {
+                head.to_string()
+            } else {
+                " ".repeat(head_w)
+            };
+            self.row(&format!("{head}{l}"), head_w + l.width())?;
         }
         Ok(())
     }
 
-    /// Closes a reply under its bar.
-    fn footer(&mut self, s: impl Display) -> Result<()> {
-        self.print(format!(
-            "{}{} {s}",
-            " ".repeat(INDENT - 2),
-            "╰─".with(ACCENT)
+    /// An edge of a card: its top (with a label), a divider, or its bottom (with a status).
+    fn edge(
+        &mut self,
+        corners: [char; 2],
+        label: &str,
+        label_color: Color,
+        status: &str,
+        status_color: Color,
+    ) -> Result<()> {
+        self.print(frame::edge(
+            corners,
+            (label, label_color),
+            (status, status_color),
+            BORDER,
+            frame::text_width(),
         ))
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.edge(['└', '┘'], "", BORDER, "", BORDER)
+    }
+
+    /// A line of the open card: `text` is `w` columns wide and may be styled.
+    fn row(&mut self, text: &str, w: usize) -> Result<()> {
+        self.print(frame::row(text, w, BORDER, frame::text_width()))
+    }
+
+    /// Wrapped text in the open card after a marker.
+    fn marked(&mut self, marker: impl Display, s: &str, color: Color) -> Result<()> {
+        let lines = frame::wrap(s, frame::text_width() - 2);
+        for (i, l) in lines.iter().enumerate() {
+            let marker = if i == 0 {
+                marker.to_string()
+            } else {
+                " ".to_string()
+            };
+            self.row(
+                &format!("{marker} {}", l.as_str().with(color)),
+                2 + l.width(),
+            )?;
+        }
+        Ok(())
     }
 
     fn note(&mut self, s: &str) -> Result<()> {
-        self.print(format!(
-            "{}{} {}",
-            " ".repeat(INDENT - 2),
-            "◦".dark_grey(),
-            s.dark_grey()
-        ))
+        self.marked("◦".dark_grey(), s, Color::DarkGrey)
     }
 
     fn error(&mut self, s: &str) -> Result<()> {
-        let s = s.replace('\n', &format!("\r\n{}", " ".repeat(INDENT)));
-        self.print(format!(
-            "{}{} {}",
-            " ".repeat(INDENT - 2),
-            "✗".red(),
-            s.red()
-        ))
+        self.marked("✗".red(), s, Color::Red)
     }
 
     /// Writes a line; raw mode needs the explicit carriage return.
@@ -734,8 +765,14 @@ impl Chat {
     }
 }
 
-/// The phase, a meter and the numbers so far, fitted to `width` columns.
-fn status_line(start: Instant, first_token: Option<Duration>, pieces: u64, width: usize) -> String {
+/// The phase, a meter and the numbers so far, fitted to `width` columns; returns the line and
+/// its width.
+fn status_line(
+    start: Instant,
+    first_token: Option<Duration>,
+    pieces: u64,
+    width: usize,
+) -> (String, usize) {
     let elapsed = start.elapsed();
     let phase = if first_token.is_some() {
         "decoding"
@@ -750,16 +787,14 @@ fn status_line(start: Instant, first_token: Option<Duration>, pieces: u64, width
         }
     }
     parts.push("esc to stop".to_string());
-    let mut detail = parts.join(" · ");
     // The meter, a space, the phase and two spaces come first.
-    while !parts.is_empty() && 8 + phase.width() + detail.width() >= width {
-        parts.pop();
-        detail = parts.join(" · ");
-    }
-    format!(
+    let head_w = 8 + phase.width();
+    let detail = frame::fit(&parts, width.saturating_sub(head_w));
+    let line = format!(
         "{} {}  {}",
         meter(start),
         phase.with(ACCENT),
-        detail.dark_grey()
-    )
+        detail.as_str().dark_grey()
+    );
+    (line, head_w + detail.width())
 }

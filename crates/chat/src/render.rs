@@ -1,25 +1,26 @@
-//! Formats a streamed reply for the terminal as it arrives: word wrapping beside the
-//! transcript's gutter, under a hanging indent, plus the Markdown a small model actually writes (headings, bullets, **bold**,
-//! `code` and fenced blocks).
+//! Formats a streamed reply for the terminal as it arrives, inside its card: word wrapping
+//! under a hanging indent, each finished line closed with the card's right border, plus the
+//! Markdown a small model actually writes (headings, bullets, **bold**, `code` and fenced
+//! blocks).
 
 use std::mem;
 
-use crossterm::style::{Attribute, Color, ContentStyle, Stylize};
+use crossterm::style::{Attribute, Color, ContentStyle};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::ACCENT;
+use crate::frame::{self, BORDER, INDENT};
 
-/// Column where transcript text starts, after a speaker's label and bar (` rlis │ `).
-pub const INDENT: usize = 8;
 const CODE: Color = Color::AnsiValue(179);
 
 pub struct Renderer {
-    /// Text never reaches the last column, so the cursor never sits in the terminal's
-    /// pending-wrap state.
+    /// The column text stops at; the card's right border follows it.
     width: usize,
     col: usize,
-    /// Starts every line after the first, which the caller labels.
-    gutter: String,
+    /// The card's left border, starting every line after the first (the caller draws that one),
+    /// and its right border, ending every line.
+    left: String,
+    right: String,
     /// Where wrapped lines continue: under the text of a list item, else at `INDENT`.
     hang: usize,
     out: String,
@@ -41,11 +42,13 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(term_width: usize) -> Self {
+    /// A renderer for a card whose text is `text_width` columns wide.
+    pub fn new(text_width: usize) -> Self {
         Self {
-            width: term_width.saturating_sub(1).max(INDENT + 16),
+            width: INDENT + text_width,
             col: INDENT,
-            gutter: format!("{}{} ", " ".repeat(INDENT - 2), "│".with(ACCENT)),
+            left: frame::left(BORDER),
+            right: frame::right(BORDER),
             hang: INDENT,
             out: String::new(),
             word: String::new(),
@@ -110,7 +113,8 @@ impl Renderer {
         }
     }
 
-    /// Prints whatever is still buffered; returns the remaining output.
+    /// Prints whatever is still buffered and closes the last line; returns the remaining
+    /// output.
     pub fn finish(&mut self) -> String {
         if self.fence.is_some() {
             if self.fence.as_ref().is_some_and(|l| !l.is_empty()) {
@@ -119,6 +123,9 @@ impl Renderer {
             self.fence = None;
         } else {
             self.flush_word();
+        }
+        if self.started {
+            self.close_line();
         }
         self.take()
     }
@@ -134,6 +141,8 @@ impl Renderer {
             return;
         }
         self.emit_newlines();
+        // A bar sets code apart from prose.
+        self.emit("▎ ", style(Some(BORDER), false));
         self.emit(&line.replace('\t', "    "), style(Some(CODE), false));
         self.newlines = 1;
     }
@@ -247,20 +256,29 @@ impl Renderer {
         if self.newlines > 0 {
             // At most one blank line between paragraphs.
             for _ in 0..self.newlines.min(2) {
+                self.close_line();
                 self.out.push_str("\r\n");
-                self.out.push_str(&self.gutter);
+                self.out.push_str(&self.left);
+                self.col = INDENT;
             }
-            self.col = INDENT;
             self.hang = INDENT;
             self.newlines = 0;
         }
     }
 
     fn break_line(&mut self) {
+        self.close_line();
         self.out.push_str("\r\n");
-        self.out.push_str(&self.gutter);
+        self.out.push_str(&self.left);
         self.out.push_str(&" ".repeat(self.hang - INDENT));
         self.col = self.hang;
+    }
+
+    /// Pads the current line out to the right border and draws it.
+    fn close_line(&mut self) {
+        self.out
+            .push_str(&" ".repeat(self.width.saturating_sub(self.col)));
+        self.out.push_str(&self.right);
     }
 }
 
@@ -277,9 +295,9 @@ fn style(fg: Option<Color>, bold: bool) -> ContentStyle {
 mod tests {
     use super::*;
 
-    /// Rendered text without escape codes, split into lines.
-    fn plain(input: &[&str], width: usize) -> Vec<String> {
-        let mut r = Renderer::new(width);
+    /// Rendered lines without escape codes.
+    fn raw(input: &[&str], text_width: usize) -> Vec<String> {
+        let mut r = Renderer::new(text_width);
         let mut out = String::new();
         for piece in input {
             r.push(piece);
@@ -298,19 +316,38 @@ mod tests {
         text.split('\n').map(str::to_string).collect()
     }
 
+    /// Rendered lines without the card's borders.
+    fn plain(input: &[&str], text_width: usize) -> Vec<String> {
+        raw(input, text_width)
+            .iter()
+            .map(|l| {
+                let l = l.strip_prefix(" │ ").unwrap_or(l);
+                l.trim_end_matches('│').trim_end().to_string()
+            })
+            .collect()
+    }
+
     #[test]
-    fn wraps_words_beside_the_gutter() {
+    fn closes_every_line_at_the_border() {
+        let lines = raw(&["one two three four five\n\nsix"], 10);
+        assert_eq!(lines.len(), 5);
+        // The caller draws the first line's left border.
+        assert_eq!(lines[0], "one two    │");
+        for l in &lines[1..] {
+            assert!(l.starts_with(" │ ") && l.ends_with(" │"), "{l:?}");
+            assert_eq!(l.chars().count(), INDENT + 10 + 2, "{l:?}");
+        }
+    }
+
+    #[test]
+    fn wraps_words_inside_the_card() {
         let lines = plain(
             &["The sky", " is blue because", " of Rayleigh scattering."],
-            28,
+            19,
         );
         assert_eq!(
             lines,
-            [
-                "The sky is blue",
-                "      │ because of Rayleigh",
-                "      │ scattering."
-            ]
+            ["The sky is blue", "because of Rayleigh", "scattering."]
         );
     }
 
@@ -318,17 +355,17 @@ mod tests {
     fn hangs_list_items_under_their_text() {
         let lines = plain(
             &["Steps:\n- one two three four\n12. five six seven\nend"],
-            24,
+            15,
         );
         assert_eq!(
             lines,
             [
                 "Steps:",
-                "      │ • one two three",
-                "      │   four",
-                "      │ 12. five six",
-                "      │     seven",
-                "      │ end"
+                "• one two three",
+                "  four",
+                "12. five six",
+                "    seven",
+                "end"
             ]
         );
     }
@@ -346,12 +383,12 @@ mod tests {
             lines,
             [
                 "Why",
-                "      │ ",
-                "      │ How",
-                "      │ It is really blue.",
-                "      │ • one",
-                "      │ let x = 1;",
-                "      │ Done"
+                "",
+                "How",
+                "It is really blue.",
+                "• one",
+                "▎ let x = 1;",
+                "Done"
             ]
         );
     }

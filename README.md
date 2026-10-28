@@ -23,8 +23,9 @@ in `~/.cargo/bin` to this build), so from any directory `rlis` opens the chat an
 `rlis generate` and `rlis perplexity` run the server binary. `make uninstall` removes the link.
 Replies stream in with Markdown styling (headings, bold, code, lists) under a live status
 line (prefill, then decoding with tokens and tok/s so far), and each one ends with its token
-count, decode speed and time to first token. Typing `/` opens a command menu; the rule above
-the prompt shows the model, temperature and conversation length. If no
+count, decode speed and time to first token. Each exchange is drawn as a card (your message,
+then the reply, with its stats in the bottom edge), and the prompt card's top edge shows the
+model, temperature and conversation length. Typing `/` opens a command menu. If no
 server answers at `--url` (default `http://127.0.0.1:8000`), it starts `rlis serve` in the
 background, warms it up so the first reply is fast, and stops it on exit; an already running
 server is used as is. The conversation is kept across turns, and the oldest exchanges are
