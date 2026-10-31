@@ -8,11 +8,14 @@ use anyhow::{Result, bail};
 use serde_json::Value;
 
 use crate::http;
+use crate::native::Native;
 
 pub enum Update {
     /// The request's socket, so the UI can shut it down to interrupt the reply.
     Connected(TcpStream),
     Text(String),
+    /// A token not shown (yet): thinking, or a tool call still arriving.
+    Thinking,
     Finish(String),
     /// Completion tokens, from the final usage chunk.
     Usage(u64),
@@ -25,12 +28,13 @@ pub enum Update {
     End(Option<String>),
 }
 
-pub fn stream(url: &str, body: &[u8], tx: &Sender<Update>) {
-    let result = run(url, body, tx);
+/// `native` is for a model that thinks and calls tools natively (see `native`).
+pub fn stream(url: &str, body: &[u8], native: bool, tx: &Sender<Update>) {
+    let result = run(url, body, native.then(Native::new), tx);
     let _ = tx.send(Update::End(result.err().map(|e| format!("{e:#}"))));
 }
 
-fn run(url: &str, body: &[u8], tx: &Sender<Update>) -> Result<()> {
+fn run(url: &str, body: &[u8], mut native: Option<Native>, tx: &Sender<Update>) -> Result<()> {
     let mut resp = http::request(url, "POST", "/v1/chat/completions", Some(body))?;
     let _ = tx.send(Update::Connected(resp.socket()?));
     if resp.status != 200 {
@@ -46,7 +50,18 @@ fn run(url: &str, body: &[u8], tx: &Sender<Update>) -> Result<()> {
         buf.extend_from_slice(&bytes);
         for data in split_events(&mut buf) {
             for update in parse(&data)? {
-                let _ = tx.send(update);
+                let updates = match (&mut native, update) {
+                    (Some(n), Update::Text(t)) => n.feed(&t),
+                    (Some(n), Update::Finish(f)) => {
+                        let mut held = n.finish();
+                        held.push(Update::Finish(f));
+                        held
+                    }
+                    (_, update) => vec![update],
+                };
+                for update in updates {
+                    let _ = tx.send(update);
+                }
             }
         }
     }

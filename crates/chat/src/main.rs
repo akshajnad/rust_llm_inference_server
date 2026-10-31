@@ -2,14 +2,20 @@
 //! `rlis serve` in the background when nothing answers at `--url`, and stops it on exit.
 //! `make install` puts it on the PATH as `rlis`, so it also hands the server binary's own
 //! subcommands (`rlis serve`, ...) through to it. `rlis fix` is its own (see `fix.rs`), and
-//! `rlis code` is the chat with tools for the files in the current directory (see `tools.rs`).
+//! `rlis code` is the chat with tools for files and shell commands, working in the current
+//! directory (see `tools.rs` and `shell.rs`).
 
 mod api;
 mod fix;
 mod frame;
 mod http;
 mod input;
+mod models;
+mod native;
+#[cfg(test)]
+mod probe;
 mod render;
+mod shell;
 mod tools;
 
 use std::env;
@@ -40,6 +46,7 @@ use unicode_width::UnicodeWidthStr;
 use api::Update;
 use frame::BORDER;
 use input::{Command as SlashCommand, Editor, Input};
+use models::Model;
 use render::Renderer;
 
 /// The model's color: its label, the bar beside its replies, headings and the status meter.
@@ -58,27 +65,30 @@ const COMMANDS: &[SlashCommand] = &[
         "show, set or remove the system prompt",
     ),
     ("/temp", "<0-2>", "show or set the sampling temperature"),
+    (
+        "/model",
+        "<name>",
+        "list the models, or switch to one on disk",
+    ),
     ("/help", "", "commands, keys and settings"),
     ("/exit", "", "quit"),
 ];
 
-/// Rounds of requests (reads, edits) in one turn before the agent is stopped, so a model stuck
-/// in a loop ends.
+/// Rounds of requests (reads, edits, commands) in one turn before the agent is stopped, so a
+/// model stuck in a loop ends.
 const MAX_STEPS: usize = 25;
 /// Diff lines shown for a change before the rest are summarized.
 const MAX_DIFF_ROWS: usize = 40;
-/// What `rlis code` starts when no server is running: the coding model, with room for several
-/// files in context.
-const CODE_SERVE_ARGS: &[&str] = &[
-    "--model",
-    "models/Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf",
-    "--tokenizer",
-    "models/qwen2.5-coder-3b-instruct",
-    "--served-model-name",
-    "qwen2.5-coder-3b-instruct",
-    "--max-seq-len",
-    "16384",
-];
+/// Output lines of a command shown in its card before the rest are counted.
+const MAX_OUTPUT_ROWS: usize = 20;
+/// A command's output for the model: its start and its end, where errors and results are.
+const OUTPUT_HEAD: usize = 2000;
+const OUTPUT_TAIL: usize = 4000;
+/// `rlis code`'s options on top of the chat's.
+struct CodeOptions {
+    yes: bool,
+    timeout: u64,
+}
 
 #[derive(Parser)]
 #[command(
@@ -96,17 +106,23 @@ struct Args {
 #[derive(Parser)]
 #[command(
     name = "rlis code",
-    about = "A coding agent: chat with a model that can read, create and edit the files in the \
-             current directory. Changes are shown as diffs and wait for your approval.",
-    after_help = "With no server running it starts one with Qwen2.5-Coder 3B \
-                  (`make models-qwen-3b`)."
+    about = "A coding agent: chat with a model that can read, create and edit files and run \
+             commands in the current directory. Changes are shown as diffs and wait for your \
+             approval, as do commands that delete, move or install things.",
+    after_help = "With no server running it starts one: K2 Horizon if \
+                  `make models-k2` downloaded it, else Qwen2.5-Coder 3B (`make models-qwen-3b`); \
+                  `--model` picks one, and `/model` switches during the session."
 )]
 struct CodeArgs {
     #[command(flatten)]
     chat: ChatArgs,
-    /// Apply file changes without asking.
+    /// Apply file changes and run every command without asking (changes outside the current
+    /// directory still ask).
     #[arg(long)]
     yes: bool,
+    /// Seconds a command may run before it is killed.
+    #[arg(long, default_value_t = 120)]
+    timeout: u64,
 }
 
 #[derive(clap::Args)]
@@ -127,6 +143,11 @@ struct ChatArgs {
     /// Exit instead of starting a server when none is running.
     #[arg(long)]
     no_start: bool,
+    /// The model to start when no server is running: 3b, k2 or 14b (fastest to most reliable) or
+    /// llama-1b; `/model` lists them and switches during the session
+    /// [default: llama-1b; for `rlis code` k2 if downloaded, else 3b]
+    #[arg(long, alias = "coder", value_enum)]
+    model: Option<Model>,
     /// Extra arguments for `rlis serve` when starting one, e.g. `-- --kv-cache-gb 2`.
     #[arg(last = true)]
     serve_args: Vec<String>,
@@ -137,8 +158,20 @@ struct Agent {
     ws: tools::Workspace,
     /// The instructions and the project's files, listed again at each message from the user.
     prompt: String,
-    /// Apply changes without asking (`--yes`, or `a` at a prompt).
+    /// Apply changes inside the project without asking (`--yes`, or `a` at a prompt).
     approve_all: bool,
+    /// Run commands that delete, move or install things without asking.
+    approve_commands: bool,
+    timeout: Duration,
+}
+
+/// What an approval prompt is for.
+#[derive(Clone, Copy, PartialEq)]
+enum Ask {
+    Change,
+    /// A change outside the project, which always asks.
+    Outside,
+    Command,
 }
 
 /// What a request did to the agent's turn.
@@ -174,24 +207,48 @@ fn main() -> Result<()> {
     }
     if env::args().nth(1).as_deref() == Some("code") {
         let args = CodeArgs::parse_from(env::args().skip(1));
-        return chat(args.chat, Some(args.yes));
+        let code = CodeOptions {
+            yes: args.yes,
+            timeout: args.timeout,
+        };
+        return chat(args.chat, Some(code));
     }
     chat(Args::parse().chat, None)
 }
 
-/// The chat, or with `code` (whether to approve all changes) the coding agent.
-fn chat(args: ChatArgs, code: Option<bool>) -> Result<()> {
-    let serve_args = match (code, args.serve_args.is_empty()) {
-        (Some(_), true) => CODE_SERVE_ARGS.iter().map(|s| s.to_string()).collect(),
-        _ => args.serve_args,
+/// The chat, or with `code` the coding agent.
+fn chat(args: ChatArgs, code: Option<CodeOptions>) -> Result<()> {
+    // The model to start, unless `rlis serve` arguments say what to start: `--model`, or for
+    // `rlis code` K2 when it is on disk, else the 3B. The chat's default is the server's.
+    let repo = server_dir(&env::current_exe()?.canonicalize()?);
+    let wanted = match (args.model, &code) {
+        _ if !args.serve_args.is_empty() => None,
+        (Some(m), _) => Some(m),
+        (None, Some(_)) => Some(Model::default_coder(&repo)),
+        (None, None) => None,
     };
-    let _server = ensure_server(&args.url, args.no_start, &serve_args)?;
+    let serve_args = match wanted {
+        Some(m) => {
+            if !healthy(&args.url) && !m.on_disk(&repo) {
+                bail!(
+                    "{} is not downloaded; run `{}` in the rlis repo",
+                    m.gguf(),
+                    m.download()
+                );
+            }
+            m.serve_args()
+        }
+        None => args.serve_args,
+    };
+    let server = ensure_server(&args.url, args.no_start, &serve_args)?;
     let model = model_name(&args.url).unwrap_or_else(|| "unknown model".to_string());
     let agent = match code {
-        Some(yes) => Some(Agent {
+        Some(c) => Some(Agent {
             ws: tools::Workspace::new(env::current_dir()?),
             prompt: String::new(),
-            approve_all: yes,
+            approve_all: c.yes,
+            approve_commands: c.yes,
+            timeout: Duration::from_secs(c.timeout),
         }),
         None => None,
     };
@@ -205,8 +262,11 @@ fn chat(args: ChatArgs, code: Option<bool>) -> Result<()> {
         top_p: args.top_p,
         max_tokens: args.max_tokens,
         messages: Vec::new(),
-        agent,
         editor: Editor::new(COMMANDS),
+        agent,
+        server,
+        repo,
+        wanted,
         out: io::stdout(),
     };
     chat.refresh_prompt();
@@ -316,12 +376,44 @@ fn ensure_server(url: &str, no_start: bool, serve_args: &[String]) -> Result<Opt
     if healthy(url) {
         return Ok(None);
     }
-    let (host, port) = http::authority(url)?
+    let host = http::authority(url)?
         .rsplit_once(':')
-        .context("--url needs a port")?;
+        .context("--url needs a port")?
+        .0;
     if no_start || !matches!(host, "127.0.0.1" | "localhost") {
         bail!("no server is answering at {url}");
     }
+    let start = Instant::now();
+    let mut out = io::stdout();
+    let server = start_server(url, serve_args, |phase| {
+        let detail = match phase {
+            "warming up" => String::new(),
+            _ => format!("{}s · {phase}", start.elapsed().as_secs()),
+        };
+        let head = match phase {
+            "warming up" => "warming up",
+            _ => "starting rlis server",
+        };
+        print!(
+            "\r\x1b[2K{} {}  {}",
+            meter(start),
+            head.with(ACCENT),
+            detail.dark_grey()
+        );
+        let _ = out.flush();
+    });
+    print!("\r\x1b[2K");
+    out.flush()?;
+    Ok(Some(server?))
+}
+
+/// Starts `rlis serve <serve_args>` for `url` and waits until it answers and is warmed up;
+/// `tick` gets the phase ("loading the model", "warming up") every few milliseconds.
+fn start_server(url: &str, serve_args: &[String], mut tick: impl FnMut(&str)) -> Result<Server> {
+    let port = http::authority(url)?
+        .rsplit_once(':')
+        .context("--url needs a port")?
+        .1;
     // Resolved through the symlink `make install` puts on the PATH, to find the build.
     let exe = env::current_exe()?.canonicalize()?;
     let bin = server_bin(&exe)?;
@@ -344,10 +436,8 @@ fn ensure_server(url: &str, no_start: bool, serve_args: &[String]) -> Result<Opt
     );
 
     let start = Instant::now();
-    let mut out = io::stdout();
     while !healthy(url) {
         if let Some(status) = server.0.try_wait()? {
-            print!("\r\x1b[2K");
             let log = fs::read_to_string(&log_path).unwrap_or_default();
             let lines: Vec<&str> = log.lines().collect();
             let tail = lines[lines.len().saturating_sub(15)..].join("\n");
@@ -359,24 +449,15 @@ fn ensure_server(url: &str, no_start: bool, serve_args: &[String]) -> Result<Opt
                 log_path.display()
             );
         }
-        print!(
-            "\r{} {}  {}",
-            meter(start),
-            "starting rlis server".with(ACCENT),
-            format!("{}s · loading the model", start.elapsed().as_secs()).dark_grey()
-        );
-        out.flush()?;
+        tick("loading the model");
         thread::sleep(Duration::from_millis(120));
     }
-    print!("\r\x1b[2K{} {}", meter(start), "warming up".with(ACCENT));
-    out.flush()?;
+    tick("warming up");
     // The first request after startup compiles GPU pipelines (seconds); pay for it here
     // rather than on the first message.
     let warmup = br#"{"prompt": "Hello", "max_tokens": 1}"#;
     let _ = http::request(url, "POST", "/v1/completions", Some(warmup)).and_then(|r| r.text());
-    print!("\r\x1b[2K");
-    out.flush()?;
-    Ok(Some(server))
+    Ok(server)
 }
 
 /// A five-cell bar with one lit cell sweeping back and forth.
@@ -435,6 +516,12 @@ struct Chat {
     max_tokens: Option<usize>,
     messages: Vec<Message>,
     agent: Option<Agent>,
+    /// The server this process started, if it did; `/model` replaces it.
+    server: Option<Server>,
+    /// The rlis repo, whose `models/` directory holds the models.
+    repo: PathBuf,
+    /// The model asked for (`--model` or `/model`), which the server should be running.
+    wanted: Option<Model>,
     editor: Editor,
     out: Stdout,
 }
@@ -478,6 +565,7 @@ impl Chat {
     /// card, until it replies without one.
     fn respond(&mut self) -> Result<()> {
         let mut steps = 0;
+        let mut nudges = tools::Nudges::default();
         loop {
             let (text, interrupted) = match self.generate()? {
                 Outcome::Reply(text) => (text, false),
@@ -501,9 +589,13 @@ impl Chat {
                 self.pop_user();
                 return Ok(());
             }
-            let requests = match self.agent {
-                Some(_) if !interrupted => tools::Reply::parse(&text),
-                _ => Vec::new(),
+            let (requests, unsaved) = match &self.agent {
+                Some(a) if !interrupted => {
+                    let reply = tools::Reply::read(&text, Some(a.ws.root()));
+                    let unsaved = reply.unsaved_code();
+                    (reply.into_requests(), unsaved)
+                }
+                _ => (Vec::new(), 0),
             };
             // A model that only says again what it said last does nothing new by going on.
             let repeated = self
@@ -518,7 +610,25 @@ impl Chat {
                 tool: false,
             });
             if requests.is_empty() {
-                return Ok(());
+                let request = self.request().to_string();
+                let text = &self.messages.last().expect("pushed").content;
+                let nudge = match self.agent {
+                    Some(_) => nudges.next(text, unsaved, &request),
+                    None => None,
+                };
+                let Some((note, message)) = nudge else {
+                    return Ok(());
+                };
+                self.edge(['┌', '┐'], "retry", Color::Yellow, "", BORDER)?;
+                self.note(note)?;
+                self.close()?;
+                self.messages.push(Message {
+                    role: "user",
+                    content: message,
+                    tool: true,
+                });
+                self.edge(['┌', '┐'], "rlis", ACCENT, "", BORDER)?;
+                continue;
             }
             if steps == MAX_STEPS {
                 self.edge(['┌', '┐'], "stopped", Color::Yellow, "", BORDER)?;
@@ -532,6 +642,7 @@ impl Chat {
             // All of a reply's results go back in one message.
             let mut results = Vec::new();
             let (mut stopped, mut progress) = (false, false);
+            nudges.saw(&requests);
             for request in &requests {
                 if stopped {
                     results.push(format!(
@@ -545,20 +656,7 @@ impl Chat {
                 stopped = flow == Flow::Stop;
                 progress |= flow == Flow::Next;
             }
-            // Small models lose the request behind the file contents they read, and make up
-            // work instead (edits nobody asked for), so each result restates it.
-            let request = self
-                .messages
-                .iter()
-                .rev()
-                .find(|m| m.role == "user" && !m.tool)
-                .map_or("", |m| m.content.as_str());
-            results.push(format!(
-                "(The user's request: {} Do what it says next, or if it is done, reply with a \
-                 short summary. Write each file you create or rewrite as its path alone on a \
-                 line, then its content in a fenced block.)",
-                request.trim()
-            ));
+            results.push(tools::restate(self.request()));
             self.messages.push(Message {
                 role: "user",
                 content: results.join("\n\n"),
@@ -574,6 +672,15 @@ impl Chat {
             }
             self.edge(['┌', '┐'], "rlis", ACCENT, "", BORDER)?;
         }
+    }
+
+    /// The user's last message.
+    fn request(&self) -> &str {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user" && !m.tool)
+            .map_or("", |m| m.content.as_str())
     }
 
     /// Reports a reply that failed in the open card and closes it, forgetting the user's
@@ -621,11 +728,17 @@ impl Chat {
         }
     }
 
+    /// Whether the server's model thinks and calls tools natively.
+    fn native(&self) -> bool {
+        Model::from_served(&self.model).is_some_and(Model::native)
+    }
+
     fn body(&self) -> Vec<u8> {
         let mut messages = Vec::new();
         let system = match &self.agent {
-            Some(a) => Some(&a.prompt),
-            None => self.system.as_ref(),
+            Some(a) if self.native() => Some(native::system(&a.prompt)),
+            Some(a) => Some(a.prompt.clone()),
+            None => self.system.clone(),
         };
         if let Some(s) = system {
             messages.push(json!({"role": "system", "content": s}));
@@ -655,8 +768,8 @@ impl Chat {
     /// interrupts by closing the connection, which also stops generation on the server.
     fn generate(&mut self) -> Result<Outcome> {
         let (tx, rx) = mpsc::channel();
-        let (url, body) = (self.url.clone(), self.body());
-        thread::spawn(move || api::stream(&url, &body, &tx));
+        let (url, body, native) = (self.url.clone(), self.body(), self.native());
+        thread::spawn(move || api::stream(&url, &body, native, &tx));
 
         let width = frame::text_width();
         let mut r = Renderer::new(width);
@@ -666,11 +779,12 @@ impl Chat {
         let mut text = String::new();
         // The agent's requests are shown in cards of their own, and it stops once one is
         // complete (`cut`) instead of imagining the result.
-        let mut reply = self.agent.is_some().then(tools::Reply::default);
+        let mut reply = self.agent.as_ref().map(|a| tools::Reply::new(a.ws.root()));
         let (mut pieces, mut usage, mut finish) = (0u64, None, None);
         let (mut socket, mut interrupted, mut rejected) = (None::<TcpStream>, false, None);
         let mut cut = false;
         let mut writing = false;
+        let mut thinking = false;
         let mut error = loop {
             if event::poll(Duration::from_millis(40))?
                 && let Event::Key(k) = event::read()?
@@ -694,9 +808,15 @@ impl Chat {
                         socket = Some(s);
                     }
                     Update::Text(_) if interrupted || cut => {}
+                    Update::Thinking => {
+                        first_token.get_or_insert_with(|| start.elapsed());
+                        pieces += 1;
+                        thinking = true;
+                    }
                     Update::Text(t) => {
                         first_token.get_or_insert_with(|| start.elapsed());
                         pieces += 1;
+                        thinking = false;
                         text.push_str(&t);
                         match &mut reply {
                             Some(p) => {
@@ -732,6 +852,7 @@ impl Chat {
             }
             let phase = match (first_token, reply.as_ref().and_then(tools::Reply::writing)) {
                 (None, _) => "prefill".to_string(),
+                (Some(_), _) if thinking => "working".to_string(),
                 (Some(_), Some(path)) => format!("writing {path}"),
                 (Some(_), None) => "decoding".to_string(),
             };
@@ -869,6 +990,7 @@ impl Chat {
                 _ => self.error("The temperature must be a number from 0 to 2")?,
             },
             "/help" => self.help()?,
+            "/model" => self.switch_model(arg)?,
             _ => self.error(&format!("Unknown command {name}; /help lists them"))?,
         }
         self.close()?;
@@ -877,6 +999,7 @@ impl Chat {
 
     fn banner(&mut self) -> Result<()> {
         let width = term_width();
+        let mut warning = None;
         // " rlis " and the spaces around it.
         let room = width.saturating_sub(12 + self.model.width());
         let url = if self.url.width() < room {
@@ -903,6 +1026,13 @@ impl Chat {
                         .to_string_lossy()
                         .into();
                 }
+                if !self.model.to_lowercase().contains("coder") && !self.native() {
+                    warning = Some(format!(
+                        "this server runs {}; rlis code works best with a coding model (/model \
+                         lists them)",
+                        self.model
+                    ));
+                }
                 vec![
                     format!("coding agent in {dir}"),
                     "it asks before changing files".to_string(),
@@ -915,8 +1045,24 @@ impl Chat {
                 "esc stops a reply".to_string(),
             ],
         };
+        // An already running server is used as it is, whatever it runs.
+        if let Some(want) = self.wanted
+            && want.served_name() != self.model
+        {
+            warning = Some(format!(
+                "this server at {} runs {}, not {}; it wasn't started here, so stop it to switch",
+                self.url,
+                self.model,
+                want.served_name()
+            ));
+        }
         let tips = frame::fit(&tips, width.saturating_sub(4));
         self.print(format!("  {}", tips.dark_grey()))?;
+        if let Some(w) = warning {
+            for line in frame::wrap(&w, width.saturating_sub(4)) {
+                self.print(format!("  {}", line.yellow()))?;
+            }
+        }
         self.print("")
     }
 
@@ -946,13 +1092,14 @@ impl Chat {
                 format!("{c} {a}")
             }
         };
-        let w = COMMANDS
+        let commands = COMMANDS;
+        let w = commands
             .iter()
             .map(|(c, a, _)| label(c, a).width())
             .max()
             .unwrap_or(0);
         self.row(&"commands".with(ACCENT).bold().to_string(), 8)?;
-        for (c, a, d) in COMMANDS {
+        for (c, a, d) in commands {
             let gap = " ".repeat(w - label(c, a).width() + 3);
             let a = if a.is_empty() {
                 String::new()
@@ -986,6 +1133,11 @@ impl Chat {
                 ("read", "files and directories, at once"),
                 ("edit", "part of a file, after you approve the diff"),
                 ("write", "a new or whole file, after you approve the diff"),
+                (
+                    "run",
+                    "shell commands in the project, at once; ones that delete, move, install or \
+                     commit ask first",
+                ),
             ];
             for (t, d) in tools {
                 let head = format!("  {}", format!("{t:<14}").with(ACCENT));
@@ -994,8 +1146,9 @@ impl Chat {
             self.columns(
                 "  ",
                 2,
-                "At a change: y applies it, n declines it (the model hears so and goes on), \
-                 a applies it and every later one, esc declines it and stops the turn.",
+                "At a prompt: y approves, n declines (the model hears so and goes on), a \
+                 approves this and every later one of its kind, esc declines and stops the turn \
+                 (and stops a running command). Changes outside the project always ask.",
             )?;
             self.row("", 0)?;
         }
@@ -1041,18 +1194,28 @@ impl Chat {
                 self.close()?;
                 return Ok((output, Flow::Idle));
             }
+            Ok(tools::Action::Run { command, risk }) => {
+                return self.run_command(&title, &command, risk);
+            }
             Ok(tools::Action::Change(change)) => change,
         };
 
         let diff = tools::diff(change.old.as_deref().unwrap_or(""), &change.new);
         let count = |t: char| diff.iter().filter(|(tag, _)| *tag == t).count();
-        let stats = match change.old {
+        let mut stats = match change.old {
             None => format!("new file · {} lines", count('+')),
             Some(_) => format!("+{} −{}", count('+'), count('-')),
         };
-        self.edge(['┌', '┐'], &title, ACCENT, &stats, Color::DarkGrey)?;
+        let (ask, stats_color) = match change.outside {
+            true => {
+                stats += " · outside the project";
+                (Ask::Outside, Color::Yellow)
+            }
+            false => (Ask::Change, Color::DarkGrey),
+        };
+        self.edge(['┌', '┐'], &title, ACCENT, &stats, stats_color)?;
         self.show_diff(&diff)?;
-        let (result, flow) = match self.approve()? {
+        let (result, flow) = match self.approve("apply?", ask)? {
             Approval::Yes => match self
                 .agent
                 .as_mut()
@@ -1090,6 +1253,245 @@ impl Chat {
         Ok((result, flow))
     }
 
+    /// `/model`: lists the models, or switches to one on disk, in the open card. The old server
+    /// stops before the new one starts, so only one model is ever in memory; if the new one
+    /// fails to start, the old one comes back. The conversation carries over.
+    fn switch_model(&mut self, arg: &str) -> Result<()> {
+        let current = Model::from_served(&self.model);
+        if arg.is_empty() {
+            for m in Model::ALL {
+                let state = match (Some(m) == current, m.on_disk(&self.repo)) {
+                    (true, _) => "running",
+                    (false, true) => "on disk",
+                    (false, false) => "not downloaded",
+                };
+                let head = format!(
+                    "  {}  {}",
+                    format!("{:<8}", m.name()).with(ACCENT),
+                    format!("{state:<16}").dark_grey()
+                );
+                self.columns(&head, 2 + 8 + 2 + 16, m.about())?;
+            }
+            self.row("", 0)?;
+            return self.note(
+                "/model <name> switches to one on disk; `make models-qwen-<size>` in the rlis \
+                 repo downloads the others",
+            );
+        }
+        let Some(model) = Model::parse(arg) else {
+            return self.error(&format!("No model {arg}; /model lists them"));
+        };
+        if Some(model) == current {
+            return self.note(&format!("{} is already running", self.model));
+        }
+        if !model.on_disk(&self.repo) {
+            return self.error(&format!(
+                "{} is not downloaded; run `{}` in the rlis repo",
+                model.gguf(),
+                model.download()
+            ));
+        }
+        if self.server.is_none() && healthy(&self.url) {
+            return self.error(&format!(
+                "The server at {} wasn't started here, so it can't switch models; stop it and \
+                 start rlis again",
+                self.url
+            ));
+        }
+
+        let start = Instant::now();
+        // One model in memory at a time: the old one goes before the new one loads.
+        self.server = None;
+        while healthy(&self.url) && start.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(100));
+        }
+        let started = start_server(&self.url, &model.serve_args(), |phase| {
+            status_row(
+                &mut self.out,
+                start,
+                &format!("starting {} · {phase}", model.name()),
+            );
+        });
+        queue!(self.out, MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
+        match started {
+            Ok(server) => self.server = Some(server),
+            Err(e) => {
+                self.error(&format!("{e:#}"))?;
+                // Bring back the model that was running.
+                let old = current.filter(|m| m.on_disk(&self.repo));
+                if let Some(old) = old {
+                    let back = start_server(&self.url, &old.serve_args(), |phase| {
+                        let what = format!("starting {} again · {phase}", old.name());
+                        status_row(&mut self.out, start, &what);
+                    });
+                    queue!(self.out, MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
+                    if let Ok(server) = back {
+                        self.server = Some(server);
+                        return self.note(&format!("Back on {}", self.model));
+                    }
+                }
+                return self.note("No model is running; /model <name> starts one");
+            }
+        }
+        self.model = model_name(&self.url).unwrap_or_else(|| model.served_name().to_string());
+        self.wanted = Some(model);
+        self.marked(
+            "✓".with(ACCENT),
+            &format!(
+                "Switched to {} in {:.0}s; the conversation carries over",
+                self.model,
+                start.elapsed().as_secs_f64()
+            ),
+            Color::DarkGrey,
+        )
+    }
+
+    /// Runs one of the agent's commands in a card of its own, asking first if it is risky, with
+    /// its output streaming into the card under a live status line. Esc or Ctrl-C kills it and
+    /// stops the turn. Returns the output for the model.
+    fn run_command(
+        &mut self,
+        title: &str,
+        command: &str,
+        risk: Option<&'static str>,
+    ) -> Result<(String, Flow)> {
+        let width = frame::text_width();
+        self.edge(['┌', '┐'], title, ACCENT, "", BORDER)?;
+        // A script's lines; a one-line command is all in the title.
+        if command.lines().nth(1).is_some() {
+            for line in command.lines().take(MAX_OUTPUT_ROWS) {
+                let text = frame::truncate(&format!("$ {line}"), width);
+                self.row(&text.as_str().dark_grey().to_string(), text.width())?;
+            }
+        }
+        let name = match command.lines().nth(1) {
+            Some(_) => "the script".to_string(),
+            None => format!("`{command}`"),
+        };
+        if let Some(why) = risk {
+            self.marked("!".yellow(), &format!("This command {why}"), Color::Yellow)?;
+            match self.approve("run?", Ask::Command)? {
+                Approval::Yes => {}
+                Approval::No => {
+                    self.note("Declined")?;
+                    self.close()?;
+                    let msg = format!("The user declined to run {name}; it did not run.");
+                    return Ok((msg, Flow::Next));
+                }
+                Approval::Stop => {
+                    self.note("Declined; the turn stops here")?;
+                    self.close()?;
+                    let msg = format!("The user declined to run {name} and stopped you.");
+                    return Ok((msg, Flow::Stop));
+                }
+            }
+        }
+
+        let agent = self.agent.as_ref().expect("commands come from the agent");
+        let (root, timeout) = (agent.ws.root().to_path_buf(), agent.timeout);
+        let start = Instant::now();
+        let (mut partial, mut rows, mut hidden) = (String::new(), 0, 0);
+        let out = &mut self.out;
+        let mut show = |line: &str, out: &mut Stdout| {
+            // A progress bar redraws its line with carriage returns; its last state counts.
+            let line = line
+                .rsplit('\r')
+                .next()
+                .unwrap_or_default()
+                .replace('\t', "    ");
+            if rows == MAX_OUTPUT_ROWS {
+                hidden += 1;
+                return;
+            }
+            rows += 1;
+            let text = frame::truncate(&line, width);
+            let row = frame::row(
+                &text.as_str().dark_grey().to_string(),
+                text.width(),
+                BORDER,
+                width,
+            );
+            let _ = write!(out, "{row}\r\n");
+        };
+        let run = shell::run(&root, command, timeout, |fresh| {
+            let _ = queue!(out, Clear(ClearType::FromCursorDown));
+            partial += fresh;
+            while let Some(i) = partial.find('\n') {
+                let line: String = partial.drain(..=i).collect();
+                show(line.trim_end_matches(['\n', '\r']), out);
+            }
+            let detail = format!("{:.1}s · esc to stop", start.elapsed().as_secs_f64());
+            let status = format!(
+                "{} {}  {}",
+                meter(start),
+                "running".with(ACCENT),
+                detail.as_str().dark_grey()
+            );
+            // The meter's five cells, a space, "running" and two spaces come first.
+            let status_w = 15 + detail.width();
+            let _ = write!(out, "{}", frame::row(&status, status_w, BORDER, width));
+            let _ = queue!(out, MoveToColumn(0));
+            let _ = out.flush();
+            // Esc or Ctrl-C stops it.
+            matches!(event::poll(Duration::ZERO), Ok(true))
+                && matches!(event::read(), Ok(Event::Key(k)) if k.kind != KeyEventKind::Release
+                    && (k.code == KeyCode::Esc
+                        || (k.code == KeyCode::Char('c')
+                            && k.modifiers.contains(KeyModifiers::CONTROL))))
+        });
+        queue!(self.out, MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
+        let run = match run {
+            Ok(run) => run,
+            Err(e) => {
+                self.error(&format!("{e:#}"))?;
+                self.close()?;
+                return Ok((format!("Error: {e:#}"), Flow::Next));
+            }
+        };
+        if !partial.is_empty() {
+            show(&partial, &mut self.out);
+        }
+        if hidden > 0 {
+            self.note(&format!("… {hidden} more lines"))?;
+        }
+        let secs = format!("{:.1}s", run.secs);
+        let (stats, color, said, flow) = match run.exit {
+            _ if run.stopped => (
+                format!("stopped · {secs}"),
+                Color::Yellow,
+                format!("The user stopped {name} after {secs} and stopped you."),
+                Flow::Stop,
+            ),
+            _ if run.timed_out => (
+                format!("killed after {}s", timeout.as_secs()),
+                Color::Yellow,
+                format!(
+                    "{name} was killed after {}s; it may wait for input or never end.",
+                    timeout.as_secs()
+                ),
+                Flow::Next,
+            ),
+            Some(code) => (
+                format!("exit {code} · {secs}"),
+                if code == 0 {
+                    Color::DarkGrey
+                } else {
+                    Color::Yellow
+                },
+                format!("Output of {name} (exit {code}):"),
+                Flow::Next,
+            ),
+            None => (
+                format!("killed · {secs}"),
+                Color::Yellow,
+                format!("{name} was killed by a signal."),
+                Flow::Next,
+            ),
+        };
+        self.edge(['└', '┘'], "", BORDER, &stats, color)?;
+        Ok((format!("{said}\n{}", output_excerpt(&run.output)), flow))
+    }
+
     /// The changed lines of `diff` with a little context, up to `MAX_DIFF_ROWS` rows.
     fn show_diff(&mut self, diff: &[(char, String)]) -> Result<()> {
         let width = frame::text_width();
@@ -1123,16 +1525,25 @@ impl Chat {
         Ok(())
     }
 
-    /// Asks whether to apply a change, in a row of the open card, unless every change is
-    /// approved already.
-    fn approve(&mut self) -> Result<Approval> {
+    /// Asks `question` (whether to apply a change or run a command) in a row of the open card,
+    /// unless everything of its kind is approved already.
+    fn approve(&mut self, question: &str, ask: Ask) -> Result<Approval> {
         let agent = self.agent.as_mut().expect("changes come from the agent");
-        if agent.approve_all {
+        let approved = match ask {
+            Ask::Change => agent.approve_all,
+            Ask::Command => agent.approve_commands,
+            Ask::Outside => false,
+        };
+        if approved {
             return Ok(Approval::Yes);
         }
-        let keys = "y yes · n no · a yes to all · esc stop";
-        let prompt = format!("{} {}", "apply?".with(ACCENT).bold(), keys.dark_grey());
-        let row = frame::row(&prompt, 7 + keys.width(), BORDER, frame::text_width());
+        let keys = match ask {
+            Ask::Outside => "y yes · n no · esc stop",
+            _ => "y yes · n no · a yes to all · esc stop",
+        };
+        let prompt = format!("{} {}", question.with(ACCENT).bold(), keys.dark_grey());
+        let w = question.width() + 1 + keys.width();
+        let row = frame::row(&prompt, w, BORDER, frame::text_width());
         write!(self.out, "{row}")?;
         self.out.flush()?;
         let answer = loop {
@@ -1144,8 +1555,11 @@ impl Chat {
             }
             match k.code {
                 KeyCode::Char('y' | 'Y') => break Approval::Yes,
-                KeyCode::Char('a' | 'A') => {
-                    agent.approve_all = true;
+                KeyCode::Char('a' | 'A') if ask != Ask::Outside => {
+                    match ask {
+                        Ask::Command => agent.approve_commands = true,
+                        _ => agent.approve_all = true,
+                    }
                     break Approval::Yes;
                 }
                 KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1233,6 +1647,52 @@ impl Chat {
         self.out.flush()?;
         Ok(())
     }
+}
+
+/// A live status row in the open card (a meter, `what` and the time so far), redrawn in place.
+fn status_row(out: &mut Stdout, start: Instant, what: &str) {
+    let width = frame::text_width();
+    let detail = format!("{}s", start.elapsed().as_secs());
+    let what = frame::truncate(what, width.saturating_sub(detail.width() + 8));
+    let line = format!(
+        "{} {}  {}",
+        meter(start),
+        what.as_str().with(ACCENT),
+        detail.as_str().dark_grey()
+    );
+    let _ = queue!(out, MoveToColumn(0), Clear(ClearType::FromCursorDown));
+    let row = frame::row(&line, 8 + what.width() + detail.width(), BORDER, width);
+    let _ = write!(out, "{row}");
+    let _ = queue!(out, MoveToColumn(0));
+    let _ = out.flush();
+}
+
+/// A command's output for the model in a fenced block: all of it, or its start and end.
+fn output_excerpt(output: &str) -> String {
+    let output = output.trim_end();
+    if output.is_empty() {
+        return "(no output)".to_string();
+    }
+    let floor = |i: usize| {
+        (0..=i)
+            .rev()
+            .find(|&i| output.is_char_boundary(i))
+            .unwrap_or(0)
+    };
+    let body = match output.len() > OUTPUT_HEAD + OUTPUT_TAIL {
+        true => {
+            let head = floor(OUTPUT_HEAD);
+            let tail = floor(output.len() - OUTPUT_TAIL);
+            format!(
+                "{}\n[... {} characters left out ...]\n{}",
+                &output[..head],
+                tail - head,
+                &output[tail..]
+            )
+        }
+        false => output.to_string(),
+    };
+    format!("```\n{body}\n```")
 }
 
 /// The phase, a meter and the numbers so far, fitted to `width` columns; returns the line and

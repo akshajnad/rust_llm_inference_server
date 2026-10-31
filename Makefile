@@ -20,7 +20,7 @@ LLAMA_CPP_CMAKE_FLAGS ?= -DGGML_METAL=ON
 LLAMA_CPP_JOBS ?=
 WIKITEXT_URL := $(HF)/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip
 
-.PHONY: serve chat install uninstall models models-qwen models-qwen-3b models-all wikitext llama-cpp bench-mac bench-cuda bench-ablations bench-fork bench-fix bench-fix-3b bench-charts soak build test test-metal parity-ref parity-ref-qwen chat-ref chat-ref-qwen parity parity-qwen lint fuzz teardown
+.PHONY: serve chat install uninstall models models-qwen models-qwen-3b models-k2 models-qwen-14b models-all wikitext llama-cpp bench-mac bench-cuda bench-ablations bench-fork bench-fix bench-fix-3b bench-charts soak build test test-metal parity-ref parity-ref-qwen chat-ref chat-ref-qwen parity parity-qwen lint fuzz teardown
 
 # One command from a fresh clone to a running server on http://127.0.0.1:8000.
 serve: models
@@ -85,6 +85,32 @@ models-qwen-3b:
 	$(call fetch,$(QWEN3B_REPO),tokenizer.json,$(QWEN3B_DIR)/tokenizer.json)
 	$(call fetch,$(QWEN3B_REPO),tokenizer_config.json,$(QWEN3B_DIR)/tokenizer_config.json)
 	$(call fetch,bartowski/Qwen2.5-Coder-3B-Instruct-GGUF,$(QWEN3B_GGUF),models/$(QWEN3B_GGUF))
+
+# `rlis code`'s default: K2 Horizon 3.7B (36 layers, 4 query heads per KV head), which thinks first
+# and calls tools natively. Its chat template lives in its own file.
+K2_DIR := models/k2-horizon-3.7b
+K2_REPO := IFM/K2-Horizon-3.7B
+K2_GGUF := K2-Horizon-3.7B-Q4_K_M.gguf
+
+models-k2:
+	$(call fetch,$(K2_REPO),config.json,$(K2_DIR)/config.json)
+	$(call fetch,$(K2_REPO),generation_config.json,$(K2_DIR)/generation_config.json)
+	$(call fetch,$(K2_REPO),tokenizer.json,$(K2_DIR)/tokenizer.json)
+	$(call fetch,$(K2_REPO),tokenizer_config.json,$(K2_DIR)/tokenizer_config.json)
+	$(call fetch,$(K2_REPO),chat_template.jinja,$(K2_DIR)/chat_template.jinja)
+	$(call fetch,bartowski/K2-Horizon-3.7B-GGUF,$(K2_GGUF),models/$(K2_GGUF))
+
+# The largest coder: the 14B (48 layers, 7 query heads per KV head).
+QWEN14B_DIR := models/qwen2.5-coder-14b-instruct
+QWEN14B_REPO := Qwen/Qwen2.5-Coder-14B-Instruct
+QWEN14B_GGUF := Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf
+
+models-qwen-14b:
+	$(call fetch,$(QWEN14B_REPO),config.json,$(QWEN14B_DIR)/config.json)
+	$(call fetch,$(QWEN14B_REPO),generation_config.json,$(QWEN14B_DIR)/generation_config.json)
+	$(call fetch,$(QWEN14B_REPO),tokenizer.json,$(QWEN14B_DIR)/tokenizer.json)
+	$(call fetch,$(QWEN14B_REPO),tokenizer_config.json,$(QWEN14B_DIR)/tokenizer_config.json)
+	$(call fetch,bartowski/Qwen2.5-Coder-14B-Instruct-GGUF,$(QWEN14B_GGUF),models/$(QWEN14B_GGUF))
 
 models-all: models
 	$(call fetch,$(DENSE_REPO),model.safetensors,$(MODEL_DIR)/model.safetensors)

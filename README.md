@@ -39,6 +39,7 @@ dropped when it outgrows the 2,048-token context.
 | `/retry` | regenerate the last reply |
 | `/system <prompt>` | show or set the system prompt (`/system none` removes it) |
 | `/temp <x>` | show or set the temperature (default 0.6, top-p 0.9) |
+| `/model <name>` | list the models (`/model`), or switch to one on disk: `3b`, `14b` (Qwen2.5-Coder), `k2` (K2 Horizon) or `llama-1b` |
 | `/help`, `/exit` | |
 
 | Key | |
@@ -58,23 +59,67 @@ server logs to `target/release/rlis-chat-server.log`.
 ### `rlis code` (coding agent)
 
 ```sh
-make models-qwen-3b # Qwen2.5-Coder 3B Instruct, Q4_K_M (1.9 GB)
+make models-k2 # K2 Horizon 3.7B, Q4_K_M (3.3 GB); or models-qwen-3b (1.9 GB)
 cd path/to/project && rlis code
 ```
 
 The terminal chat as a coding agent for the current directory: the model reads, creates and
-edits its files to do what you ask, and keeps going (reading, then editing) until it replies
-with a summary. It asks in plain text, in formats a 3B model writes reliably: `READ path` lines
-(`READ .` lists the directory), and a file's path followed by a fenced `SEARCH`/`REPLACE` block
-(an edit) or by the whole file (a write; makefile recipes get the tabs make needs). Generation stops as soon as a request is complete, so the model never makes up a
-file's contents, and the requests show as cards instead of raw text: reads at once, changes as
-a diff that waits for `y` (apply), `n` (decline; the model hears so and goes on), `a` (apply
-this and every later change) or esc (decline and stop). It may only change files it has read
-in the conversation (or new ones), and no path outside the directory. Each tool result restates
-your request, which keeps a small model on it instead of making up edits nobody asked for. The system prompt lists
-the project's files (what git doesn't ignore). With no server running it starts one with the
-Qwen 3B model and a 16,384-token context. `--yes` applies changes without asking; the chat's
-other options and commands work too (`/clear` starts over).
+edits files and runs shell commands to do what you ask, and keeps going (reading, editing,
+running) until it replies with a summary. It asks in plain text, in formats a 3B model writes
+reliably: `READ path` lines (`READ .` lists the directory), `RUN command` lines (or a lone
+`RUN` and a fenced script), and a file's path followed by a fenced `SEARCH`/`REPLACE` block (an
+edit) or by the whole file (a write; makefile recipes get the tabs make needs). Generation
+stops as soon as a request is complete, so the model never makes up a file's contents or a
+command's output, and the requests show as cards instead of raw text:
+
+- reads run at once, from the project or (by absolute or `~/` path) anywhere else;
+- changes show as a diff that waits for `y` (apply), `n` (decline; the model hears so and goes
+  on), `a` (apply this and every later change) or esc (decline and stop). A change outside the
+  directory always asks, even after `a` or with `--yes`;
+- commands run at once in the project directory, their output streaming into the card (esc
+  kills one; `--timeout`, default 120 s). Commands that delete, move or overwrite files, change
+  git history, install packages or run with `sudo` ask first, with the same keys.
+
+It may only change files it has read in the conversation (or new ones). Small models slip in
+ways the agent corrects: a code block with no path line still creates the new file the line
+before it (`### HTML (index.html)`) or its first comment (`# snake.py`) names; and a reply that
+shows code without saving it, refuses an ordinary task, or claims to have done something it
+didn't gets one reminder of what it can do. Each tool result restates your request, which keeps
+a small model on it instead of making up edits nobody asked for. The system prompt lists the
+project's files (what git doesn't ignore) and the first of `RLIS.md`, `AGENTS.md` or
+`CLAUDE.md` it finds. With no server running it starts one with a 16,384-token context and
+K2 Horizon if it is downloaded, else Qwen2.5-Coder 3B; `--model 3b|k2|14b|llama-1b` picks one
+(`make models-qwen-14b` downloads the 14B).
+
+K2 thinks before it answers and was trained on native tool calls, so `crates/chat/src/native.rs`
+declares the agent's actions as tools, hides the thinking (the status line says `working`) and
+turns each call back into the text above; the agent itself doesn't change.
+
+`/model` lists the models and which are on disk; `/model 14b` switches to one mid-session.
+It stops the running server, then starts one with the new model, so only one model is in
+memory at a time. This takes a few seconds, and the conversation carries over. If the new
+model fails to start, the old one comes back. Only a server `rlis` started itself can be
+switched; one already running when it started is used as it is. The plain chat has `/model`
+and `--model` too. On ten small tasks (`crates/chat/src/probe.rs`: create
+a script, a game, a web page, a Rust and a Go program, add to a file, run the tests, fix a
+failing test, delete a file, answer a question without changing anything), two runs each on
+an M4 Pro (24 GB):
+
+| `/model` | Tasks done | Decode | Peak footprint |
+|---|---|---|---|
+| `3b` | 15/20 | 61 tok/s | 3.9 GB |
+| `k2` (default when downloaded) | 19/20 | 50 tok/s | 6.9 GB (`--kv-cache-gb 2.3`) |
+| `14b` | 20/20 | 21 tok/s | 12.9 GB (`--kv-cache-gb 3`) |
+
+The 3B's misses vary from run to run (a page or a program shown but never saved, an edit
+left out); K2's miss was one snake game, which ended in an error after 200 s of writing. It writes more than the
+others (a task takes it longer despite the faster decode) and needs the probe's replies
+uncapped (`RLIS_PROBE_MAX_TOKENS=8000`). The 14B did everything, for about twice K2's memory
+and time per token.
+
+`--yes` applies changes and runs commands without asking; the chat's other options and
+commands work too (`/clear` starts over). `cargo test --release -p chat probe -- --ignored`
+with `RLIS_PROBE_URL` set runs the tasks behind that table against any server.
 
 ### `rlis fix` (prototype)
 
@@ -257,7 +302,7 @@ How it works and why: [DESIGN.md](DESIGN.md). The hardest bug:
 | Default run (Q8_0, 1 GiB KV pool), benchmark load | 2.7–3.2 GB peak footprint |
 | Default run, 64 long requests overfilling the pool | 3.26 GB peak footprint |
 | Upper-bound run (3B Q4_K_M, 2 GiB pool) | not measured yet; the spec's budget estimate is ~5 GB |
-| Model files (`make models` / `make models-all` / `make models-qwen` / `make models-qwen-3b`) | 1.3 GB / 4.6 GB / 1.7 GB / 1.9 GB |
+| Model files (`make models` / `make models-all` / `make models-qwen` / `make models-qwen-3b` / `make models-k2` / `make models-qwen-14b`) | 1.3 GB / 4.6 GB / 1.7 GB / 1.9 GB / 3.3 GB / 9.0 GB |
 | Rust build (`./target`, release + debug, with and without Metal) | 13 GB |
 | llama.cpp build (`./third_party`) | 0.36 GB |
 

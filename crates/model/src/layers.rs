@@ -103,6 +103,9 @@ impl Module for Linear {
 pub struct RmsNorm {
     weight: Tensor,
     eps: f32,
+    /// Group count and a unit weight for one group, when normalizing equal slices of the hidden
+    /// dimension separately (K2 Horizon); `weight` then scales the whole width afterwards.
+    groups: Option<(usize, Tensor)>,
 }
 
 impl RmsNorm {
@@ -110,20 +113,43 @@ impl RmsNorm {
         Self {
             weight,
             eps: eps as f32,
+            groups: None,
         }
     }
 
     pub fn load(vb: VarBuilder, dim: usize, eps: f64) -> Result<Self> {
+        Ok(Self::new(vb.get(dim, "weight")?, eps))
+    }
+
+    /// Normalizes `groups` equal slices of the hidden dimension separately.
+    pub fn grouped(weight: Tensor, eps: f64, groups: usize) -> Result<Self> {
+        let width = weight.dim(0)?;
+        if groups == 0 || !width.is_multiple_of(groups) {
+            candle_core::bail!("{groups} norm groups do not divide width {width}");
+        }
+        let unit = (groups > 1)
+            .then(|| Tensor::ones(width / groups, weight.dtype(), weight.device()))
+            .transpose()?
+            .map(|t| (groups, t));
         Ok(Self {
-            weight: vb.get(dim, "weight")?,
-            eps: eps as f32,
+            groups: unit,
+            ..Self::new(weight, eps)
         })
     }
 }
 
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        candle_nn::ops::rms_norm(&x.contiguous()?, &self.weight, self.eps)
+        let x = x.contiguous()?;
+        let Some((groups, unit)) = &self.groups else {
+            return candle_nn::ops::rms_norm(&x, &self.weight, self.eps);
+        };
+        let dims = x.dims();
+        let (width, batch) = dims.split_last().expect("norm input has dimensions");
+        let split = [batch, &[*groups, width / groups]].concat();
+        candle_nn::ops::rms_norm(&x.reshape(split)?, unit, self.eps)?
+            .reshape(dims)?
+            .broadcast_mul(&self.weight)
     }
 }
 

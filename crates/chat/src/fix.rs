@@ -10,8 +10,6 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Read;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -24,7 +22,7 @@ use clap::Parser;
 use crossterm::style::Stylize;
 use serde_json::{Value, json};
 
-use crate::{ACCENT, ensure_server, http, model_name};
+use crate::{ACCENT, ensure_server, http, model_name, shell};
 
 /// What `rlis fix` starts when no server is running: the coding model (the 3B fixed 6 of the
 /// 10 benchmark tasks, the 1.5B 2; docs/fix-bench.md), with room for a prompt of a few files
@@ -152,7 +150,7 @@ pub fn run(args: FixArgs) -> Result<()> {
     let t = Instant::now();
     let base_dir = trees.add(&base, "base")?;
     let baseline = run_test(&base_dir, &args.test, args.timeout)?;
-    if baseline.passed {
+    if baseline.passed() {
         println!("the test already passes at the current tree; nothing to fix");
         return Ok(());
     }
@@ -224,7 +222,7 @@ pub fn run(args: FixArgs) -> Result<()> {
                         }
                         let r = run_test(&dirs[i], &args.test, args.timeout)?;
                         let a = &mut attempts.lock().unwrap()[i];
-                        (a.passed, a.exit, a.test_secs) = (r.passed, r.exit, r.secs);
+                        (a.passed, a.exit, a.test_secs) = (r.passed(), r.exit, r.secs);
                     }
                 })
             })
@@ -394,54 +392,13 @@ impl Drop for Worktrees {
     }
 }
 
-struct TestRun {
-    passed: bool,
-    exit: Option<i32>,
-    output: String,
-    secs: f64,
-}
-
-/// Runs `cmd` with `sh -c` in `dir`, killing its whole process group after `timeout` seconds.
-fn run_test(dir: &Path, cmd: &str, timeout: u64) -> Result<TestRun> {
-    let start = Instant::now();
-    let out_path = dir.join(".rlis-fix-test-output");
-    let out = fs::File::create(&out_path)?;
-    let mut child = Command::new("sh")
-        .args(["-c", cmd])
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(out.try_clone()?)
-        .stderr(out)
-        .process_group(0)
-        .spawn()
-        .with_context(|| format!("running {cmd:?}"))?;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break Some(status);
-        }
-        if start.elapsed() > Duration::from_secs(timeout) {
-            let _ = Command::new("kill")
-                .args(["-KILL", &format!("-{}", child.id())])
-                .status();
-            let _ = child.wait();
-            break None;
-        }
-        thread::sleep(Duration::from_millis(20));
-    };
-    let mut output = String::new();
-    fs::File::open(&out_path)?.read_to_string(&mut output)?;
-    fs::remove_file(&out_path)?;
-    let exit = status.and_then(|s| s.code());
-    Ok(TestRun {
-        passed: exit == Some(0),
-        exit,
-        output,
-        secs: start.elapsed().as_secs_f64(),
-    })
-}
-
 /// The task, the test's output, the tracked files the output or task names, and grep hits
 /// for identifiers in the task.
+/// Runs the test command in `dir`, killing it after `timeout` seconds.
+fn run_test(dir: &Path, cmd: &str, timeout: u64) -> Result<shell::Run> {
+    shell::run(dir, cmd, Duration::from_secs(timeout), |_| false)
+}
+
 fn build_prompt(dir: &Path, args: &FixArgs, output: &str) -> Result<String> {
     // Paths in the output are absolute (inside the base worktree) or repository-relative.
     let prefix = format!("{}/", dir.display());

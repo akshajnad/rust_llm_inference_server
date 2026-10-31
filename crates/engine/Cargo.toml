@@ -25,6 +25,7 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 rand_chacha.workspace = true
 minijinja.workspace = true
+minijinja-contrib.workspace = true
 chrono.workspace = true
 metrics.workspace = true
 

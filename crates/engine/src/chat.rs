@@ -11,8 +11,18 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-/// The model's own Jinja chat template from `tokenizer_config.json`, rendered with the same
-/// environment settings and helper functions transformers' `apply_chat_template` provides.
+/// A message as templates see it. K2 Horizon's refuses an assistant turn without a thinking
+/// field; earlier turns' thinking is not kept, so it is empty for every model.
+#[derive(Serialize)]
+struct TemplateMessage<'a> {
+    role: &'a str,
+    content: &'a str,
+    reasoning_content: &'static str,
+}
+
+/// The model's own Jinja chat template from `tokenizer_config.json` or `chat_template.jinja`,
+/// rendered with the same environment settings and helper functions transformers'
+/// `apply_chat_template` provides.
 pub struct ChatTemplate {
     env: Environment<'static>,
     bos_token: String,
@@ -24,14 +34,16 @@ impl ChatTemplate {
         let text = std::fs::read_to_string(model_dir.join("tokenizer_config.json"))
             .context("reading tokenizer_config.json")?;
         let cfg: serde_json::Value = serde_json::from_str(&text)?;
-        let source = cfg["chat_template"]
-            .as_str()
-            .context("no chat_template in tokenizer_config.json")?;
+        let source = match cfg["chat_template"].as_str() {
+            Some(s) => s.to_string(),
+            None => std::fs::read_to_string(model_dir.join("chat_template.jinja"))
+                .context("no chat_template in tokenizer_config.json or chat_template.jinja")?,
+        };
         let token = |key: &str| match &cfg[key] {
             serde_json::Value::String(s) => s.clone(),
             v => v["content"].as_str().unwrap_or_default().to_string(),
         };
-        Self::new(source, &token("bos_token"), &token("eos_token"))
+        Self::new(&source, &token("bos_token"), &token("eos_token"))
     }
 
     pub fn new(source: &str, bos_token: &str, eos_token: &str) -> Result<Self> {
@@ -52,7 +64,14 @@ impl ChatTemplate {
         env.add_function("strftime_now", |fmt: String| {
             chrono::Local::now().format(&fmt).to_string()
         });
-        env.add_template_owned("chat", source.to_string())?;
+        // Python's string and dict methods (`.get`, `.split`, `.startswith`).
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        // transformers' `{% generation %}` marks a span for masks and renders its body; `if`
+        // does the same and trims the same whitespace.
+        let source = source
+            .replace("{% generation %}", "{% if true %}")
+            .replace("{%- endgeneration -%}", "{%- endif -%}");
+        env.add_template_owned("chat", source)?;
         Ok(Self {
             env,
             bos_token: bos_token.into(),
@@ -75,6 +94,14 @@ impl ChatTemplate {
         date_string: Option<&str>,
     ) -> Result<String> {
         let tmpl = self.env.get_template("chat")?;
+        let messages: Vec<_> = messages
+            .iter()
+            .map(|m| TemplateMessage {
+                role: &m.role,
+                content: &m.content,
+                reasoning_content: "",
+            })
+            .collect();
         let mut ctx = context! {
             messages => Value::from(minijinja::value::Serde(messages)),
             add_generation_prompt => add_generation_prompt,
@@ -105,6 +132,22 @@ mod tests {
             content: " hi ".into(),
         }];
         assert_eq!(t.render(&msgs, true)?, "<s>user: hi\nassistant:");
+        Ok(())
+    }
+
+    #[test]
+    fn generation_tags_render_their_body() -> Result<()> {
+        let t = ChatTemplate::new(
+            "{% for m in messages %}{{- m.role }}\n    {% generation %}\n    {%- if m.reasoning_content == '' -%}\
+             {{- '<t></t>' + m.content }}{%- endif -%}{%- endgeneration -%}{% endfor %}",
+            "",
+            "",
+        )?;
+        let msgs = [ChatMessage {
+            role: "assistant".into(),
+            content: "hi".into(),
+        }];
+        assert_eq!(t.render(&msgs, false)?, "assistant\n<t></t>hi");
         Ok(())
     }
 

@@ -1,5 +1,6 @@
 //! Loads llama.cpp GGUF checkpoints (Q8_0, Q4_K_M, ...) into the same `Llama` forward pass.
-//! Two architectures: `llama` and `qwen2` (Llama plus Q/K/V biases).
+//! Three architectures: `llama`, `qwen2` (Llama plus Q/K/V biases) and `k2-horizon` (Llama with
+//! RMS norms over equal groups of the hidden dimension).
 //!
 //! Differences from HF safetensors, all handled here:
 //! - Config comes from `<arch>.*` metadata.
@@ -8,7 +9,8 @@
 //! - Llama 3 RoPE scaling is stored as `rope_freqs.weight`, per-frequency divisors of the base
 //!   inverse frequencies.
 //! - For `llama` the converter permutes Q/K rows for interleaved RoPE, so rotation uses
-//!   adjacent pairs. `qwen2` is converted unpermuted and keeps HF's rotate-half (NEOX) layout.
+//!   adjacent pairs. `qwen2` and `k2-horizon` are converted unpermuted and keep HF's rotate-half
+//!   (NEOX) layout.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -54,7 +56,7 @@ pub fn config(content: &gguf_file::Content) -> Result<LlamaConfig> {
         bos_token_id: md("tokenizer.ggml.bos_token_id")
             .ok()
             .and_then(|v| v.to_u32().ok()),
-        attention_f32: arch == "qwen2",
+        attention_f32: arch != "llama",
     })
 }
 
@@ -67,7 +69,7 @@ pub fn architecture(content: &gguf_file::Content) -> Result<String> {
         .to_string()?
         .clone();
     anyhow::ensure!(
-        matches!(arch.as_str(), "llama" | "qwen2"),
+        matches!(arch.as_str(), "llama" | "qwen2" | "k2-horizon"),
         "unsupported GGUF architecture {arch:?}"
     );
     Ok(arch)
@@ -128,7 +130,15 @@ pub fn load(path: &Path, device: &Device, max_seq_len: usize) -> Result<Llama> {
         std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let content = gguf_file::Content::read(&mut file)?;
     let cfg = config(&content)?;
-    let interleaved_rope = architecture(&content)? == "llama";
+    let arch = architecture(&content)?;
+    let interleaved_rope = arch == "llama";
+    let groups = match content
+        .metadata
+        .get(&format!("{arch}.attention.group_norm_groups"))
+    {
+        Some(v) => v.to_u32()? as usize,
+        None => 1,
+    };
     let mut r = Reader {
         content: &content,
         file,
@@ -138,7 +148,7 @@ pub fn load(path: &Path, device: &Device, max_seq_len: usize) -> Result<Llama> {
         true => Some(r.dense_f32("rope_freqs.weight")?.to_vec1::<f32>()?),
         false => None,
     };
-    let norm = |t| RmsNorm::new(t, cfg.rms_norm_eps);
+    let norm = |t| RmsNorm::grouped(t, cfg.rms_norm_eps, groups);
     let mut blocks = Vec::with_capacity(cfg.num_hidden_layers);
     for i in 0..cfg.num_hidden_layers {
         let b = |n: &str| format!("blk.{i}.{n}.weight");
@@ -160,11 +170,11 @@ pub fn load(path: &Path, device: &Device, max_seq_len: usize) -> Result<Llama> {
             gate: r.linear(&b("ffn_gate"))?,
             up: r.linear(&b("ffn_up"))?,
             down: r.linear(&b("ffn_down"))?,
-            input_norm: norm(r.dense_f32(&b("attn_norm"))?),
-            post_attn_norm: norm(r.dense_f32(&b("ffn_norm"))?),
+            input_norm: norm(r.dense_f32(&b("attn_norm"))?)?,
+            post_attn_norm: norm(r.dense_f32(&b("ffn_norm"))?)?,
         });
     }
-    let final_norm = norm(r.dense_f32("output_norm.weight")?);
+    let final_norm = norm(r.dense_f32("output_norm.weight")?)?;
     let embed = Arc::new(r.qtensor("token_embd.weight")?);
     let lm_head = match cfg.tie_word_embeddings {
         true => Linear::Quantized(QuantLinear::new(QMatMul::from_arc(embed.clone())?)),
